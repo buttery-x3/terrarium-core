@@ -126,6 +126,22 @@
       console.info("terrain connected", socket.id);
     });
 
+    socket.on("connect_error", (error) => {
+      console.error("terrain connect error", error);
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.warn("terrain disconnected", reason);
+    });
+
+    socket.on("reconnect_attempt", (attempt) => {
+      console.info("terrain reconnect attempt", attempt);
+    });
+
+    socket.on("reconnect_error", (error) => {
+      console.error("terrain reconnect error", error);
+    });
+
     socket.on("rooms:list", (payload: string[]) => {
       console.info("terrain rooms list received", payload);
       rooms.splice(0, rooms.length, ...payload);

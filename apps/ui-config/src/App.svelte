@@ -11,6 +11,22 @@
     console.info("config connected", socket.id);
   });
 
+  socket.on("connect_error", (error) => {
+    console.error("config connect error", error);
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.warn("config disconnected", reason);
+  });
+
+  socket.on("reconnect_attempt", (attempt) => {
+    console.info("config reconnect attempt", attempt);
+  });
+
+  socket.on("reconnect_error", (error) => {
+    console.error("config reconnect error", error);
+  });
+
   socket.on("rooms:list", (payload: string[]) => {
     console.info("config rooms list received", payload);
     rooms.set(payload);
