@@ -1,0 +1,22 @@
+{
+  "name": "terrarium-core",
+  "packageManager": "pnpm@10.26.2",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "eslint": "^9.39.2",
+    "prettier": "^3.7.4",
+    "tsx": "^4.21.0",
+    "turbo": "^2.7.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  }
+}
