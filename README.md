@@ -1,40 +1,65 @@
 # terrarium-core
-AI LM Terrarium toy
+AI LM Terrarium toy — dual front-ends plus a Fastify/Socket.io backend for multi-room LM agent play.
 
-The scope of this project is as follows:
+## Scope
 
-## Terrain UI
+### Terrain UI (Pixi)
+- Renders a fixed-size 2D terrarium scene in a separate window (Vite + Svelte 5 + Pixi.js).
+- Bots render as circles; speech appears briefly above them.
+- Chat pane lists recent messages with optional room filter; rooms map to Socket.io rooms.
+- Bots can move between rooms/locations; room history is stored in SQLite for context.
 
-A rendered 2d scene of a language-model "terrarium" using pixi.js. This terrarium is a fixed-size canvas displayed in the front-end.
+### Config UI (Svelte)
+- Configure rooms (name, description, position/appearance in Pixi scene).
+- Configure agents (persona/system prompts, provider/model selection, turn cadence min/max, context window per room).
+- View full history by room and per-agent message history.
 
-AI-LM-Agents, known as "bots" will be represented by circles
-their messages will show in the canvas as as popups over their 
-representation circle lasting for a few seconds.
+### Server
+- Fastify + Socket.io; authoritative world state and scheduler.
+- Non-blocking turn loop: scheduler enqueues turns, LM calls resolve async, responses patch state and broadcast.
+- Persistence via SQLite (Kysely + better-sqlite3) for rooms, agents, messages, snapshots.
+- LM providers are pluggable: OpenAI-compatible default plus Anthropic, Azure OpenAI, Gemini, LM Studio (each adapter in its own file). Env-based credentials.
 
-There will also be a scrolling chat window showing recent messages to the side of the canvas as a Svelte component. This should be able to filtered by a room dropdown which filters chat messages by room, or with no filtering.
+## Stack
+- Monorepo: pnpm workspaces + Turbo.
+- Frontends: Vite + Svelte 5; Pixi.js in terrain app; Socket.io client on both.
+- Backend: Fastify, Socket.io, pino logging, dotenv.
+- Shared: zod schemas for contracts; Kysely + SQLite for persistence.
+- TypeScript everywhere.
 
-The LM agents will be able to move between "locations" such as different "houses" defined in the terrarium. These will use socket.io rooms and the message history for each room will be stored using SQLite.
+## Workspace layout
+- apps/
+	- server/ — Fastify + Socket.io backend, world scheduler loop.
+	- ui-config/ — Vite + Svelte config UI (Svelte 5).
+	- ui-terrain/ — Vite + Svelte + Pixi render UI (Svelte 5).
+- packages/
+	- shared/ — shared types/schemas (zod).
+	- persistence/ — SQLite/Kysely adapter.
+	- lm-providers/ — provider interfaces and individual adapters (openai, anthropic, azure-openai, gemini, lmstudio).
+- data/ — SQLite database location (terrarium.db).
 
-Each language model will have a user-configured/defined persona, such as "philosophyBot" "gremlinBot" "seriousBot" "linguisticsBot" "sheriffBot" "whimsyBot" which will determine the actions or language it is likely to use.
+## Getting started
+1) Install Node 18+ and pnpm (project metadata assumes pnpm@10.26.2).
+2) Install deps: `pnpm install`
+3) Approve native builds (needed for better-sqlite3/esbuild): `pnpm approve-builds`
+4) Dev servers: `pnpm dev`
+	 - Config UI: http://localhost:4173
+	 - Terrain UI: http://localhost:4174
+	 - API/socket: http://localhost:3000 (health at `/health`)
+5) Build all: `pnpm build`
 
-Each bots turn can be one of the following 2 options. Continue to the conversation in the current room they are in. Or move to a different room of their choosing if their persona would not participate in said conversation.
+## Environment
+- Create `.env` in root (loaded by server) for PORT, LOG_LEVEL, provider keys/URLs:
+	- `PORT=3000`
+	- `LOG_LEVEL=info`
+	- `OPENAI_API_KEY=...`
+	- `OPENAI_BASE_URL=...` (optional, OpenAI-compatible)
+	- `ANTHROPIC_API_KEY=...`
+	- `AZURE_OPENAI_ENDPOINT=...`, `AZURE_OPENAI_API_KEY=...`, `AZURE_OPENAI_DEPLOYMENT=...`
+	- `GEMINI_API_KEY=...`
+	- `LMSTUDIO_BASE_URL=http://localhost:1234/v1`
 
-These will be defined by custom instruction blocks which will all be configurable.
-
-## Config UI
-
-A svelte front-end for configuring all aspects of the terrarium.
-
-Here The different rooms can be defined, with their name, appearance, including position in the pixi front-end, description, etc...
-
-The AI-Agents will also be configured here, including which API/endpoint each agent will use. The custom instructions, such as system-level instructions for all character bots, and persona instructions defeined per bot.
-
-this is also where full history of conversation in all rooms can be displayed, and also message history of each bot.
-
-also configuration of how often each bot should take a turn in real time (e.g 30 seconds, 5 minutes, 1 hour) and also, how configuration for how many turns of context of that rooms history will be included within their prompt.
-
-## Server
-
-The server will handle communication between both the Terrain UI, and the Server UI using socket.io, it will hold the configuration as described above, and handle persistance for all data using sqlite.
-
-It will also post and handle responses from the LM end points per the configuration data.
+## Current placeholders
+- LM provider calls are stubbed; wire real HTTP calls per adapter.
+- Scheduler emits mock agent updates; needs integration with providers, persistence, and room/agent config API.
+- UI is minimal scaffolding; hook up forms, room/agent CRUD, and live state feeds via Socket.io.
