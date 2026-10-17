@@ -3,11 +3,17 @@
   "packageManager": "pnpm@10.26.2",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
   "scripts": {
-    "dev": "turbo run dev --parallel",
+    "dev": "pnpm build:packages && turbo run dev --parallel --filter=!@terrarium/ui-terrain",
+    "dev:terrain": "turbo run dev --filter=@terrarium/ui-terrain",
+    "build:packages": "turbo run build --filter=@terrarium/shared --filter=@terrarium/persistence --filter=@terrarium/lm-providers",
     "build": "turbo run build",
+    "check": "turbo run check",
     "lint": "turbo run lint",
-    "test": "turbo run test",
+    "test": "pnpm build:packages && turbo run test",
     "format": "prettier --write ."
   },
   "devDependencies": {

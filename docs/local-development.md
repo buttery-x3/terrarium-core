@@ -1,0 +1,61 @@
+# Terrarium Core local development
+
+## Start and validate
+
+Use Node 24 (tested with 24.15.0), pnpm 10.26.2, and Windows for ChatGPT credential storage. From the repository root:
+
+```sh
+pnpm install
+pnpm dev
+```
+
+Development builds the shared, persistence, and model-provider packages before starting watchers, the server, and the web interface at `http://localhost:4173`. It works without pre-existing compiled output. Health: `http://127.0.0.1:3000/health`. Start optional terrain separately with `pnpm dev:terrain` at `http://localhost:4174`.
+
+```sh
+pnpm build
+pnpm check
+pnpm test
+```
+
+Build compiles all six packages; check runs Svelte/TypeScript checks for both frontends. Tests cover contracts, migrations, persistence, sockets, scheduling, and fake provider responses. Automated tests make no real model calls. If an existing installation reports a SQLite Node ABI mismatch after changing Node, run `pnpm --filter @terrarium/persistence rebuild better-sqlite3`.
+
+## Paths and local access
+
+The server loads root `.env` regardless of working directory. It uses root `data/terrarium.db`. If only legacy `apps/server/data/terrarium.db` exists, first startup copies it using SQLite backup before migrating the copy. The original remains unchanged. Existing canonical data takes precedence. An interrupted `.migrating` backup causes startup to fail rather than overwrite it.
+
+`DATABASE_PATH` optionally selects a database, resolving relative paths from the repository root and disabling legacy copying. `LOG_LEVEL` controls logging. `PORT` defaults to 3000; frontend proxies target that default port. These environment values pass through the development runner. Server host remains `127.0.0.1`.
+
+Accepted UI origins are `http://localhost:4173`, `http://127.0.0.1:4173`, `http://localhost:4174`, and `http://127.0.0.1:4174`. Socket handshakes also require localhost/127.0.0.1 as host. This is a local origin restriction, not multi-user authentication.
+
+SQLite files and sidecars, Vite caches, and compiled output are ignored. Previously tracked runtime files were removed from Git tracking while retaining local files. Do not distribute configuration through database files.
+
+## Connect ChatGPT and run a conversation
+
+1. Open the web interface in your ChatGPT browser. Choose **Connect ChatGPT**, then **Continue to ChatGPT sign-in**; complete sign-in and plan-usage consent.
+2. Wait for Connected. Model discovery fills suggestions; `gpt-6-luna` is the initial selection. A listed model still requires access through the signed-in account.
+3. Create or edit rooms. A fresh database initializes five rooms and no agents.
+4. Create an agent with a name, instructions, current room, model, cadence, and context limit of 1–50 messages. The form initially suggests 10–30 seconds and 50 messages. Enable the agent when ready. Saving configuration never automatically starts the run.
+5. Choose **Start**. Agents propose `speak`, `move`, or `wait`; the server validates and applies actions. Saved speech shows speaker names and timestamps.
+6. **Pause** stops new turns and finishes active turns. **Resume** continues scheduling. **Stop** cancels active work and discards late results. Disable/edit an agent to invalidate its old turn.
+
+Sign-in uses an ephemeral loopback callback and a ten-minute timeout. If opened in the wrong browser, restart the server to cancel the attempt, then begin from the intended browser. Credentials live under `%LOCALAPPDATA%/TerrariumCore/credentials`, encrypted with an AES key protected by Windows DPAPI for the current user. Directory access is restricted to that user and SYSTEM. Terrarium does not read another application's credentials or accept API keys. ChatGPT plan-usage tokens authorize Responses requests. See [authentication provenance](authentication-provenance.md).
+
+The scheduler permits four requests and one active turn per agent. Attempts time out after 60 seconds, retrying at most twice with 1/2-second backoff. Exhausted failures remain visible and schedule another turn after the configured cadence. State-read failures pause with a recovery message. Restart starts stopped. Context uses only the current room, including history before arrival; the UI's room selection does not affect agent knowledge.
+
+## Socket contracts
+
+Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }`:
+
+| Command          | Input / result                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `config:message` | `{ roomId, message }`; trimmed length 1–8,000; returns saved message.                                                                                                    |
+| `history:get`    | `{ roomId, before?, after? }`; cursors `{ createdAt, id }`; choose before or after; returns `{ messages, hasMore }`.                                                     |
+| `rooms:save`     | `{ id?, name, description }`; omit ID to create; returns saved configuration.                                                                                            |
+| `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |
+| `run:control`    | `'start'`, `'pause'`, `'stop'`; returns run state.                                                                                                                       |
+| `auth:login`     | `{}`; returns browser sign-in URL. Credentials stay on the server.                                                                                                       |
+| `auth:models`    | `{}`; returns visible model slugs.                                                                                                                                       |
+
+`world:state`, `run:state`, and `auth:state` synchronize the operator UI. Both namespaces receive `conversation:message` after persistence, carrying `{ id, roomId, agentId, speaker, createdAt, content }`. Humans use agent ID `config-ui` and speaker `Human`. `/terrain` also receives `rooms:list`.
+
+History pages contain up to 100 messages ordered oldest to newest by saved timestamp and ID. Initially select the latest page; `before` retrieves older pages; `after` retrieves missed messages forward. The client merges by ID, freezes reconnect cursors before live events arrive, and follows all forward pages. New timestamps advance monotonically to prevent same-millisecond inserts falling behind a cursor.

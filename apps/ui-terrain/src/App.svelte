@@ -2,10 +2,11 @@
   import { Application, Graphics, Text } from "pixi.js";
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
+  import type { ConversationMessage } from "@terrarium/shared";
 
   let container: HTMLDivElement | null = null;
   let app: Application | null = null;
-  const socket = io("/terrain");
+  const socket = io("/terrain", { transports: ["websocket"] });
   const rooms: string[] = [];
   const roomStates = new Map<
     string,
@@ -31,7 +32,8 @@
   };
 
   const renderRooms = () => {
-    if (!app) return;
+    const currentApp = app;
+    if (!currentApp) return;
     rooms.forEach((roomId, index) => {
       if (roomStates.has(roomId)) return;
       const col = index % columns;
@@ -61,7 +63,7 @@
       });
       message.position.set(x, y + size + 8);
 
-      app.stage.addChild(graphics, label, message);
+      currentApp.stage.addChild(graphics, label, message);
       roomStates.set(roomId, {
         graphics,
         label,
@@ -148,16 +150,11 @@
       renderRooms();
     });
 
-    socket.on("agent:update", (payload) => {
-      console.info("agent update", payload);
-    });
-
-    socket.on("terrain:message", (payload: { roomId: string; message: string }) => {
-      console.info("terrain message received", payload);
+    socket.on("conversation:message", (payload: ConversationMessage) => {
       const room = roomStates.get(payload.roomId);
       if (!room) return;
       room.highlightUntil = Date.now() + 1000;
-      room.message.text = payload.message;
+      room.message.text = payload.content;
     });
 
     return () => {

@@ -11,6 +11,7 @@ export interface LmCompletionRequest {
   messages: Message[];
   temperature?: number;
   maxTokens?: number;
+  signal?: AbortSignal;
 }
 
 export interface LmCompletionResponse {

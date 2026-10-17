@@ -4,11 +4,13 @@ Extend the existing prototype in three stages: reliable foundations, one complet
 
 ## Review and delivery
 
-This plan is proposed for user approval. Its pull request contains documentation only. Application changes begin after approval, in bounded review branches with acceptance evidence before merging into `main`. Approval of the plan does not resolve the open decisions below or authorize unlisted dependencies, unrelated refactors, or scope expansion.
+The user approved implementation of this plan on 18 October 2026 and subsequently approved the foundation, agent behavior, and ChatGPT dependency choices recorded below. All three stages are implemented on `codex/terrarium-implementation`, pending review before merging into `main`. This does not authorize unrelated refactors or scope expansion.
 
 Follow [AGENTS.md](../AGENTS.md) and [AGENTS_COMMENTS_STYLE.md](../AGENTS_COMMENTS_STYLE.md). Keep documentation in `docs/`. No dates or owners are assigned by this plan.
 
 ## Stage 1 Reliable local foundations
+
+Startup ordering, explicit paths, local access controls, durable validated messages, history recovery, frontend checks, and runtime-artifact cleanup are implemented. See [local development](local-development.md) for operation and [validation](implementation-validation.md) for evidence. The stage descriptions below preserve the approved requirements.
 
 ### 1A Reproducible startup and local access
 
@@ -119,7 +121,7 @@ Prove the complete workflow with a small configurable population, then run sixte
 
 **Acceptance:** the configured request cap and one-turn-per-agent rule hold at both sizes; lifecycle changes reject stale completions; saved history and membership match accepted actions; the web interface remains usable; no fixed population or personality enumeration is required.
 
-## Decisions required before the affected work
+## Approved implementation decisions
 
 | Decision                                                                                                                                       | Required by |
 | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
@@ -131,7 +133,15 @@ Prove the complete workflow with a small configurable population, then run sixte
 | Action schema and observation policy, including access to history before arrival/after departure and context-size limits.                      | 2B          |
 | Global concurrency, timeout/retry/backoff bounds, and exact queue/in-flight behavior for pause, stop, disable, edits, and moves.               | 2C          |
 
-Resolve these in the relevant implementation review instead of choosing hidden defaults. The excerpt proposes the behavior but does not specify these contracts or numeric values.
+The user resolved these decisions before the affected work:
+
+- Node 24, Fastify 5.12.7, compatible `@fastify/cors` 11.3.1; root `.env`; canonical root `data/terrarium.db`; preserve the legacy database through a SQLite backup before migration.
+- Loopback server; only localhost/127.0.0.1 UI origins on ports 4173 and 4174. Socket handshakes validate host and origin.
+- Messages of 1–8,000 characters after trimming; human speaker `Human`; one `conversation:message` event after commit; result acknowledgements; history pages of 100 ordered by timestamp and ID and merged by ID on reconnect.
+- Five initial rooms, no automatic agents. Create/edit rooms and create/edit/disable agents; no deletion. Legacy agents remain disabled until configured.
+- ChatGPT authentication from Flamehorn Desktop and protected storage from social-summarizer-extension. Explicitly approved dependencies: `jose` 6.2.12 and `@primno/dpapi` 2.0.1. Default model `gpt-6-luna`; one real call used for the smoke check.
+- Actions `speak`, `move`, `wait`; latest 1–50 messages from the current room, including before arrival. No departed-room history enters subsequent turns.
+- Four concurrent calls, one turn per agent, 60-second attempts, two retries with 1/2-second backoff. Pause finishes active turns; stop, disable, edits, and movement invalidate stale results. Exhausted failures remain visible and schedule another turn after the configured cadence.
 
 ## Validation and review evidence
 

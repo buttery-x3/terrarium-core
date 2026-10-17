@@ -1,47 +1,38 @@
 # Terrarium Core project scope
 
-Terrarium Core is a local AI conversation toy in which configurable agents inhabit rooms, observe conversation history, and take turns interacting. Development will extend the existing repository into a working, controllable terrarium, beginning with a web chat interface and a small population before exercising the same system with sixteen or more agents.
+Terrarium Core is a local AI conversation toy in which configurable agents inhabit rooms, observe conversation history, and take turns interacting. It extends this repository with a controllable web interface, durable history, and ChatGPT-authenticated agents. The same configuration supports a small population and sixteen or more agents.
 
-This is the proposed scope for review. Application implementation begins only after the user approves the [development plan](development-plan.md). The planning pull request changes documentation only.
+The user approved the [development plan](development-plan.md) and implementation choices on 18 October 2026. Implementation is on `codex/terrarium-implementation`, pending review; it has not been merged into `main`.
 
-## Product direction
+## Product and architecture
 
-Retain TypeScript, Svelte, a single Fastify server, Socket.IO, and SQLite through Kysely and better-sqlite3. Keep the existing application and package boundaries. Extend `apps/ui-config` into the initial web interface; retain `apps/ui-terrain` as an optional graphical view whose further development is deferred.
+Retain TypeScript, Svelte, one Fastify server, Socket.IO, and SQLite through Kysely and better-sqlite3. The server validates model proposals and owns world operations. SQLite stores rooms, agent configuration, current membership, and conversation history. Active calls and scheduling remain in memory.
 
-The server owns world operations and decides which model proposals become accepted actions. SQLite holds durable room configuration, agent configuration, room membership, and conversation history. In-flight requests and scheduler bookkeeping can remain in memory.
+Personality is editable instructions. No schema fixes population size or personality categories. `apps/ui-config` is the primary web interface; `apps/ui-terrain` remains optional. Authentication uses the working ChatGPT path supplied through Flamehorn Desktop and social-summarizer-extension, with Terrarium's own protected credentials.
 
-Personality is editable agent instructions. An MBTI-based starting population may be configuration data; the system must not require exactly sixteen agents or a fixed set of personality categories. Reuse the existing provider interface and the previously tested authentication integration referenced in the conversation once its source and usage contract are supplied.
+## Implemented for review
 
-## Current implementation
+| Area                | Behavior                                                                                                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Startup and access  | Initial package builds precede watchers. Root environment/database paths are explicit. The API binds to loopback; socket controls accept approved local UI origins.                      |
+| Messages            | Runtime validation, save before broadcast, one saved record for config and terrain views, success/error acknowledgements. Human and agent speech use the same insertion operation.       |
+| History             | Stable timestamp/ID ordering, 100-record pages, room filtering, reconnect recovery merged by message ID.                                                                                 |
+| World configuration | Versioned migration preserves messages. Five initial rooms; no automatic agents. Create/edit rooms and create/edit/disable agents; persisted membership.                                 |
+| Agents              | Editable name, instructions, model, cadence, context limit, room, enabled state. Context includes latest 1–50 current-room messages, including before arrival.                           |
+| Model integration   | ChatGPT OAuth with PKCE and verified identity, Windows protected storage, model discovery, completed Responses streams. Initial model: `gpt-6-luna`. Other adapters remain unused mocks. |
+| Actions             | `speak`, `move`, `wait`. Destinations and agent/run revisions are validated before mutation. Technical failures remain operational errors.                                               |
+| Scheduling          | One active turn per agent, four concurrent requests, 60-second attempts, two retries. Pause finishes active work; stop/disable/edits/movement discard stale results.                     |
+| Web interface       | Timeline, older messages, reconnect recovery, room/agent forms, ChatGPT connection, run controls, activity/error feedback.                                                               |
+| Terrain             | Optional existing Pixi view consumes the shared conversation event. Further graphical development remains deferred.                                                                      |
 
-The baseline is commit `81e74a1f7f7c67759d0078b291a7c492f0e39ace`. Some capabilities listed in the root README are intended behavior, not implemented behavior.
-
-| Area                 | What exists                                                                                                 | What remains                                                                                                                                     |
-| -------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Message delivery     | The config UI sends a test message; the server attempts to save it and broadcasts to the terrain namespace. | Runtime validation, success/error acknowledgements, a shared saved-message path, and history recovery. Failed inserts currently still broadcast. |
-| Rooms and agents     | SQLite table definitions and five hardcoded room IDs in the server.                                         | Authoritative persisted configuration, editable persona/model settings, and membership operations.                                               |
-| Conversation history | Message insertion into SQLite.                                                                              | History reads, reconnect recovery, and context assembly.                                                                                         |
-| Agent execution      | An empty turn queue and a placeholder handler.                                                              | Initial scheduling, provider calls, bounded concurrency, lifecycle controls, and failure handling.                                               |
-| Providers            | Five adapters implementing a common interface.                                                              | Real integration; every adapter currently returns mock output or configuration-error text.                                                       |
-| Web interface        | A room list and test-message form.                                                                          | Conversation timeline, history browser, configuration, run controls, and activity/error state.                                                   |
-| Terrain view         | Pixi room squares displaying the latest manual message.                                                     | A later graphical agent experience; `agent:update` currently only logs, and sockets do not join the rooms targeted by that event.                |
-
-Source locations are [server](../apps/server/src/server.ts), [persistence](../packages/persistence/src/index.ts), [shared schemas](../packages/shared/src/index.ts), [provider interface](../packages/lm-providers/src/types.ts), [config UI](../apps/ui-config/src/App.svelte), and [terrain UI](../apps/ui-terrain/src/App.svelte).
-
-## Next development scope
-
-1. Stabilize local startup, environment/database paths, access boundaries, validated message storage and delivery, and history retrieval.
-2. Complete one agent loop with persisted configuration, the existing authentication path, deliberate context assembly, validated actions, and controlled scheduling.
-3. Expose that loop in the existing web app through readable conversations, room and agent configuration, run controls, and understandable activity/errors. Validate a small population before sixteen-plus agents.
-
-The proposed initial action vocabulary is `speak`, `move`, and `wait`, subject to approval of the action contract. Technical errors must appear as operational errors, never as agent dialogue. The UI's room filter controls display, while server-side context rules determine what an agent can observe.
+Implementation: [server](../apps/server/src/app.ts), [scheduler](../apps/server/src/scheduler.ts), [turns](../apps/server/src/turns.ts), [persistence](../packages/persistence/src/world.ts), [schemas](../packages/shared/src/index.ts), [ChatGPT provider](../packages/lm-providers/src/chatgpt.ts), [web UI](../apps/ui-config/src/App.svelte), [terrain UI](../apps/ui-terrain/src/App.svelte).
 
 ## Deferred scope
 
-Defer relationship scores, separate long-term memory, judicial actions, additional graphical behavior, snapshots beyond current needs, and implementing every provider at once. Do not introduce a third frontend, a queue service, a distributed agent platform, a general action framework, a user-account system, or a replacement stack as part of this plan.
+Relationship scores, separate long-term memory, judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
 
-## First usable release
+## Release boundaries
 
-The first usable release lets a local operator configure rooms and agents, start and control a conversation, inspect saved history after reconnecting or restarting, and understand failures without reading server logs. Human and agent speech use the same reliable storage/delivery path. Moves update authoritative membership; stale model responses cannot mutate an invalid world state. The same configurable implementation supports a small trial and a sixteen-plus-agent trial within an approved request-concurrency limit.
+This is a local single-operator application. ChatGPT credential protection currently requires Windows. Keep one server process per database/credential store. Runs start stopped after restart; enabled flags do not automatically start model calls. Pause is temporary runtime state, not a saved run snapshot. Other provider adapters are not exposed in the product.
 
-Acceptance criteria, implementation boundaries, and unresolved decisions are in the [development plan](development-plan.md). Project tracking is in [Linear](https://linear.app/flamehorn-games/project/terrarium-core-1bb502640e5f/overview).
+See [local development](local-development.md), [validation evidence](implementation-validation.md), and [Linear](https://linear.app/flamehorn-games/project/terrarium-core-1bb502640e5f/overview).
