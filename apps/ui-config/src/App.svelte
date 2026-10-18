@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
-  import { configurationSchema, configurationFileLimitBytes, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
+  import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
@@ -26,10 +26,25 @@
   let roomId = "";
   let roomName = "";
   let roomDescription = "";
+  let roomFoodSource = false;
   let agentId = "";
   let deleteAgentConfirmation: Agent | undefined;
   let agentName = "";
   let instructions = "";
+  let motivations = "";
+  let intention = "";
+  let settings: Settings = structuredClone(defaultSettings);
+  let activeSettings: Settings = structuredClone(defaultSettings);
+  let settingsVersion = 0;
+  let promptAgent = "";
+  let promptPreview: { payload: { model: string; instructions: string; input: unknown; text: unknown }; constraints: string } | undefined;
+  let diagnosticAgent = "", diagnosticRoom = "", diagnosticAction = "", diagnosticOutcome = "", diagnosticFrom = "", diagnosticTo = "";
+  let diagnosticPage: DiagnosticPage = { records: [], hasMore: false };
+  let diagnosticBefore: number | undefined;
+  let diagnosticLoading = false;
+  let diagnosticDetails: Record<string, DiagnosticRecord> = {};
+  let diagnosticUsage: DiagnosticUsage | undefined;
+  let confirmDiagnosticClear = false;
   let agentRoom = "";
   let agentModel = "gpt-6-luna";
   let enabled = false;
@@ -96,10 +111,11 @@
     try { await action(); } catch (failure) { error = failure instanceof Error ? failure.message : "The operation failed."; }
     finally { busy = false; }
   }
-  function editRoom(room?: Room) { roomId = room?.id ?? ""; roomName = room?.name ?? ""; roomDescription = room?.description ?? ""; }
+  function editRoom(room?: Room) { roomId = room?.id ?? ""; roomName = room?.name ?? ""; roomDescription = room?.description ?? ""; roomFoodSource = room?.isFoodSource ?? false; }
   function editAgent(agent?: Agent) {
     deleteAgentConfirmation = undefined;
     agentId = agent?.id ?? ""; agentName = agent?.name ?? ""; instructions = agent?.instructions ?? "";
+    motivations = agent?.motivations ?? ""; intention = agent?.intention ?? "";
     agentRoom = agent?.roomId ?? selectedRoom; agentModel = agent?.model ?? "gpt-6-luna"; enabled = agent?.enabled ?? false;
     minimumSeconds = (agent?.minIntervalMs ?? 10000) / 1000; maximumSeconds = (agent?.maxIntervalMs ?? 30000) / 1000;
     contextMessages = agent?.contextMessageLimit ?? 50;
@@ -164,9 +180,45 @@
     clearImport(); editRoom(); editAgent();
     notice = `Configuration imported. Rooms saved: ${result.rooms.length}; agents saved: ${result.agents.length}. Choose Start when ready.`;
   }
+  function diagnosticFilter(): DiagnosticFilter {
+    return { ...(diagnosticAgent ? { agentId: diagnosticAgent } : {}), ...(diagnosticRoom ? { roomId: diagnosticRoom } : {}),
+      ...(diagnosticAction ? { action: diagnosticAction as "speak" | "move" | "wait" | "eat" } : {}),
+      ...(diagnosticOutcome ? { outcome: diagnosticOutcome } : {}),
+      ...(diagnosticFrom ? { from: new Date(diagnosticFrom).toISOString() } : {}),
+      ...(diagnosticTo ? { to: new Date(diagnosticTo).toISOString() } : {}) };
+  }
+  async function loadDiagnostics(before?: number) {
+    if (!connected || diagnosticLoading) return;
+    diagnosticLoading = true;
+    try {
+      diagnosticPage = await request<DiagnosticPage>("diagnostics:list", { ...diagnosticFilter(), ...(before ? { before } : {}) });
+      const retained: Record<string, DiagnosticRecord> = {};
+      for (const record of diagnosticPage.records) if (diagnosticDetails[record.id]) retained[record.id] = diagnosticDetails[record.id];
+      diagnosticDetails = retained;
+      diagnosticBefore = before;
+      diagnosticUsage = await request<DiagnosticUsage>("diagnostics:usage", {});
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Could not load diagnostics."; }
+    finally { diagnosticLoading = false; }
+  }
+  async function exportDiagnostics() {
+    const records: DiagnosticRecord[] = [];
+    const filter = diagnosticFilter();
+    let before: number | undefined;
+    while (true) {
+      const page = await request<DiagnosticPage>("diagnostics:export", { ...filter, limit: 10, ...(before ? { before } : {}) });
+      records.push(...page.records);
+      if (!page.hasMore) break;
+      before = page.next;
+    }
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ format: "terrarium-diagnostics", version: 1, exportedAt: new Date().toISOString(), filter, records }, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "terrarium-diagnostics.json";
+    document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notice = `Exported ${records.length} diagnostic records. Exported files retain their conversation snapshots independently.`;
+  }
   onMount(() => {
     socket.on("connect", () => {
       connected = true;
+      void loadDiagnostics();
       // INVARIANT: reconnect discards caches that may have missed a conversation clear.
       histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
@@ -176,6 +228,9 @@
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
       rooms = state.rooms; agents = state.agents;
+      activeSettings = state.settings;
+      if (state.settingsVersion !== settingsVersion) { settings = structuredClone(state.settings); settingsVersion = state.settingsVersion; promptPreview = undefined; }
+      if (!agents.some(agent => agent.id === promptAgent)) { promptAgent = agents[0]?.id ?? ""; promptPreview = undefined; }
       if (!rooms.some(room => room.id === selectedRoom)) selectedRoom = rooms[0]?.id ?? "";
       if (!agentRoom) agentRoom = selectedRoom;
       if (agentId && !agents.some(agent => agent.id === agentId)) editAgent();
@@ -183,6 +238,11 @@
       void loadHistory(selectedRoom);
     });
     socket.on("conversation:message", (item: ConversationMessage) => merge(item.roomId, [item]));
+    socket.on("energy:state", (values: { id: string; energy: number }[]) => {
+      const energy = new Map(values.map(item => [item.id, item.energy]));
+      agents = agents.map(agent => ({ ...agent, energy: energy.get(agent.id) ?? agent.energy }));
+    });
+    socket.on("diagnostics:changed", () => { if (!diagnosticBefore) void loadDiagnostics(); });
     socket.on("conversation:cleared", (result: HistoryCleared) => {
       resetHistory(result.roomIds); clearConfirmation = undefined;
       void loadHistory(selectedRoom);
@@ -233,6 +293,8 @@
         <ul aria-label="Configuration changes">
           {#each importPreview.rooms as room}<li>{room.operation === "add" ? "Add" : "Update"} room: {room.name} ({room.id})</li>{/each}
           {#each importPreview.agents as agent}<li>{agent.operation === "add" ? "Add" : "Update"} agent: {agent.name} ({agent.id})</li>{/each}
+          {#each importPreview.defaults as detail}<li>{detail}</li>{/each}
+          <li>Shared settings: {importPreview.settingsChanged ? "will update" : "unchanged"}. Existing current energy and diagnostic history are preserved.</li>
         </ul>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(applyConfiguration)}>Apply import</button>
       {:else}
@@ -254,7 +316,7 @@
     {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
     {#if clearConfirmation}
       <div role="group" aria-label="Confirm conversation clearing">
-        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agent conversation context. Rooms, agents and their settings will be kept.</p>
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agent conversation context. Rooms, agents and their settings will be kept. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
         <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
       </div>
@@ -275,15 +337,16 @@
   </section>
   <section>
     <h2>Rooms</h2>
-    <ul>{#each rooms as room}<li>{room.name} <button on:click={() => editRoom(room)}>Edit {room.name}</button></li>{/each}</ul>
+    <ul>{#each rooms as room}<li>{room.name}{room.isFoodSource ? " · Food source" : ""} <button on:click={() => editRoom(room)}>Edit {room.name}</button></li>{/each}</ul>
     <button on:click={() => editRoom()}>New room</button>
     <form on:submit|preventDefault={() => perform(async () => {
-      const saved = await request<Room>("rooms:save", { ...(roomId ? { id: roomId } : {}), name: roomName, description: roomDescription });
+      const saved = await request<Room>("rooms:save", { ...(roomId ? { id: roomId } : {}), name: roomName, description: roomDescription, isFoodSource: roomFoodSource });
       editRoom(saved); notice = "Room saved.";
     })}>
       <h3>{roomId ? "Edit room" : "Create room"}</h3>
       <label>Room name <input bind:value={roomName} maxlength="8000" required /></label>
       <label>Description <textarea bind:value={roomDescription} maxlength="8000"></textarea></label>
+      <label><input type="checkbox" bind:checked={roomFoodSource} /> Provides unlimited food</label>
       <button disabled={!connected || busy}>Save room</button>
     </form>
   </section>
@@ -292,11 +355,12 @@
     <p>Each agent can have one active turn. Up to {runState.concurrency} requests run at once.</p>
     <ul>{#each agents as agent}
       <li><strong>{agent.name}</strong> · {rooms.find(room => room.id === agent.roomId)?.name ?? agent.roomId} · {agent.enabled ? "Enabled" : "Disabled"}
+        · Energy {agent.energy.toFixed(2)} / {activeSettings.energy.maximum}
         <button on:click={() => editAgent(agent)}>Edit {agent.name}</button>
         <button disabled={!connected || busy} on:click={() => { deleteAgentConfirmation = agent; }}>Delete {agent.name}</button>
         {#if deleteAgentConfirmation?.id === agent.id}
           <div role="group" aria-label="Confirm agent deletion">
-            <p>Permanently delete agent “{deleteAgentConfirmation.name}” and its settings? Its active turn will be cancelled. Existing conversation messages will be kept.</p>
+        <p>Permanently delete agent “{deleteAgentConfirmation.name}” and its settings? Its active turn will be cancelled. Existing conversation messages and diagnostic records will be kept.</p>
             <button disabled={!connected || busy} on:click={() => perform(deleteAgent)}>Permanently delete agent</button>
             <button disabled={busy} on:click={() => { deleteAgentConfirmation = undefined; }}>Cancel deletion</button>
           </div>
@@ -309,7 +373,7 @@
     {:else}<li>No agents configured.</li>{/each}</ul>
     <button on:click={() => editAgent()}>New agent</button>
     <form on:submit|preventDefault={() => perform(async () => {
-      const input: AgentInput = { ...(agentId ? { id: agentId } : {}), name: agentName, instructions, roomId: agentRoom,
+      const input: AgentInput = { ...(agentId ? { id: agentId } : {}), name: agentName, instructions, motivations, intention, roomId: agentRoom,
         provider: "chatgpt", model: agentModel, enabled, minIntervalMs: Math.round(minimumSeconds * 1000),
         maxIntervalMs: Math.round(maximumSeconds * 1000), contextMessageLimit: contextMessages };
       const saved = await request<Agent>("agents:save", input); if (agents.some(agent => agent.id === saved.id)) editAgent(saved); notice = "Agent saved.";
@@ -317,6 +381,10 @@
       <h3>{agentId ? "Edit agent" : "Create agent"}</h3>
       <label>Agent name <input bind:value={agentName} maxlength="8000" required /></label>
       <label>Personality instructions <textarea bind:value={instructions} maxlength="8000" required rows="4"></textarea></label>
+      <label>Motivations and preferences <textarea bind:value={motivations} maxlength="8000" rows="4"></textarea></label>
+      <p>Interests, company or solitude, conversational preferences and tolerance for repetition. There is no boredom meter or forced movement timer.</p>
+      <label>Current intention (optional) <textarea bind:value={intention} maxlength="1000" rows="2"></textarea></label>
+      <p>An operator-configured immediate aim. Agents cannot rewrite it or store private notes.</p>
       <label>Current room <select bind:value={agentRoom} required>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
       <label>ChatGPT model <input bind:value={agentModel} list="chatgpt-models" required /></label>
       <datalist id="chatgpt-models">{#each models as model}<option value={model}></option>{/each}</datalist>
@@ -328,6 +396,90 @@
       <label><input type="checkbox" bind:checked={enabled} /> Enabled</label>
       <button disabled={!connected || busy}>Save agent</button>
     </form>
+  </section>
+  <section aria-label="Shared settings">
+    <h2>Shared behaviour and energy</h2>
+    <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
+    <p>Active energy rules: {activeSettings.energy.enabled ? "enabled" : "disabled"}; initial {activeSettings.energy.initial}; maximum {activeSettings.energy.maximum}; depletion {activeSettings.energy.depletionPerMinute} per running minute; low at {activeSettings.energy.lowThreshold} or below; meals fill to maximum.</p>
+    <form on:submit|preventDefault={() => perform(async () => { await request("settings:save", settings); notice = "Shared settings saved."; })}>
+      <h3>Energy</h3>
+      <label><input type="checkbox" bind:checked={settings.energy.enabled} /> Enable energy and eating</label>
+      <label>Initial energy for new agents <input type="number" min="0" max={settings.energy.maximum} step="any" bind:value={settings.energy.initial} required /></label>
+      <label>Maximum energy <input type="number" min="0.01" step="any" bind:value={settings.energy.maximum} required /></label>
+      <label>Depletion per running minute <input type="number" min="0" step="any" bind:value={settings.energy.depletionPerMinute} required /></label>
+      <label>Low energy at or below <input type="number" min="0" max={settings.energy.maximum} step="any" bind:value={settings.energy.lowThreshold} required /></label>
+      <p>Meals fill to maximum. Decay freezes while paused, stopped, individually disabled or offline. Stop/restart preserves energy. Zero energy does not restrict actions. At least one food-source room is required when enabled.</p>
+      <h3>Shared prompt text</h3>
+      <p>These sections are assembled in the order below, followed by resolved local context and enforced protocol constraints. There is no hidden behavioural fallback.</p>
+      {#each Object.keys(defaultPrompts) as name}
+        {@const key = name as keyof typeof defaultPrompts}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders" })[key]}
+          <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
+        </label>
+        <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>
+      {/each}
+      <h3>Diagnostic retention</h3>
+      <label>Diagnostic payload budget (MiB) <input type="number" min="32" max="16384" step="1" bind:value={settings.diagnostics.maxPayloadMiB} required /></label>
+      <p>Records are retained until explicitly cleared. No automatic pruning. Capacity is reserved for active attempts; the run pauses before admitting work beyond the budget. This measures diagnostic payloads and row allowance, not total database file size.</p>
+      <button disabled={!connected || busy || runState.state !== "stopped"}>Save shared settings</button>
+    </form>
+  </section>
+  <section aria-label="Prompt preview">
+    <h2>Assembled prompt preview</h2>
+    <label>Preview agent <select bind:value={promptAgent} on:change={() => { promptPreview = undefined; }}>{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</select></label>
+    <button disabled={!connected || busy || !promptAgent} on:click={() => perform(async () => { promptPreview = await request("prompt:preview", { agentId: promptAgent }); })}>Preview saved prompt</button>
+    <p>Preview reads current saved state without requesting a model or applying a turn. The payload shows Terrarium's instructions, input, model and output schema. It does not show provider-internal instructions or reasoning.</p>
+    {#if promptPreview}
+      <p>Model: {promptPreview.payload.model}</p>
+      <h3>Instructions in request order</h3>
+      <pre class="configuration-json">{promptPreview.payload.instructions}</pre>
+      <h3>Observed room history</h3>
+      <pre class="configuration-json">{JSON.stringify(promptPreview.payload.input, null, 2)}</pre>
+      <details><summary>Enforced protocol and output schema</summary><pre class="configuration-json">{promptPreview.constraints}\n\n{JSON.stringify(promptPreview.payload.text, null, 2)}</pre></details>
+      <details><summary>Complete preview snapshot and provider payload</summary><pre class="configuration-json">{JSON.stringify(promptPreview, null, 2)}</pre></details>
+    {/if}
+  </section>
+  <section aria-label="Decision diagnostics">
+    <h2>Decision diagnostics</h2>
+    <p>Operator-only history. Attempt 0 records scheduling and the overall turn; numbered attempts record requests. A numbered attempt without an action produced no validated action. Intention is model self-report, not a verified explanation.</p>
+    {#if diagnosticUsage}<p>Stored payloads: {(diagnosticUsage.bytes / 1048576).toFixed(2)} MiB; reserved: {(diagnosticUsage.reservedBytes / 1048576).toFixed(2)} MiB; budget: {diagnosticUsage.limitBytes / 1048576} MiB. Retained until explicitly cleared.</p>{/if}
+    <form on:submit|preventDefault={() => loadDiagnostics()}>
+      <label>Agent ID (empty for all; deleted IDs supported) <input bind:value={diagnosticAgent} list="diagnostic-agents" /></label>
+      <datalist id="diagnostic-agents">{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</datalist>
+      <label>Decision room <select bind:value={diagnosticRoom}><option value="">All rooms</option>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
+      <label>Action <select bind:value={diagnosticAction}><option value="">All actions</option>{#each ["speak", "move", "wait", "eat"] as action}<option value={action}>{action}</option>{/each}</select></label>
+      <label>Outcome <select bind:value={diagnosticOutcome}><option value="">All outcomes</option>{#each ["scheduled", "running", "completed", "applied", "applied-noop", "applied-notification-failure", "provider", "timeout", "parse", "schema", "world-validation", "persistence", "stale", "cancelled", "cancelled-before-start", "interrupted", "diagnostic-failure"] as outcome}<option value={outcome}>{outcome}</option>{/each}</select></label>
+      <label>Scheduled from <input type="datetime-local" bind:value={diagnosticFrom} /></label>
+      <label>Scheduled through <input type="datetime-local" bind:value={diagnosticTo} /></label>
+      <button disabled={!connected || diagnosticLoading}>Apply filters / latest page</button>
+    </form>
+    <button disabled={!connected || busy} on:click={() => perform(exportDiagnostics)}>Export filtered diagnostics</button>
+    <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => { confirmDiagnosticClear = true; }}>Clear diagnostics</button>
+    {#if confirmDiagnosticClear}
+      <p>Permanently delete all stored diagnostic records and prompt/response snapshots? Conversation history and downloaded files remain. This cannot be undone.</p>
+      <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(async () => { await request("diagnostics:clear", { confirm: true }); confirmDiagnosticClear = false; diagnosticDetails = {}; await loadDiagnostics(); notice = "Stored diagnostics cleared."; })}>Permanently clear all diagnostics</button>
+      <button on:click={() => { confirmDiagnosticClear = false; }}>Cancel diagnostic clearing</button>
+    {/if}
+    <ol aria-label="Activity records">
+      {#each diagnosticPage.records as record (record.id)}
+        <li><strong>{record.agentName}</strong> · {new Date(record.scheduledAt).toLocaleString()} · {record.roomId} · attempt {record.attempt} · {record.action ?? (record.attempt === 0 ? "Scheduling summary" : "No validated action")} · {record.outcome}
+          <p>Due {new Date(record.dueAt).toLocaleString()} · started {record.startedAt ? new Date(record.startedAt).toLocaleString() : "not started"} · ended {record.endedAt ? new Date(record.endedAt).toLocaleString() : "pending"}</p>
+          <details on:toggle={event => { if ((event.currentTarget as HTMLDetailsElement).open) void perform(async () => { diagnosticDetails = { ...diagnosticDetails, [record.id]: await request<DiagnosticRecord>("diagnostics:get", { id: record.id }) }; }); }}>
+            <summary>Inspect turn {record.turnId}, attempt {record.attempt}</summary>
+            {#if diagnosticDetails[record.id]}
+              {@const detail = diagnosticDetails[record.id].details}
+              {#if detail?.energySeen !== undefined}<p>Energy seen by model: {detail.energySeen}. Before action: {detail.energyBefore ?? "not applied"}. After action: {detail.energyAfter ?? "not applied"}.</p>{/if}
+              {#if detail?.sourceRoomId}<p>Applied location: {detail.sourceRoomId} → {detail.destinationRoomId}. {detail.moved ? "Location changed." : "Location unchanged."}</p>{/if}
+              {#if detail?.selfReport}<p>Model self-report: {detail.selfReport}</p>{/if}
+              {#if detail?.truncated}<p>Response capture is partial or incomplete. Capture limit: 4 MiB of provider stream data.</p>{/if}
+              <pre class="configuration-json">{JSON.stringify(diagnosticDetails[record.id], null, 2)}</pre>
+            {:else}<p>Loading details…</p>{/if}
+          </details>
+        </li>
+      {:else}<li>No matching records.</li>{/each}
+    </ol>
+    {#if diagnosticPage.hasMore}<button disabled={diagnosticLoading} on:click={() => loadDiagnostics(diagnosticPage.next)}>Next 50 older records</button>{/if}
+    {#if diagnosticBefore}<button disabled={diagnosticLoading} on:click={() => loadDiagnostics()}>Return to latest records</button>{/if}
   </section>
 </main>
 

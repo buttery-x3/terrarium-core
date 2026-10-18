@@ -14,6 +14,8 @@ import {
   messageInputSchema,
   roomInputSchema,
   runCommandSchema,
+  settingsSchema,
+  diagnosticFilterSchema,
   type ConversationMessage,
   type ConversationExport,
   type Result,
@@ -24,7 +26,7 @@ import {
   type LmProvider,
 } from '@terrarium/lm-providers';
 import { Scheduler } from './scheduler.js';
-import { performTurn } from './turns.js';
+import { performTurn, previewPrompt } from './turns.js';
 
 function conversationMarkdown(snapshot: ConversationExport) {
   const label = (value: string) => value
@@ -76,6 +78,7 @@ export async function createApplication(options: {
   const config = io.of('/config'),
     terrain = io.of('/terrain');
   const world = new World(options.db);
+  await world.interruptUnfinished();
   let clearingHistory = false;
   const checkHistoryWrite = () => {
     if (clearingHistory)
@@ -100,7 +103,7 @@ export async function createApplication(options: {
   };
   const scheduler = new Scheduler(
     world,
-    (agent, signal, current, applied) =>
+    (agent, signal, current, applied, attemptId) =>
       performTurn(
         world,
         agent,
@@ -110,10 +113,15 @@ export async function createApplication(options: {
         publishMessage,
         publishWorld,
         applied,
+        attemptId,
       ),
-    (state) => config.emit('run:state', state),
+    (state) => { config.emit('run:state', state); config.emit('diagnostics:changed'); },
   );
   scheduler.watch();
+  const energyUpdates = setInterval(() => {
+    void world.agents().then(agents => config.emit('energy:state', agents.map(({ id, energy }) => ({ id, energy }))))
+      .catch(() => config.emit('operation:error', 'Could not read current energy.'));
+  }, 1000);
 
   config.on('connection', (socket) => {
     const sendInitial = async () => {
@@ -148,7 +156,7 @@ export async function createApplication(options: {
                   )
                   .join('; ')
               : error instanceof Error &&
-                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT|Configuration|Conversation)/.test(
+                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT|Configuration|Conversation|Diagnostics)/.test(
                     error.message,
                   )
                 ? error.message
@@ -206,6 +214,30 @@ export async function createApplication(options: {
     command('config:export', z.object({}).strict(), () =>
       world.exportConfiguration(),
     );
+    command('settings:save', settingsSchema, async input => {
+      checkConfigurationWrite();
+      if (scheduler.snapshot().state !== 'stopped') throw new Error('Configuration settings require a stopped run. Choose Stop first.');
+      importingConfiguration = true;
+      try { const saved = await world.saveSettings(input); await publishWorld(); return saved; }
+      finally { importingConfiguration = false; }
+    });
+    command('prompt:preview', z.object({ agentId: z.string().min(1) }).strict(), async input => {
+      const agent = await world.agent(input.agentId);
+      if (!agent) throw new Error('Agent does not exist.');
+      return previewPrompt(world, agent);
+    });
+    command('diagnostics:list', diagnosticFilterSchema, input => world.diagnostics(input));
+    command('diagnostics:export', diagnosticFilterSchema, input => world.diagnostics(input, true));
+    command('diagnostics:get', z.object({ id: z.string().min(1) }).strict(), input => world.diagnostic(input.id));
+    command('diagnostics:usage', z.object({}).strict(), () => world.diagnosticUsage());
+    command('diagnostics:clear', z.object({ confirm: z.literal(true) }).strict(), async () => {
+      checkConfigurationWrite();
+      if (scheduler.snapshot().state !== 'stopped') throw new Error('Diagnostics clearing requires a stopped run. Choose Stop first.');
+      if (scheduler.hasActiveWork()) throw new Error('Diagnostics clearing must wait for cancelled attempts to finish. Try again shortly.');
+      importingConfiguration = true;
+      try { const deleted = await world.clearDiagnostics(); config.emit('diagnostics:changed'); return deleted; }
+      finally { importingConfiguration = false; }
+    });
     command('config:preview', configurationSchema, (input) =>
       world.previewConfiguration(input),
     );
@@ -236,7 +268,7 @@ export async function createApplication(options: {
         throw new Error('Connect ChatGPT before starting agents.');
       if (input === 'start') await scheduler.start();
       else if (input === 'pause') scheduler.pause();
-      else scheduler.stop();
+      else await scheduler.stop();
       return scheduler.snapshot();
     });
     command('auth:models', z.object({}).strict(), async () => {
@@ -265,7 +297,8 @@ export async function createApplication(options: {
       .catch((error) => logger.error({ error }, 'terrain state failed'));
   });
   app.addHook('preClose', async () => {
-    scheduler.close();
+    clearInterval(energyUpdates);
+    await scheduler.close();
     options.auth?.close();
     io.disconnectSockets(true);
     await new Promise<void>((resolve) => io.close(() => resolve()));

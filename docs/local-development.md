@@ -35,7 +35,7 @@ SQLite files and sidecars, Vite caches, and compiled output are ignored. Previou
 2. Wait for Connected. Model discovery fills suggestions; `gpt-6-luna` is the initial selection. A listed model still requires access through the signed-in account.
 3. Create or edit rooms. A fresh database initializes five rooms and no agents.
 4. Create an agent with a name, instructions, current room, model, cadence, and context limit of 1–50 messages. The form initially suggests 10–30 seconds and 50 messages. Enable the agent when ready. Saving configuration never automatically starts the run.
-5. Choose **Start**. Agents propose `speak`, `move`, or `wait`; the server validates and applies actions. Saved speech shows speaker names and timestamps.
+5. Choose **Start**. Agents propose `speak`, `move`, `wait`, or `eat`; the server validates and applies actions. Saved speech shows speaker names and timestamps. Eating requires enabled energy and a food-source current room.
 6. **Pause** stops new turns and finishes active turns. **Resume** continues scheduling. **Stop** cancels active work and discards late results. Disable/edit an agent to invalidate its old turn.
 
 Sign-in uses an ephemeral loopback callback and a ten-minute timeout. If opened in the wrong browser, restart the server to cancel the attempt, then begin from the intended browser. Credentials live under `%LOCALAPPDATA%/TerrariumCore/credentials`, encrypted with an AES key protected by Windows DPAPI for the current user. Directory access is restricted to that user and SYSTEM. Terrarium does not read another application's credentials or accept API keys. ChatGPT plan-usage tokens authorize Responses requests. See [authentication provenance](authentication-provenance.md).
@@ -52,7 +52,7 @@ Invalid IDs, already-deleted agents and failed writes return errors. Deletion is
 
 ## Export and import configuration
 
-Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 1`, `rooms`, and `agents`. It exports a consistent snapshot of all saved room and agent settings, including stable IDs, instructions, model, interval values in milliseconds, context limits, enabled flags and current room assignments. Conversation history, ChatGPT credentials, run state and internal agent revisions are excluded.
+Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 2`, `rooms`, `agents`, and `settings`. It exports a consistent snapshot of stable IDs, personality `instructions`, motivations, intention, model, intervals in milliseconds, context limits, enabled flags, room assignments, food-source flags, energy policy, shared prompts and diagnostic policy. Conversation history, credentials, current energy, diagnostic records, run state and internal revisions are excluded.
 
 Choose a JSON file to validate and preview each room/agent addition or update. IDs determine identity: matching IDs are updated, new IDs are created, and saved entries absent from the file remain. Names are editable labels, not matching keys. Every entry needs an ID. Agent room references may point to either a room in the file or an existing saved room. Unknown references, duplicate IDs, unsupported versions, extra fields and invalid settings are rejected with details. Files and their formatted representation must fit within 512 KiB, below the existing socket transport limit.
 
@@ -74,13 +74,13 @@ Connected config and terrain views reset affected rooms immediately. Pending his
 
 ## Model output and diagnostics
 
-Agent turns use Responses `text.format` with `type: "json_schema"` and `strict: true` through the existing ChatGPT sign-in token. The response is wrapped as `{"action":{"type":"speak","message":"..."}}`, `{"action":{"type":"move","roomId":"..."}}`, or `{"action":{"type":"wait"}}`. The wrapper permits a nested choice while keeping the schema root an object. Every object rejects extra fields. Speech requires non-whitespace content and an 8,000-character maximum. Local validation and world checks still run before applying the action; a valid shape alone cannot establish that a destination exists or a turn is current.
+Agent turns use Responses `text.format` with `type: "json_schema"` and `strict: true` through the existing ChatGPT sign-in token. The response wraps one `action` (speak, move, wait or eat) and a nullable `intention`, for example `{"action":{"type":"eat"},"intention":null}`. The wrapper permits a nested choice while keeping the schema root an object. Every object rejects extra fields. Speech requires non-whitespace content and an 8,000-character maximum. Local validation and world checks still run before applying the action; a valid shape alone cannot establish that a destination exists or a turn is current.
 
 This route was verified with real `gpt-6-luna` calls using Terrarium's existing ChatGPT connection. No additional credentials or dependencies are needed. Models that reject the schema produce an explicit provider error; Terrarium does not silently fall back to unconstrained text. See the official [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs) and [ChatGPT token-sharing inference guide](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
 
 The stream reader waits for successful completion and uses the final assistant message, separating commentary from action text. ChatGPT plan streams can leave `response.completed.output` empty, so completed output-item events are retained. Multiple final messages, refusals, unsupported tool calls and incomplete streams fail explicitly.
 
-An exhausted turn shows the attempt count and specific failure in the agent's existing status area. Invalid JSON and action-schema failures include the model, failing fields, response/request IDs when available, output length and a preview capped at 240 characters. Application failures identify the proposed action and reason. Provider errors include HTTP status or stream event, bounded error code/message/parameter/reason, and available IDs. Credentials and complete room histories are not included. These are current run diagnostics, not a persistent error archive; starting the next turn or choosing Stop clears the error.
+An exhausted turn shows the attempt count and specific failure in the agent's existing status area. Invalid JSON and action-schema failures include the model, failing fields, response/request IDs when available, output length and a preview capped at 240 characters. Application failures identify the proposed action and reason. Provider errors include HTTP status or stream event, bounded error code/message/parameter/reason, and available IDs. Credentials and complete room histories are not included. The transient run status clears on the next turn or Stop; durable attempt records remain in Decision diagnostics until explicitly cleared.
 
 ## Socket contracts
 
@@ -96,7 +96,7 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |
 | `agents:delete`  | `{ id }`; deletes one agent, cancels its active turn and preserves messages; returns `{ id }` and publishes updated world/run state. Blocked during configuration import. |
 | `config:export`  | `{}`; returns the versioned configuration file object. |
-| `config:preview` | Configuration file object; validates references and returns `{ token, rooms, agents }`, each preview entry containing `{ id, name, operation: 'add' \| 'update' }`. |
+| `config:preview` | Configuration file object; validates references and returns `{ token, rooms, agents, defaults, settingsChanged }`, each entity entry containing `{ id, name, operation: 'add' \| 'update' }`. |
 | `config:import`  | `{ configuration, previewToken }`; requires a stopped run and a current preview; atomically merges configuration and returns the applied preview. |
 | `run:control`    | `'start'`, `'pause'`, `'stop'`; returns run state.                                                                                                                       |
 | `auth:login`     | `{}`; returns browser sign-in URL. Credentials stay on the server.                                                                                                       |
@@ -105,3 +105,51 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 `world:state`, `run:state`, and `auth:state` synchronize the operator UI. Both namespaces receive `conversation:message` after persistence, carrying `{ id, roomId, agentId, speaker, createdAt, content }`, and `conversation:cleared` carrying `{ roomIds, deletedMessages }` after deletion commits. Humans use agent ID `config-ui` and speaker `Human`. `/terrain` also receives `rooms:list`.
 
 History pages contain up to 100 messages ordered oldest to newest by saved timestamp and ID. Initially select the latest page; `before` retrieves older pages; `after` remains available for forward retrieval. The client merges live delivery and history by ID. On reconnect, it discards local history and pagination caches and fetches the latest page so offline deletion is reflected. Cleared rooms invalidate pending history requests; stale acknowledgements cannot repopulate them. New timestamps advance monotonically while messages remain saved to prevent same-millisecond inserts falling behind a cursor.
+
+## FLAME-146 energy, profiles and prompting
+
+Mark any room **Provides unlimited food** in its editor. Names and IDs have no special meaning; several food sources may coexist. Then, while stopped, enable energy under **Shared behaviour and energy**. Enabling/starting without a food source, or removing the last source while enabled, is rejected.
+
+Defaults: energy is disabled; initial/maximum 100; depletion 5 points per running minute; low energy at 25 or below; meals fill to maximum. Without meals, a full agent becomes low after 15 running minutes and reaches zero after 20. Initial energy applies to newly created agents. A maximum below an existing current value is rejected. Zero clamps at zero and does not prohibit speaking, movement, eating or waiting.
+
+Only enabled agents drain energy while the simulation runs. Passive decay uses elapsed time and is checkpointed on scheduler ticks, action/context boundaries and lifecycle changes; retries and cadence do not add charges. Pause freezes decay immediately while allowing already-active turns and their existing bounded retries to finish. An active meal may refill energy during Pause. Stop cancels pending work and preserves energy; restart starts stopped without offline catch-up or refill. An abrupt crash preserves the last committed checkpoint, so the uncommitted fraction of a running interval is not recovered offline.
+
+Personality remains the original `instructions` field, preserved verbatim. **Motivations and preferences** is separate text (up to 8,000 characters); **Current intention** is an optional operator-configured aim (up to 1,000). Neither is an accumulating boredom meter. Agents may return an optional self-report of up to 240 characters for a single decision. It appears only in diagnostics and is never carried into future prompts. No private notes, memory or relationships are introduced.
+
+The five shared prompt fields are assembled in this order: role/framing, profile interpretation, action selection, energy/food guidance, and reminders. They are followed by resolved local data and enforced protocol constraints. Defaults support self-direction, choosing an action before speech, prioritising food when low, and accepting quiet waiting without a compulsory novelty or conversation objective. Each field has a Restore default button; saving requires Stop. Required missing/blank fields fail validation; reminders may explicitly be empty. There is no hidden replacement prompt.
+
+**Preview saved prompt** displays the saved instructions in request order, observed history, enforced schema and complete provider-body preview. It performs no model request, creates no diagnostic turn and mutates no world state. The snapshot includes own profile and energy/rules, current room, locally present names/IDs and the public room directory with food flags. Remote occupancy, remote/private profiles and transcripts, and operator logs are excluded. Recent local history still includes messages from before arrival.
+
+The provider schema now also accepts `{"action":{"type":"eat"},"intention":null}`. Provider requests require the nullable `intention` field; local validation continues to accept older action-only responses. The server authorises exactly one action, checks current location/capability when applying eating, and records rejected attempts. Saying “I ate” is only speech. A move to the same room is recorded as an applied no-op. Eating fills current energy transactionally and generates activity, not fabricated speech.
+
+## Persistent decision diagnostics
+
+**Decision diagnostics** has filters for agent ID (including deleted IDs), decision room, action, outcome and scheduled time. It loads 50 summary rows per page; details are fetched on expansion. Attempt 0 is the scheduling/turn summary; attempts 1–3 share its turn ID. A scheduled/cancelled-before-start entry has no model decision. Failures are never represented as waits.
+
+Each attempt starts durably before the provider is called. Its saved data includes the configured model, settings version and agent revision, exact local context, exact submitted provider body (`instructions`, `input`, model, streaming/storage flags and output schema), final action text, parsed proposal, optional self-report, available request/response IDs, result and timings. Applied actions include source/destination, real-movement versus no-op, saved speech message ID and energy seen/before/after plus passive depletion. Notification failure keeps the committed action applied and prevents retrying it. Provider, timeout, parse, schema, world-validation, persistence, stale, cancelled and interrupted outcomes remain separate.
+
+Only the application-controlled request body and relevant action/error fields are captured. Authorization headers, access/refresh tokens, credential stores and authentication payloads never enter diagnostics. Provider-internal instructions and hidden reasoning are not visible. The existing 4 MiB provider stream limit remains; incomplete/error captures are explicitly marked partial. Successful payloads and final outputs are not silently truncated.
+
+The default diagnostic budget is 256 MiB, configurable from 32 to 16,384 MiB. This measures saved JSON payload bytes plus a 1 KiB row allowance, not total SQLite disk usage. Each started attempt reserves 8 MiB before a request is admitted. The run pauses visibly if the budget or durable logging cannot be satisfied; no automatic pruning occurs. A request whose payload/evidence exceeds its reservation is rejected before submission/application and the run pauses. Resolve storage failures, or choose Stop and increase the budget or export/clear diagnostics, then Start. Previously unfinished rows are marked interrupted on server startup; successful evidence is retained.
+
+**Export filtered diagnostics** downloads JSON using bounded retrieval pages. Records already passed by a running export can subsequently finish; Stop first for a quiescent export. **Clear diagnostics** requires Stop, finished cancellation bookkeeping and explicit confirmation, and deletes all stored diagnostic snapshots. It leaves conversation history and configuration intact. Conversation clearing and agent deletion retain diagnostics, including saved names and copied conversation text; the conversation-clear confirmation states this explicitly. Downloaded files are independent copies and are never removed by either clear operation.
+
+## Configuration version 1 compatibility and new commands
+
+Version-1 files remain importable. Existing food flags, motivations, intentions and shared settings are preserved when absent from the older file. New rooms default to non-food sources; new agents receive empty motivation/intention sections and the configured initial energy. The preview lists new defaults, additions/updates and whether shared settings change. Version 2 requires complete shared settings, food flags and profile sections. Unsupported versions and unknown fields fail validation. Imports preserve current energy for existing agents, omitted entities and history, apply atomically while stopped and retain stale-preview protection. Runtime energy decay alone does not change configuration revisions or invalidate previews.
+
+Migration 2 adds food/profile/energy fields, versioned settings and indexed decision records after the existing migration. Migration 1 is not replayed or rewritten. Existing data is preserved; upgraded worlds start with energy disabled and no food-source flags.
+
+Additional `/config` commands:
+
+| Command | Input/result |
+| --- | --- |
+| `settings:save` | Complete `{ energy, prompts, diagnostics }`; stopped only; returns saved value/version. |
+| `prompt:preview` | `{ agentId }`; returns local context, fixed constraints and provider-body preview. |
+| `diagnostics:list` | Optional agentId, roomId, action, outcome, ISO from/to, sequence before, limit 1–100 (default 50); summary page. |
+| `diagnostics:get` | `{ id }`; one record with saved details. |
+| `diagnostics:export` | Same filters/pagination; includes saved details. |
+| `diagnostics:usage` | `{}`; used/reserved/limit bytes and manual retention policy. |
+| `diagnostics:clear` | `{ confirm: true }`; stopped and idle only; deletes all diagnostic rows. |
+
+`world:state` includes shared settings/version and current agent energy. `energy:state` publishes current values separately, without invalidating configuration previews; `diagnostics:changed` refreshes the visible latest summary page. Terrain retains its existing message/room contracts.

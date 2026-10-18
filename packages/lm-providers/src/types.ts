@@ -13,6 +13,11 @@ export interface LmCompletionRequest {
   maxTokens?: number;
   responseFormat?: { name: string; schema: Record<string, unknown> };
   signal?: AbortSignal;
+  onRequest?: (payload: Record<string, unknown>) => Promise<void>;
+}
+
+export class ProviderError extends Error {
+  constructor(message: string, readonly details: { requestId?: string; responseId?: string; output?: string; truncated?: boolean } = {}) { super(message); }
 }
 
 export interface LmCompletionResponse {

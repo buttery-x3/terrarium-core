@@ -187,3 +187,13 @@ Checks on 18 October 2026 used Node 24.15.0 and pnpm 10.26.2. They describe the 
 | Documentation                          | Both files passed formatting checks; all eleven relative links resolved.                                                                                              |
 
 The first development attempt failed because the installed `better-sqlite3` binary targeted a different Node ABI. Rebuilding that existing dependency in `packages/persistence` repaired the local installation without changing source, manifests, or the lockfile. A successful development run after a build does not prove the fresh-checkout startup race is resolved. The smoke check did not exercise a real model call or browser interaction.
+
+## Approved FLAME-146 implementation
+
+The user approved the bounded plan and defaults on 18 October 2026 after the local and remote main commits were verified as `b1eea79`. Work is on `codex/flame-146` and extends the existing shared contracts, ordered migrations/world operations, scheduler/turn pipeline, ChatGPT payload boundary, config UI and their existing tests. No dependencies, build configuration, authentication redesign or terrain expansion are included.
+
+Approved decisions: energy disabled initially; initial/maximum 100, depletion 5 per running minute, low at 25, meals filling to maximum; zero permits all actions; freeze while paused/stopped/disabled/offline and preserve energy across Stop/restart. Active Pause work may finish, including meals. Initial changes affect new agents; maximum cannot be below existing energy. At least one food source is required for an enabled loop.
+
+Profiles preserve `instructions` as personality and add separate motivations/operator intention. Optional model-declared intention is diagnostic-only and never becomes memory. Shared behavioural prompts are editable/restorable, with a request-free preview and exact actual-request capture. Shared settings edits require Stop. Diagnostic retention is manual, defaults to a 256 MiB payload budget with in-flight reservations, and pauses on insufficient capacity/logging failures. Conversation clearing retains diagnostic copies with an explicit warning; separate diagnostic clearing requires Stop and confirmation.
+
+The implementation adds version-2 configuration while preserving version-1 imports, current runtime energy, IDs, histories, omitted records, preview validity checks and atomic rollback. See local-development.md for shipped behaviour, field limits and recovery procedures, and implementation-validation.md for validation evidence.

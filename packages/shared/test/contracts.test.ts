@@ -7,9 +7,22 @@ import {
   configurationSchema,
   clearHistorySchema,
   deleteAgentSchema,
+  defaultSettings, settingsSchema, actionResponseSchema,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('requires complete version-2 prompt settings without restoring missing defaults', () => {
+    expect(configurationSchema.parse({ format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: defaultSettings }).settings).toEqual(defaultSettings);
+    for (const prompts of [{}, { ...defaultSettings.prompts, framing: '' }, { ...defaultSettings.prompts, energy: undefined }])
+      expect(settingsSchema.safeParse({ ...defaultSettings, prompts }).success).toBe(false);
+    expect(settingsSchema.safeParse({ ...defaultSettings, energy: { ...defaultSettings.energy, initial: 101 } }).success).toBe(false);
+    expect(configurationSchema.safeParse({ format: 'terrarium-config', version: 3, rooms: [], agents: [] }).success).toBe(false);
+  });
+  it('allows one eat action and a bounded self-report, never arbitrary energy changes', () => {
+    expect(actionResponseSchema.parse({ action: { type: 'eat' }, intention: null })).toEqual({ action: { type: 'eat' }, intention: null });
+    for (const value of [{ action: { type: 'eat', energy: 100 } }, { action: { type: 'eat' }, intention: 'a'.repeat(241) }, { action: [{ type: 'move', roomId: 'food' }, { type: 'eat' }] }])
+      expect(actionResponseSchema.safeParse(value).success).toBe(false);
+  });
   it('requires one explicit agent ID for deletion', () => {
     expect(deleteAgentSchema.parse({ id: 'agent-1' })).toEqual({ id: 'agent-1' });
     for (const input of [null, {}, { id: '' }, { id: 1 }, { id: 'agent-1', deleteMessages: true }])

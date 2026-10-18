@@ -1,5 +1,5 @@
 import { boundedJson, type ChatGptAuth } from './chatgpt-auth.js';
-import type { LmCompletionResponse, LmProvider } from './types.js';
+import { ProviderError, type LmCompletionRequest, type LmCompletionResponse, type LmProvider } from './types.js';
 
 function errorDetails(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
@@ -24,8 +24,9 @@ export async function readResponse(
     response.headers.get('request-id') ??
     undefined;
   let responseId: string | undefined;
+  let captured = '';
   const failure = (reason: string) =>
-    new Error(
+    new ProviderError(
       [
         reason,
         responseId ? `Response: ${responseId}.` : '',
@@ -33,6 +34,7 @@ export async function readResponse(
       ]
         .filter(Boolean)
         .join(' '),
+      { requestId, responseId, output: captured, truncated: true },
     );
   if (!response.ok) {
     const body = await boundedJson(response, 65536).catch(() => undefined);
@@ -122,6 +124,7 @@ export async function readResponse(
               ? (textParts.get(key) ?? '') + part
               : part,
           );
+          captured = [...textParts.values()].join('\n');
         }
         if (event.type === 'response.completed') {
           if (event.response?.status !== 'completed')
@@ -210,6 +213,9 @@ export function createChatGptProvider(auth: ChatGptAuth): LmProvider {
     async complete(request) {
       const token = await auth.token();
       request.signal?.throwIfAborted();
+      const payload = createChatGptPayload(request);
+      await request.onRequest?.(payload);
+      request.signal?.throwIfAborted();
       const response = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
         redirect: 'error',
@@ -219,41 +225,29 @@ export function createChatGptProvider(auth: ChatGptAuth): LmProvider {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
         },
-        body: JSON.stringify({
-          model: request.model,
-          stream: true,
-          store: false,
-          instructions: request.messages
-            .filter((message) => message.role === 'system')
-            .map((message) => message.content)
-            .join('\n'),
-          input: request.messages.filter(
-            (message) => message.role !== 'system',
-          ),
-          ...(request.responseFormat
-            ? {
-                text: {
-                  format: {
-                    type: 'json_schema',
-                    name: request.responseFormat.name,
-                    strict: true,
-                    schema: request.responseFormat.schema,
-                  },
-                },
-              }
-            : {}),
-        }),
+        body: JSON.stringify(payload),
       });
       const result = await readResponse(response).catch(
         (error: unknown) => {
-          throw new Error(
+          throw new ProviderError(
             `${error instanceof Error ? error.message : 'ChatGPT response failed.'} Model: ${request.model}.`,
+            error instanceof ProviderError ? error.details : {},
           );
         },
       );
       request.signal?.throwIfAborted();
       return result;
     },
+  };
+}
+
+export function createChatGptPayload(request: LmCompletionRequest): Record<string, unknown> {
+  return {
+    model: request.model, stream: true, store: false,
+    instructions: request.messages.filter(message => message.role === 'system').map(message => message.content).join('\n'),
+    input: request.messages.filter(message => message.role !== 'system'),
+    ...(request.responseFormat ? { text: { format: { type: 'json_schema', name: request.responseFormat.name,
+      strict: true, schema: request.responseFormat.schema } } } : {}),
   };
 }
 

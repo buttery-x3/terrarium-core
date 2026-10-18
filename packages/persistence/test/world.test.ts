@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sql } from 'kysely';
-import type { Configuration } from '@terrarium/shared';
+import { defaultSettings, type Configuration } from '@terrarium/shared';
 import {
   createDb,
   ensureTables,
@@ -15,6 +15,7 @@ import {
 const databases: ReturnType<typeof createDb>[] = [];
 const directories: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const db of databases.splice(0)) await db.destroy();
   for (const directory of directories.splice(0)) {
     if (!directory.startsWith(join(tmpdir(), 'terrarium-test-')))
@@ -41,6 +42,162 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('recovers interrupted attempts and energy after reopening the database without changing applied evidence', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
+    directories.push(directory);
+    const path = join(directory, 'diagnostic-restart.db'), firstDb = createDb(path);
+    await ensureTables(firstDb);
+    const first = new World(firstDb), agent = await first.saveAgent(agentInput);
+    await firstDb.updateTable('agents').set({ energy: 42 }).where('id', '=', agent.id).execute();
+    const turn = await first.scheduleTurn(agent, Date.now()), attempt = await first.startAttempt(turn, 1, agent);
+    await first.updateDiagnostic(attempt, { payload: { instructions: 'Exact saved input' } });
+    await firstDb.destroy();
+    const reopened = createDb(path); databases.push(reopened);
+    await ensureTables(reopened);
+    const world = new World(reopened);
+    await world.interruptUnfinished();
+    expect(await world.diagnostic(attempt)).toMatchObject({ outcome: 'interrupted', details: { payload: { instructions: 'Exact saved input' } } });
+    expect((await world.diagnosticUsage()).reservedBytes).toBe(0);
+    await world.syncEnergy(Date.now() + 86400000);
+    expect((await world.agent(agent.id))?.energy).toBe(42);
+  });
+  it('reserves capacity before requests and preserves terminal cancellation against late writes', async () => {
+    const world = await fixture(), agent = await world.saveAgent(agentInput);
+    await world.saveSettings({ ...defaultSettings, diagnostics: { retention: 'manual', maxPayloadMiB: 32 } });
+    const turn = await world.scheduleTurn(agent, Date.now());
+    const attempts = [];
+    for (let index = 1; index <= 3; index++) attempts.push(await world.startAttempt(turn, index, agent));
+    await expect(world.startAttempt(turn, 4, agent)).rejects.toThrow('capacity');
+    await world.updateDiagnostic(attempts[0], { error: 'Cancelled' }, 'cancelled');
+    await world.updateDiagnostic(attempts[0], { output: 'late reply' }, 'applied');
+    expect(await world.diagnostic(attempts[0])).toMatchObject({ outcome: 'cancelled', details: { error: 'Cancelled' } });
+    expect((await world.diagnostic(attempts[0])).details).not.toHaveProperty('output');
+    await expect(world.startAttempt(turn, 4, agent)).resolves.toBeTypeOf('string');
+  });
+  it('drains elapsed running time independently of turns, freezes disabled agents and preserves restart energy', async () => {
+    const world = await fixture();
+    let now = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    await world.saveRoom({ id: 'room-2', name: 'Orchard', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true } });
+    const fast = await world.saveAgent(agentInput);
+    const slow = await world.saveAgent({ ...agentInput, minIntervalMs: 60000, maxIntervalMs: 60000 });
+    const disabled = await world.saveAgent({ ...agentInput, enabled: false });
+    await world.syncEnergy(now, true);
+    now = 60000;
+    await world.syncEnergy();
+    await world.syncEnergy();
+    await world.applyAction(fast.id, fast.revision, { type: 'wait' }, () => true);
+    expect((await world.agent(fast.id))?.energy).toBe(95);
+    expect((await world.agent(slow.id))?.energy).toBe(95);
+    expect((await world.agent(disabled.id))?.energy).toBe(100);
+    expect((await world.agent(fast.id))?.revision).toBe(fast.revision);
+    now = 120000;
+    await world.syncEnergy(now, false);
+    now = 900000;
+    await world.syncEnergy();
+    expect((await world.agent(fast.id))?.energy).toBe(90);
+    const restarted = new World(world.db);
+    await restarted.syncEnergy(now + 86400000);
+    expect((await restarted.agent(fast.id))?.energy).toBe(90);
+    await world.syncEnergy(now, true);
+    now += 9999999;
+    await world.syncEnergy();
+    expect((await world.agent(fast.id))?.energy).toBe(0);
+    await world.applyAction(fast.id, fast.revision, { type: 'speak', message: 'Still able to speak.' }, () => true);
+  });
+
+  it('uses room capability for two sources, validates meals and records atomic move/eat evidence', async () => {
+    const world = await fixture();
+    await world.saveRoom({ id: 'room-1', name: 'Canteen', description: '' });
+    const food = await world.saveRoom({ name: 'Arbitrary food location', description: '', isFoodSource: true });
+    await world.saveRoom({ id: 'room-2', name: 'Another', description: '', isFoodSource: true });
+    await world.saveRoom({ ...food, name: 'Renamed' });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 10 } });
+    let agent = await world.saveAgent(agentInput);
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true)).rejects.toThrow('food-source');
+    const turn = await world.scheduleTurn(agent, Date.now()), attempt = await world.startAttempt(turn, 1, agent);
+    await world.updateDiagnostic(attempt, { energySeen: 10 });
+    await world.applyAction(agent.id, agent.revision, { type: 'move', roomId: food.id }, () => true, attempt);
+    expect((await world.diagnostic(attempt)).details).toMatchObject({ moved: true, sourceRoomId: 'room-1', destinationRoomId: food.id });
+    agent = (await world.agent(agent.id))!;
+    const eat = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true, eat);
+    expect((await world.diagnostic(eat)).details).toMatchObject({ energyBefore: 10, energyAfter: 100 });
+    expect((await world.history({ roomId: food.id })).messages).toHaveLength(0);
+    await world.applyAction(agent.id, agent.revision, { type: 'move', roomId: 'room-2' }, () => true);
+    agent = (await world.agent(agent.id))!;
+    await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true);
+    expect((await world.agent(agent.id))?.energy).toBe(100);
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => false)).rejects.toThrow('no longer current');
+  });
+
+  it('rolls back a world mutation if its diagnostic evidence cannot be saved', async () => {
+    const world = await fixture(), agent = await world.saveAgent(agentInput);
+    const id = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await sql`CREATE TRIGGER reject_evidence BEFORE UPDATE ON decisions WHEN NEW.outcome = 'applied' BEGIN SELECT RAISE(ABORT, 'Evidence failed'); END`.execute(world.db);
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Must roll back' }, () => true, id)).rejects.toThrow('Evidence failed');
+    expect((await world.history({ roomId: agent.roomId })).messages).toHaveLength(0);
+    expect((await world.diagnostic(id)).outcome).toBe('running');
+  });
+
+  it('rejects enabling without food, removing the last source and lowering maximum below current energy', async () => {
+    const world = await fixture();
+    const enabled = { ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true } };
+    await expect(world.saveSettings(enabled)).rejects.toThrow('food-source');
+    const room = await world.saveRoom({ name: 'Source', description: '', isFoodSource: true });
+    await world.saveSettings(enabled);
+    await world.saveAgent(agentInput);
+    await expect(world.saveRoom({ ...room, isFoodSource: false })).rejects.toThrow('last food-source');
+    await expect(world.saveSettings({ ...enabled, energy: { ...enabled.energy, initial: 20, maximum: 50 } })).rejects.toThrow('current energy');
+    const configuration = await world.exportConfiguration();
+    configuration.rooms.forEach(room => { room.isFoodSource = false; });
+    await expect(world.previewConfiguration(configuration)).rejects.toThrow('food-source');
+  });
+
+  it('preserves newer settings and runtime energy on version-1 imports and round trips profiles in version 2', async () => {
+    const world = await fixture();
+    const room = await world.saveRoom({ name: 'Food', description: '', isFoodSource: true });
+    const agent = await world.saveAgent({ ...agentInput, motivations: 'Enjoy quiet', intention: 'Visit the orchard' });
+    await world.db.updateTable('agents').set({ energy: 31 }).where('id', '=', agent.id).execute();
+    const v1: Configuration = { format: 'terrarium-config', version: 1, rooms: [{ id: room.id, name: 'Renamed', description: '' }], agents: [{ ...agentInput, id: agent.id }] };
+    const preview = await world.previewConfiguration(v1);
+    expect(preview.defaults.join(' ')).toContain('preserved');
+    await world.importConfiguration(v1, preview.token);
+    expect(await world.agent(agent.id)).toMatchObject({ energy: 31, motivations: 'Enjoy quiet', intention: 'Visit the orchard', instructions: agent.instructions });
+    expect((await world.rooms()).find(item => item.id === room.id)?.isFoodSource).toBe(true);
+    const olderWithSettings: Configuration = { ...v1,
+      settings: { ...defaultSettings, energy: { ...defaultSettings.energy, initial: 7 } },
+      agents: [{ ...agentInput, id: 'new-older-agent' }],
+    };
+    const olderPreview = await world.previewConfiguration(olderWithSettings);
+    expect(olderPreview.defaults.join(' ')).toContain('initial energy 100');
+    await world.importConfiguration(olderWithSettings, olderPreview.token);
+    expect((await world.agent('new-older-agent'))?.energy).toBe(100);
+    expect((await world.settings()).value).toEqual(defaultSettings);
+    const v2 = await world.exportConfiguration();
+    expect(v2.agents[0]).not.toHaveProperty('energy');
+    const destination = await fixture();
+    await destination.importConfiguration(v2, (await destination.previewConfiguration(v2)).token);
+    expect(await destination.exportConfiguration()).toEqual(v2);
+  });
+
+  it('retains attributed diagnostics after deletion/clearing and paginates without inline payloads', async () => {
+    const world = await fixture(), agent = await world.saveAgent(agentInput);
+    const turn = await world.scheduleTurn(agent, Date.now()), id = await world.startAttempt(turn, 1, agent);
+    await world.updateDiagnostic(id, { payload: { input: 'saved conversation snapshot' } }, 'provider');
+    await world.deleteAgent(agent.id);
+    await world.clearHistory({ scope: 'all' });
+    const page = await world.diagnostics({ agentId: agent.id, limit: 1 });
+    expect(page.records[0]).toMatchObject({ agentName: agent.name, attempt: 1 });
+    expect(page.records[0]).not.toHaveProperty('details');
+    expect(page.hasMore).toBe(true);
+    expect((await world.diagnostics({ before: page.next })).records[0].attempt).toBe(0);
+    expect((await world.diagnostics({ outcome: 'provider' }, true)).records[0].details?.payload).toEqual({ input: 'saved conversation snapshot' });
+    await world.interruptUnfinished();
+    expect((await world.diagnostic(turn)).outcome).toBe('interrupted');
+    expect((await world.diagnostic(id)).outcome).toBe('provider');
+  });
   it('exports every room and all ordered messages, including a deleted agent and older pages', async () => {
     const world = await fixture();
     await world.db.insertInto('messages').values(['tie-b', 'tie-a'].map(id => ({
@@ -121,7 +278,7 @@ describe('persisted world', () => {
       await world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Keep my words.' }, () => true);
       await world.speak('room-1', 'Keep human words.');
       history = await world.history({ roomId: 'room-1' });
-      preserved = { rooms: await world.rooms(), agents: [other] };
+      preserved = { ...(await world.state()), agents: [other] };
       expect(await world.deleteAgent(agent.id)).toEqual({ id: agent.id });
       expect(await world.state()).toEqual(preserved);
       expect(await world.history({ roomId: 'room-1' })).toEqual(history);
@@ -218,6 +375,7 @@ describe('persisted world', () => {
       'agents',
       'format',
       'rooms',
+      'settings',
       'version',
     ]);
     expect(configuration.agents[0]).not.toHaveProperty('revision');
@@ -391,7 +549,7 @@ describe('persisted world', () => {
     });
     expect(
       await db.selectFrom('schema_migrations').selectAll().execute(),
-    ).toEqual([{ version: 1 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }]);
     const unchanged = new Database(legacy, { readonly: true });
     expect(unchanged.prepare('PRAGMA table_info(agents)').all()).toHaveLength(
       4,

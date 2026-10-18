@@ -2,13 +2,15 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Kysely, SqliteDialect } from 'kysely';
+import { Kysely, SqliteDialect, type Generated } from 'kysely';
+import { defaultSettings } from '@terrarium/shared';
 
 export interface DB {
   rooms: {
     id: string;
     name: string;
     description: string;
+    is_food_source: Generated<number>;
   };
   agents: {
     id: string;
@@ -22,6 +24,9 @@ export interface DB {
     enabled: number;
     context_message_limit: number;
     revision: number;
+    motivations: Generated<string>;
+    intention: Generated<string>;
+    energy: Generated<number>;
   };
   messages: {
     id: string;
@@ -32,6 +37,13 @@ export interface DB {
     speaker_name: string;
   };
   schema_migrations: { version: number };
+  settings: { id: number; version: number; value: string };
+  decisions: {
+    sequence: Generated<number>; id: string; turn_id: string; agent_id: string; agent_name: string; room_id: string;
+    scheduled_at: string; due_at: string; started_at: string | null; ended_at: string | null;
+    attempt: number; model: string; action: string | null; outcome: string; details: string;
+    bytes: number; reserved_bytes: number;
+  };
 }
 
 export const defaultDatabasePath = fileURLToPath(new URL('../../../data/terrarium.db', import.meta.url));
@@ -50,7 +62,7 @@ export const ensureTables = async (db: Kysely<DB>) => {
   await db.schema.createTable('schema_migrations').ifNotExists()
     .addColumn('version', 'integer', column => column.primaryKey()).execute();
   const applied = await db.selectFrom('schema_migrations').selectAll().execute();
-  if (applied.some(row => row.version === 1)) return;
+  if (!applied.some(row => row.version === 1)) {
   await db.schema
     .createTable('rooms')
     .ifNotExists()
@@ -96,6 +108,35 @@ export const ensureTables = async (db: Kysely<DB>) => {
   }
   await db.schema.createIndex('messages_room_order').ifNotExists().on('messages').columns(['room_id', 'created_at', 'id']).execute();
   await db.insertInto('schema_migrations').values({ version: 1 }).execute();
+  }
+  if (!applied.some(row => row.version === 2)) {
+    await db.schema.alterTable('rooms').addColumn('is_food_source', 'integer', column => column.notNull().defaultTo(0)).execute();
+    await db.schema.alterTable('agents').addColumn('motivations', 'text', column => column.notNull().defaultTo('')).execute();
+    await db.schema.alterTable('agents').addColumn('intention', 'text', column => column.notNull().defaultTo('')).execute();
+    await db.schema.alterTable('agents').addColumn('energy', 'real', column => column.notNull().defaultTo(100)).execute();
+    await db.schema.createTable('settings').addColumn('id', 'integer', column => column.primaryKey())
+      .addColumn('version', 'integer', column => column.notNull()).addColumn('value', 'text', column => column.notNull()).execute();
+    await db.insertInto('settings').values({ id: 1, version: 1, value: JSON.stringify(defaultSettings) }).execute();
+    await db.schema.createTable('decisions')
+      .addColumn('sequence', 'integer', column => column.primaryKey().autoIncrement())
+      .addColumn('id', 'text', column => column.notNull().unique())
+      .addColumn('turn_id', 'text', column => column.notNull())
+      .addColumn('agent_id', 'text', column => column.notNull())
+      .addColumn('agent_name', 'text', column => column.notNull())
+      .addColumn('room_id', 'text', column => column.notNull())
+      .addColumn('scheduled_at', 'text', column => column.notNull())
+      .addColumn('due_at', 'text', column => column.notNull())
+      .addColumn('started_at', 'text').addColumn('ended_at', 'text')
+      .addColumn('attempt', 'integer', column => column.notNull())
+      .addColumn('model', 'text', column => column.notNull()).addColumn('action', 'text')
+      .addColumn('outcome', 'text', column => column.notNull())
+      .addColumn('details', 'text', column => column.notNull())
+      .addColumn('bytes', 'integer', column => column.notNull())
+      .addColumn('reserved_bytes', 'integer', column => column.notNull()).execute();
+    await db.schema.createIndex('decisions_turn').on('decisions').columns(['turn_id', 'attempt']).execute();
+    await db.schema.createIndex('decisions_filter').on('decisions').columns(['agent_id', 'room_id', 'sequence']).execute();
+    await db.insertInto('schema_migrations').values({ version: 2 }).execute();
+  }
   });
 };
 

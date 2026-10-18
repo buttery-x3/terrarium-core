@@ -60,6 +60,46 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('previews saved settings without a model request and enforces stopped settings edits', async () => {
+    const complete = vi.fn(async () => ({ content: '{"action":{"type":"wait"}}' }));
+    const url = await setup({ name: 'fake', complete }), socket = connect(url);
+    await ready(socket);
+    const agent = await application.world.saveAgent({ name: 'Preview', instructions: 'Personality', motivations: 'Solitude', intention: '', roomId: 'room-1',
+      provider: 'chatgpt', model: 'fake', enabled: false, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50 });
+    const settings = (await application.world.settings()).value;
+    settings.prompts.framing = 'VISIBLE EDITED FRAMING';
+    expect((await request(socket, 'settings:save', settings)).ok).toBe(true);
+    const preview = await request(socket, 'prompt:preview', { agentId: agent.id });
+    expect(preview.value.payload.instructions).toContain('VISIBLE EDITED FRAMING');
+    expect(complete).not.toHaveBeenCalled();
+    expect((await application.world.diagnostics()).records).toHaveLength(0);
+    await application.scheduler.start();
+    expect((await request(socket, 'settings:save', settings)).error).toContain('Choose Stop');
+    application.scheduler.pause();
+    expect((await request(socket, 'settings:save', settings)).error).toContain('Choose Stop');
+    application.scheduler.stop();
+    expect((await request(socket, 'settings:save', { ...settings, prompts: {} })).ok).toBe(false);
+  });
+  it('pages and exports diagnostic snapshots and requires explicit stopped clearing', async () => {
+    const url = await setup(), socket = connect(url);
+    await ready(socket);
+    const agent = await application.world.saveAgent({ name: 'Diagnosed', instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt', model: 'fake',
+      enabled: false, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50 });
+    const id = await application.world.startAttempt(await application.world.scheduleTurn(agent, Date.now()), 1, agent);
+    await application.world.updateDiagnostic(id, { payload: { input: 'SAVED SNAPSHOT' } }, 'provider');
+    const page = await request(socket, 'diagnostics:list', { limit: 1 });
+    expect(page.value.records[0]).not.toHaveProperty('details');
+    expect(page.value.hasMore).toBe(true);
+    expect((await request(socket, 'diagnostics:get', { id })).value.details.payload.input).toBe('SAVED SNAPSHOT');
+    expect((await request(socket, 'diagnostics:export', { outcome: 'provider' })).value.records[0].details.payload.input).toBe('SAVED SNAPSHOT');
+    expect((await request(socket, 'diagnostics:usage', {})).value.bytes).toBeGreaterThan(0);
+    expect((await request(socket, 'diagnostics:clear', {})).ok).toBe(false);
+    await application.scheduler.start();
+    expect((await request(socket, 'diagnostics:clear', { confirm: true })).error).toContain('Choose Stop');
+    application.scheduler.stop();
+    expect((await request(socket, 'diagnostics:clear', { confirm: true })).ok).toBe(true);
+    expect((await application.world.diagnostics()).records).toHaveLength(0);
+  });
   it('exports readable Markdown with protected labels, multiline messages and empty rooms while running', async () => {
     const url = await setup(), config = connect(url);
     await ready(config);
@@ -283,7 +323,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 1,
+      version: 2,
       agents: [],
     });
     const configuration = {
@@ -293,6 +333,7 @@ describe('web conversation contract', () => {
           id: 'import-room',
           name: 'Imported room',
           description: 'Saved from JSON.',
+          isFoodSource: false,
         },
       ],
       agents: [
@@ -300,6 +341,7 @@ describe('web conversation contract', () => {
           id: 'import-agent',
           name: 'Imported agent',
           instructions: 'Observe.',
+          motivations: '', intention: '',
           roomId: 'import-room',
           provider: 'chatgpt',
           model: 'gpt-6-luna',
@@ -367,7 +409,7 @@ describe('web conversation contract', () => {
     config.on('world:state', worldChanged);
     for (const configuration of [
       null,
-      { ...original, version: 2 },
+      { ...original, version: 3 },
       { ...original, rooms: [{ name: 'Missing ID' }] },
     ]) {
       expect(
@@ -389,6 +431,7 @@ describe('web conversation contract', () => {
           id: 'a',
           name: 'A',
           instructions: 'Wait.',
+          motivations: '', intention: '',
           roomId: 'missing',
           provider: 'chatgpt',
           model: 'gpt-6-luna',

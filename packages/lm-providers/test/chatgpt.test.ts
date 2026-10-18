@@ -3,6 +3,7 @@ import {
   readResponse,
   listChatGptModels,
   createChatGptProvider,
+  createChatGptPayload,
 } from '../src/chatgpt.js';
 import { validateCallback, type ChatGptAuth } from '../src/chatgpt-auth.js';
 import { protect, unprotect } from '../src/protected-storage.js';
@@ -17,6 +18,21 @@ const stream = (...events: unknown[]) =>
   );
 const auth = { token: async () => 'synthetic-token' } as ChatGptAuth;
 describe('ChatGPT integration', () => {
+  it('captures the exact body before sending and refuses to send when capture fails', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      expect(captured).toEqual(JSON.parse(options!.body as string));
+      return stream({ type: 'response.output_text.delta', delta: '{"action":{"type":"wait"}}' }, { type: 'response.completed', response: { status: 'completed' } });
+    });
+    let captured: Record<string, unknown> | undefined;
+    const request = { provider: 'chatgpt', model: 'test-model', messages: [{ role: 'system' as const, content: 'Configured framing' }, { role: 'user' as const, content: 'Observed history' }],
+      responseFormat: { name: 'action', schema: { type: 'object' } }, onRequest: async (payload: Record<string, unknown>) => { captured = structuredClone(payload); } };
+    await createChatGptProvider(auth).complete(request);
+    expect(captured).toEqual(createChatGptPayload(request));
+    expect(JSON.stringify(captured)).not.toContain('synthetic-token');
+    expect(JSON.stringify(captured)).not.toContain('Authorization');
+    await expect(createChatGptProvider(auth).complete({ ...request, onRequest: async () => { throw new Error('Capture failed'); } })).rejects.toThrow('Capture failed');
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
   it('does not accept partial output or failed completion as dialogue', async () => {
     const delta = {
       type: 'response.output_text.delta',

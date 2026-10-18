@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createDb, ensureTables, World } from '@terrarium/persistence';
+import { createDb, ensureTables, World, DiagnosticError } from '@terrarium/persistence';
 import {
   actionResponseJsonSchema,
   type AgentInput,
 } from '@terrarium/shared';
 import { Scheduler } from '../src/scheduler.js';
-import type { LmCompletionRequest } from '@terrarium/lm-providers';
-import { assembleContext, performTurn } from '../src/turns.js';
+import { createChatGptPayload, type LmCompletionRequest } from '@terrarium/lm-providers';
+import { assembleContext, performTurn, previewPrompt } from '../src/turns.js';
+import { defaultSettings } from '@terrarium/shared';
 
 let db: ReturnType<typeof createDb>, world: World;
 const schedulers: Scheduler[] = [];
@@ -49,6 +50,111 @@ afterEach(async () => {
 });
 
 describe('agent turns and scheduling', () => {
+  it('classifies an aborting provider timeout without inventing a wait action', async () => {
+    await world.saveAgent(input);
+    const provider = { name: 'fake', complete: async (request: LmCompletionRequest) => new Promise<never>((_resolve, reject) => {
+      request.signal!.addEventListener('abort', () => reject(request.signal!.reason), { once: true });
+    }) };
+    const scheduler = makeScheduler((agent, signal, current, applied, attempt) => performTurn(world, agent, provider, signal, current, () => {}, async () => {}, applied, attempt),
+      { concurrency: 4, timeoutMs: 20, retries: 2, backoffMs: 1 });
+    await scheduler.start(); await scheduler.tick();
+    await vi.waitFor(() => expect(scheduler.snapshot().agents[0].state).toBe('error'));
+    const attempts = (await world.diagnostics()).records.filter(record => record.attempt > 0);
+    expect(attempts).toHaveLength(3);
+    expect(attempts.every(record => record.outcome === 'timeout' && record.action === null)).toBe(true);
+  });
+  it('projects local identities and public food locations without remote or private information', async () => {
+    const agent = await world.saveAgent({ ...input, motivations: 'Enjoy the orchard', intention: 'Find lunch' });
+    await world.saveAgent({ ...input, name: 'Local friend', instructions: 'LOCAL PRIVATE', motivations: 'LOCAL SECRET' });
+    await world.saveAgent({ ...input, roomId: 'room-2', name: 'REMOTE PERSON', instructions: 'REMOTE PRIVATE' });
+    await world.saveRoom({ id: 'room-2', name: 'Public orchard', description: 'Has food', isFoodSource: true });
+    await world.speak('room-2', 'REMOTE TRANSCRIPT');
+    await world.speak('room-1', 'Local observation');
+    const preview = await previewPrompt(world, agent), text = JSON.stringify(preview.payload);
+    expect(text).toContain('Local friend');
+    expect(text).toContain('Public orchard');
+    expect(text).toContain('Local observation');
+    for (const secret of ['REMOTE PERSON', 'REMOTE PRIVATE', 'REMOTE TRANSCRIPT', 'LOCAL PRIVATE', 'LOCAL SECRET']) expect(text).not.toContain(secret);
+    expect(await world.diagnostics()).toMatchObject({ records: [] });
+  });
+
+  it('records exact payload, parsed output, self-report and saved speech without feeding diagnostics back', async () => {
+    const agent = await world.saveAgent(input);
+    const preview = await previewPrompt(world, agent);
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    const provider = { name: 'fake', complete: async (request: LmCompletionRequest) => {
+      await request.onRequest?.(createChatGptPayload(request));
+      return { content: JSON.stringify({ action: { type: 'speak', message: 'Hello' }, intention: 'SELF REPORT ONLY' }), requestId: 'request-1', responseId: 'response-1' };
+    } };
+    await performTurn(world, agent, provider, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, attempt);
+    const record = await world.diagnostic(attempt);
+    expect(record.outcome).toBe('applied');
+    expect(record.details?.payload).toEqual(preview.payload);
+    expect(record.details).toMatchObject({ requestId: 'request-1', responseId: 'response-1', selfReport: 'SELF REPORT ONLY', messageId: expect.any(String) });
+    expect(JSON.stringify(await assembleContext(world, agent))).not.toContain('SELF REPORT ONLY');
+    expect(JSON.stringify(await assembleContext(world, agent))).not.toContain('request-1');
+  });
+
+  it('diagnoses rejected eating and keeps the energy and conversation unchanged', async () => {
+    await world.saveRoom({ id: 'room-2', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 10 } });
+    const agent = await world.saveAgent(input);
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await expect(performTurn(world, agent, { name: 'fake', complete: async () => ({ content: '{"action":{"type":"eat"}}' }) },
+      new AbortController().signal, () => true, () => {}, async () => {}, () => {}, attempt)).rejects.toThrow('food-source');
+    expect(await world.agent(agent.id)).toMatchObject({ energy: 10 });
+    expect((await world.diagnostic(attempt)).outcome).toBe('world-validation');
+    expect((await world.history({ roomId: agent.roomId })).messages).toHaveLength(0);
+  });
+
+  it('keeps accepted speech applied after notification failure and correlates retries', async () => {
+    await world.saveAgent(input);
+    const complete = vi.fn().mockRejectedValueOnce(new Error('Provider failed')).mockResolvedValue({ content: '{"action":{"type":"speak","message":"Saved once"}}' });
+    const scheduler = makeScheduler((agent, signal, current, applied, attempt) => performTurn(world, agent, { name: 'fake', complete }, signal, current,
+      () => { throw new Error('Notification failed'); }, async () => {}, applied, attempt));
+    await scheduler.start(); await scheduler.tick();
+    await vi.waitFor(() => expect(scheduler.snapshot().agents[0].state).toBe('error'));
+    const records = (await world.diagnostics({}, true)).records.filter(record => record.attempt > 0).reverse();
+    expect(records.map(record => record.attempt)).toEqual([1, 2]);
+    expect(records.map(record => record.outcome)).toEqual(['provider', 'applied-notification-failure']);
+    expect(records[0].turnId).toBe(records[1].turnId);
+    expect(records[1].details?.messageId).toBeTruthy();
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect((await world.history({ roomId: 'room-1' })).messages).toHaveLength(1);
+  });
+
+  it('pauses visibly without invoking a provider when attempt logging fails', async () => {
+    await world.saveAgent(input);
+    const handler = vi.fn(async () => {}), scheduler = makeScheduler(handler);
+    await scheduler.start();
+    vi.spyOn(world, 'startAttempt').mockRejectedValue(new DiagnosticError('Disk failed'));
+    await scheduler.tick();
+    await vi.waitFor(() => expect(scheduler.snapshot().state).toBe('paused'));
+    expect(scheduler.snapshot().error).toContain('durable diagnostics');
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('freezes decay during Pause while allowing an active meal to complete', async () => {
+    let now = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 30 } });
+    const agent = await world.saveAgent(input), result = deferred();
+    const complete = vi.fn(() => result.promise);
+    const scheduler = makeScheduler((value, signal, current, applied, attempt) => performTurn(world, value, { name: 'fake', complete }, signal, current, () => {}, async () => {}, applied, attempt));
+    await scheduler.start(); await scheduler.tick();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
+    now = 60000; scheduler.pause();
+    await vi.waitFor(async () => expect((await world.agent(agent.id))?.energy).toBe(25));
+    now = 600000;
+    result.resolve({ content: '{"action":{"type":"eat"}}' });
+    await vi.waitFor(async () => expect((await world.agent(agent.id))?.energy).toBe(100));
+    const records = (await world.diagnostics({ action: 'eat' }, true)).records;
+    expect(records[0].details).toMatchObject({ energySeen: 30, energyBefore: 25, energyAfter: 100, passiveDecay: 5 });
+    scheduler.stop();
+    await scheduler.start(); scheduler.pause();
+    expect((await world.agent(agent.id))?.energy).toBe(100);
+  });
   it('keeps stop authoritative when a pending state read fails', async () => {
     await world.saveAgent(input);
     const scheduler = makeScheduler(async () => {});
