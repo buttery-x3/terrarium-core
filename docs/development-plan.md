@@ -138,7 +138,7 @@ The user resolved these decisions before the affected work:
 - Node 24, Fastify 5.12.7, compatible `@fastify/cors` 11.3.1; root `.env`; canonical root `data/terrarium.db`; preserve the legacy database through a SQLite backup before migration.
 - Loopback server; only localhost/127.0.0.1 UI origins on ports 4173 and 4174. Socket handshakes validate host and origin.
 - Messages of 1–8,000 characters after trimming; human speaker `Human`; one `conversation:message` event after commit; result acknowledgements; history pages of 100 ordered by timestamp and ID and merged by ID on reconnect.
-- Five initial rooms, no automatic agents. Create/edit rooms and create/edit/disable agents; no deletion. Legacy agents remain disabled until configured.
+- Five initial rooms, no automatic agents. Initially create/edit rooms and create/edit/disable agents; agent deletion was subsequently approved in the follow-up below. Legacy agents remain disabled until configured.
 - ChatGPT authentication from Flamehorn Desktop and protected storage from social-summarizer-extension. Explicitly approved dependencies: `jose` 6.2.12 and `@primno/dpapi` 2.0.1. Default model `gpt-6-luna`; one real call used for the smoke check.
 - Actions `speak`, `move`, `wait`; latest 1–50 messages from the current room, including before arrival. No departed-room history enters subsequent turns.
 - Four concurrent calls, one turn per agent, 60-second attempts, two retries with 1/2-second backoff. Pause finishes active turns; stop, disable, edits, and movement invalidate stale results. Exhausted failures remain visible and schedule another turn after the configured cadence.
@@ -154,6 +154,12 @@ The implementation extends the existing config UI, shared schemas, socket comman
 On 18 October 2026, the user approved a **Clear conversation** UI with current-room/all-room scope, confirmation before permanent deletion, and a stopped-run requirement. Clearing removes human and agent messages from storage and future agent context while retaining rooms, agents and all their settings. Both views reset affected messages, pending history responses are invalidated, and reconnect refreshes saved history to reflect clears missed while offline.
 
 Implementation extends the existing shared contract, persistence world, server commands and both frontends; no dependencies, schema migration or build configuration changes are needed. Verify scope isolation, durable deletion, rollback, preserved settings, stopped-run enforcement, concurrent commands, late agent output, confirmation/cancel behavior and stale/reconnecting browser history. Push to the existing review branch without merging main.
+
+## Approved follow-up: delete agents
+
+On 18 October 2026, the user approved a **Delete [agent name]** button beside each **Edit** button. A confirmation names the agent before permanently removing its settings. Deletion cancels that agent's active turn and discards late replies while preserving existing conversation messages and speaker names. The list refreshes and any edit form for the deleted agent resets, including in other connected browsers. Other agents and the current run state remain unchanged; Stop is not required.
+
+Extend the existing config UI, shared command schema, server handler and persistence world. Reuse scheduler invalidation, block deletion during configuration import, and validate missing IDs and failed writes. Verify durable deletion, preserved history/configuration, running/paused/stopped behavior, late responses, confirmation/cancel, form cleanup and reload. No dependencies or migrations are needed. Push to the existing review PR before merging main.
 
 ## Validation and review evidence
 

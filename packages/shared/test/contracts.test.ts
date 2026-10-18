@@ -6,9 +6,15 @@ import {
   historyInputSchema,
   configurationSchema,
   clearHistorySchema,
+  deleteAgentSchema,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('requires one explicit agent ID for deletion', () => {
+    expect(deleteAgentSchema.parse({ id: 'agent-1' })).toEqual({ id: 'agent-1' });
+    for (const input of [null, {}, { id: '' }, { id: 1 }, { id: 'agent-1', deleteMessages: true }])
+      expect(deleteAgentSchema.safeParse(input).success).toBe(false);
+  });
   it('requires an explicit room or all-room selection for conversation clearing', () => {
     expect(clearHistorySchema.parse({ scope: 'room', roomId: 'room-1' })).toEqual({ scope: 'room', roomId: 'room-1' });
     expect(clearHistorySchema.parse({ scope: 'all' })).toEqual({ scope: 'all' });

@@ -27,6 +27,7 @@
   let roomName = "";
   let roomDescription = "";
   let agentId = "";
+  let deleteAgentConfirmation: Agent | undefined;
   let agentName = "";
   let instructions = "";
   let agentRoom = "";
@@ -97,10 +98,19 @@
   }
   function editRoom(room?: Room) { roomId = room?.id ?? ""; roomName = room?.name ?? ""; roomDescription = room?.description ?? ""; }
   function editAgent(agent?: Agent) {
+    deleteAgentConfirmation = undefined;
     agentId = agent?.id ?? ""; agentName = agent?.name ?? ""; instructions = agent?.instructions ?? "";
     agentRoom = agent?.roomId ?? selectedRoom; agentModel = agent?.model ?? "gpt-6-luna"; enabled = agent?.enabled ?? false;
     minimumSeconds = (agent?.minIntervalMs ?? 10000) / 1000; maximumSeconds = (agent?.maxIntervalMs ?? 30000) / 1000;
     contextMessages = agent?.contextMessageLimit ?? 50;
+  }
+  async function deleteAgent() {
+    if (!deleteAgentConfirmation) return;
+    const agent = deleteAgentConfirmation;
+    deleteAgentConfirmation = undefined;
+    await request<{ id: string }>("agents:delete", { id: agent.id });
+    if (agentId === agent.id) editAgent();
+    notice = `Deleted agent “${agent.name}”. Existing conversation messages were kept.`;
   }
   async function discoverModels() {
     try { models = await request<string[]>("auth:models", {}); }
@@ -152,13 +162,15 @@
       histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
     });
-    socket.on("disconnect", () => { connected = false; loading.clear(); importPreview = undefined; clearConfirmation = undefined; });
+    socket.on("disconnect", () => { connected = false; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
       rooms = state.rooms; agents = state.agents;
       if (!rooms.some(room => room.id === selectedRoom)) selectedRoom = rooms[0]?.id ?? "";
       if (!agentRoom) agentRoom = selectedRoom;
+      if (agentId && !agents.some(agent => agent.id === agentId)) editAgent();
+      if (deleteAgentConfirmation && !agents.some(agent => agent.id === deleteAgentConfirmation?.id && agent.revision === deleteAgentConfirmation.revision)) deleteAgentConfirmation = undefined;
       void loadHistory(selectedRoom);
     });
     socket.on("conversation:message", (item: ConversationMessage) => merge(item.roomId, [item]));
@@ -270,6 +282,14 @@
     <ul>{#each agents as agent}
       <li><strong>{agent.name}</strong> · {rooms.find(room => room.id === agent.roomId)?.name ?? agent.roomId} · {agent.enabled ? "Enabled" : "Disabled"}
         <button on:click={() => editAgent(agent)}>Edit {agent.name}</button>
+        <button disabled={!connected || busy} on:click={() => { deleteAgentConfirmation = agent; }}>Delete {agent.name}</button>
+        {#if deleteAgentConfirmation?.id === agent.id}
+          <div role="group" aria-label="Confirm agent deletion">
+            <p>Permanently delete agent “{deleteAgentConfirmation.name}” and its settings? Its active turn will be cancelled. Existing conversation messages will be kept.</p>
+            <button disabled={!connected || busy} on:click={() => perform(deleteAgent)}>Permanently delete agent</button>
+            <button disabled={busy} on:click={() => { deleteAgentConfirmation = undefined; }}>Cancel deletion</button>
+          </div>
+        {/if}
         {#each runState.agents.filter(item => item.agentId === agent.id) as activity}
           <p>{activity.state}{#if activity.dueAt} · Next turn after {new Date(activity.dueAt).toLocaleTimeString()}{/if}</p>
           {#if activity.error}<p role="alert">{activity.error}</p>{/if}
@@ -281,7 +301,7 @@
       const input: AgentInput = { ...(agentId ? { id: agentId } : {}), name: agentName, instructions, roomId: agentRoom,
         provider: "chatgpt", model: agentModel, enabled, minIntervalMs: Math.round(minimumSeconds * 1000),
         maxIntervalMs: Math.round(maximumSeconds * 1000), contextMessageLimit: contextMessages };
-      const saved = await request<Agent>("agents:save", input); editAgent(saved); notice = "Agent saved.";
+      const saved = await request<Agent>("agents:save", input); if (agents.some(agent => agent.id === saved.id)) editAgent(saved); notice = "Agent saved.";
     })}>
       <h3>{agentId ? "Edit agent" : "Create agent"}</h3>
       <label>Agent name <input bind:value={agentName} maxlength="8000" required /></label>

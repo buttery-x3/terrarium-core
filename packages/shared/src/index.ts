@@ -23,6 +23,7 @@ export const agentInputSchema = z.object({
   maxIntervalMs: z.number().int().positive().max(2147483647),
   contextMessageLimit: z.number().int().min(1).max(50),
 }).strict().refine(value => value.maxIntervalMs >= value.minIntervalMs, 'Maximum interval must be at least the minimum.');
+export const deleteAgentSchema = z.object({ id: z.string().min(1) }).strict();
 export const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('speak'), message: messageTextSchema }).strict(),
   z.object({ type: z.literal('move'), roomId: roomIdSchema }).strict(),

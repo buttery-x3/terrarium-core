@@ -241,6 +241,15 @@ export class World {
     });
   }
 
+  async deleteAgent(id: string) {
+    const result = await this.db
+      .deleteFrom('agents')
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
+    if (!result.numDeletedRows) throw new Error('Agent does not exist.');
+    return { id };
+  }
+
   private async insertMessage(
     db: Kysely<DB>,
     roomId: string,

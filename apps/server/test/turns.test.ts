@@ -303,7 +303,7 @@ describe('agent turns and scheduling', () => {
       (await world.history({ roomId: agent.roomId })).messages,
     ).toHaveLength(1);
   });
-  it.each(['edit', 'disable', 'move'])(
+  it.each(['edit', 'disable', 'move', 'delete'])(
     'rejects late output following an agent %s',
     async (change) => {
       const agent = await world.saveAgent(input),
@@ -324,7 +324,8 @@ describe('agent turns and scheduling', () => {
       await scheduler.start();
       await scheduler.tick();
       await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
-      await world.saveAgent({
+      if (change === 'delete') await world.deleteAgent(agent.id);
+      else await world.saveAgent({
         ...input,
         id: agent.id,
         ...(change === 'edit'

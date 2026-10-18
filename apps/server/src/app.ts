@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { World, type createDb } from '@terrarium/persistence';
 import {
   agentInputSchema,
+  deleteAgentSchema,
   configurationSchema,
   configurationImportSchema,
   clearHistorySchema,
@@ -173,6 +174,13 @@ export async function createApplication(options: {
       await scheduler.changed();
       await publishWorld();
       return agent;
+    });
+    command('agents:delete', deleteAgentSchema, async (input) => {
+      checkConfigurationWrite();
+      const deleted = await world.deleteAgent(input.id);
+      await scheduler.changed();
+      await publishWorld();
+      return deleted;
     });
     command('config:export', z.object({}).strict(), () =>
       world.exportConfiguration(),

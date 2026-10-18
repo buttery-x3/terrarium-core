@@ -41,6 +41,53 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('permanently deletes one agent while keeping its named messages and other configuration', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
+    directories.push(directory);
+    const path = join(directory, 'delete-agent.db');
+    const db = createDb(path);
+    let deletedId: string;
+    let preserved: Awaited<ReturnType<World['state']>>;
+    let history: Awaited<ReturnType<World['history']>>;
+    try {
+      await ensureTables(db);
+      const world = new World(db);
+      const agent = await world.saveAgent(agentInput);
+      deletedId = agent.id;
+      const other = await world.saveAgent({ ...agentInput, name: 'Keep agent' });
+      await world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Keep my words.' }, () => true);
+      await world.speak('room-1', 'Keep human words.');
+      history = await world.history({ roomId: 'room-1' });
+      preserved = { rooms: await world.rooms(), agents: [other] };
+      expect(await world.deleteAgent(agent.id)).toEqual({ id: agent.id });
+      expect(await world.state()).toEqual(preserved);
+      expect(await world.history({ roomId: 'room-1' })).toEqual(history);
+      await expect(world.deleteAgent(agent.id)).rejects.toThrow('Agent does not exist');
+      await expect(world.saveAgent({ ...agentInput, id: agent.id })).rejects.toThrow('Agent does not exist');
+      await expect(world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Late' }, () => true)).rejects.toThrow();
+      expect((await world.exportConfiguration()).agents.map(item => item.id)).toEqual([other.id]);
+    } finally {
+      await db.destroy();
+    }
+    const reopened = createDb(path);
+    databases.push(reopened);
+    await ensureTables(reopened);
+    const world = new World(reopened);
+    expect(await world.agent(deletedId)).toBeUndefined();
+    expect(await world.state()).toEqual(preserved);
+    expect(await world.history({ roomId: 'room-1' })).toEqual(history);
+    expect(history.messages[0].speaker).toBe(agentInput.name);
+  });
+  it('preserves an agent and its history when deletion fails', async () => {
+    const world = await fixture();
+    const agent = await world.saveAgent(agentInput);
+    await world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Keep' }, () => true);
+    const state = await world.state(), history = await world.history({ roomId: 'room-1' });
+    await sql`CREATE TRIGGER reject_agent_delete AFTER DELETE ON agents BEGIN SELECT RAISE(ABORT, 'Injected delete failure'); END`.execute(world.db);
+    await expect(world.deleteAgent(agent.id)).rejects.toThrow('Injected delete failure');
+    expect(await world.state()).toEqual(state);
+    expect(await world.history({ roomId: 'room-1' })).toEqual(history);
+  });
   it('clears only the selected room while preserving other history and all configuration', async () => {
     const world = await fixture();
     const agent = await world.saveAgent(agentInput);

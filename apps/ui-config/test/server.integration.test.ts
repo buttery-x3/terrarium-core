@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { io, type Socket } from 'socket.io-client';
 import { createApplication } from '../../server/src/app.js';
 import { assembleContext } from '../../server/src/turns.js';
-import type { LmProvider } from '@terrarium/lm-providers';
+import type { LmCompletionRequest, LmProvider } from '@terrarium/lm-providers';
 import {
   createDb,
   ensureTables,
@@ -60,6 +60,68 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it.each(['running', 'paused', 'stopped'])('deletes an agent while %s, cancels its turn and preserves messages', async (state) => {
+    let complete!: (value: { content: string }) => void;
+    const provider = {
+      name: 'fake',
+      complete: vi.fn((_request: LmCompletionRequest) => new Promise<{ content: string }>((resolve) => { complete = resolve; })),
+    };
+    const url = await setup(provider), config = connect(url), other = connect(url);
+    await Promise.all([ready(config), ready(other)]);
+    const input = {
+      name: 'Delete me', instructions: 'Speak.', roomId: 'room-1', provider: 'chatgpt' as const, model: 'gpt-6-luna',
+      enabled: true, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
+    };
+    const agent = await application.world.saveAgent(input);
+    const kept = await application.world.saveAgent({ ...input, name: 'Keep me', enabled: false });
+    await application.world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Saved before deletion' }, () => true);
+    const history = await application.world.history({ roomId: 'room-1' });
+    if (state !== 'stopped') {
+      await application.scheduler.start();
+      await application.scheduler.tick();
+      await vi.waitFor(() => expect(provider.complete).toHaveBeenCalledOnce());
+      if (state === 'paused') application.scheduler.pause();
+    }
+    const updated = vi.fn(), notified = vi.fn();
+    other.on('world:state', updated);
+    config.on('conversation:message', notified);
+    expect(await request(config, 'agents:delete', { id: agent.id })).toEqual({ ok: true, value: { id: agent.id } });
+    await vi.waitFor(() => expect(updated).toHaveBeenCalledOnce());
+    expect(updated.mock.calls[0][0].agents).toEqual([kept]);
+    expect(updated.mock.calls[0][0].rooms).toHaveLength(5);
+    expect(application.scheduler.snapshot().state).toBe(state);
+    expect(application.scheduler.snapshot().agents.some(item => item.agentId === agent.id)).toBe(false);
+    if (state !== 'stopped') {
+      expect(provider.complete.mock.calls[0][0].signal?.aborted).toBe(true);
+      complete({ content: '{"action":{"type":"speak","message":"Late reply"}}' });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      await application.scheduler.tick();
+      expect(provider.complete).toHaveBeenCalledOnce();
+    }
+    expect(notified).not.toHaveBeenCalled();
+    expect(await application.world.history({ roomId: 'room-1' })).toEqual(history);
+    expect(await application.world.agent(agent.id)).toBeUndefined();
+    const exported = (await request(config, 'config:export', {})).value;
+    expect(exported.agents.map((item: { id: string }) => item.id)).toEqual([kept.id]);
+  });
+  it('rejects malformed, missing and failed agent deletions without broadcasting changed state', async () => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    const agent = await application.world.saveAgent({
+      name: 'Keep', instructions: 'Observe.', roomId: 'room-1', provider: 'chatgpt', model: 'gpt-6-luna',
+      enabled: false, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
+    });
+    const updated = vi.fn();
+    config.on('world:state', updated);
+    for (const payload of [null, {}, { id: '' }, { id: 'missing' }, { id: agent.id, deleteMessages: true }])
+      expect((await request(config, 'agents:delete', payload)).ok).toBe(false);
+    vi.spyOn(application.world, 'deleteAgent').mockRejectedValueOnce(new Error('Database unavailable'));
+    expect((await request(config, 'agents:delete', { id: agent.id })).ok).toBe(false);
+    expect(updated).not.toHaveBeenCalled();
+    expect(await application.world.agent(agent.id)).toEqual(agent);
+    expect((await request(config, 'agents:delete', { id: agent.id })).ok).toBe(true);
+    expect(await request(config, 'agents:delete', { id: agent.id })).toMatchObject({ ok: false, error: 'Agent does not exist.' });
+  });
   it('broadcasts room and all-room clearing to both views and removes agent context', async () => {
     const url = await setup(), config = connect(url), other = connect(url), terrain = connect(url, 'terrain');
     await Promise.all([ready(config), ready(other), ready(terrain)]);
@@ -308,6 +370,7 @@ describe('web conversation contract', () => {
     for (const [event, payload] of [
       ['run:control', 'start'],
       ['rooms:save', { name: 'Blocked room', description: '' }],
+      ['agents:delete', { id: 'blocked-agent' }],
       ['config:import', { configuration, previewToken: preview.token }],
     ] as const)
       expect((await request(other, event, payload)).error).toContain(

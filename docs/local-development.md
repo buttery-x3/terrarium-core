@@ -42,6 +42,14 @@ Sign-in uses an ephemeral loopback callback and a ten-minute timeout. If opened 
 
 The scheduler permits four requests and one active turn per agent. Attempts time out after 60 seconds, retrying at most twice with 1/2-second backoff. Exhausted failures remain visible and schedule another turn after the configured cadence. State-read failures pause with a recovery message. Restart starts stopped. Context uses only the current room, including history before arrival; the UI's room selection does not affect agent knowledge.
 
+## Delete an agent
+
+In **Agents**, choose **Delete [agent name]** beside its **Edit** button. The confirmation names the agent and explains that its settings will be permanently removed while existing messages are kept. Choose **Permanently delete agent** to proceed or **Cancel deletion** to keep it.
+
+Deletion works while stopped, running or paused. It cancels the selected agent's active turn, discards late replies and removes its scheduled activity without stopping other agents. Saved conversation messages keep their original speaker names and remain part of room history. The agent list refreshes and any open edit form for the removed agent resets. Other rooms, agents and settings remain unchanged. A disconnected browser or changed agent invalidates its pending confirmation.
+
+Invalid IDs, already-deleted agents and failed writes return errors. Deletion is blocked while a configuration import is in progress. Future exports exclude deleted agents; explicitly importing an older configuration containing their IDs can create them again. No migration or extra dependency is required.
+
 ## Export and import configuration
 
 Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 1`, `rooms`, and `agents`. It exports a consistent snapshot of all saved room and agent settings, including stable IDs, instructions, model, interval values in milliseconds, context limits, enabled flags and current room assignments. Conversation history, ChatGPT credentials, run state and internal agent revisions are excluded.
@@ -79,6 +87,7 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | `history:clear`  | `{ scope: 'room', roomId }` or `{ scope: 'all' }`; requires a stopped run; returns `{ roomIds, deletedMessages }` after deletion commits. |
 | `rooms:save`     | `{ id?, name, description }`; omit ID to create; returns saved configuration.                                                                                            |
 | `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |
+| `agents:delete`  | `{ id }`; deletes one agent, cancels its active turn and preserves messages; returns `{ id }` and publishes updated world/run state. Blocked during configuration import. |
 | `config:export`  | `{}`; returns the versioned configuration file object. |
 | `config:preview` | Configuration file object; validates references and returns `{ token, rooms, agents }`, each preview entry containing `{ id, name, operation: 'add' \| 'update' }`. |
 | `config:import`  | `{ configuration, previewToken }`; requires a stopped run and a current preview; atomically merges configuration and returns the applied preview. |
