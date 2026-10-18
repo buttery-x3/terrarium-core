@@ -1,5 +1,6 @@
 import {
-  actionSchema,
+  actionResponseSchema,
+  actionResponseJsonSchema,
   type Agent,
   type ConversationMessage,
 } from '@terrarium/shared';
@@ -19,8 +20,8 @@ export async function assembleContext(
     {
       role: 'system',
       content: [
-        'You are an agent in a conversation terrarium. Return exactly one JSON action, with no markdown.',
-        'Allowed forms: {"type":"speak","message":"text"}, {"type":"move","roomId":"id"}, {"type":"wait"}.',
+        'You are an agent in a conversation terrarium. Return exactly one JSON object matching the supplied schema, with no markdown.',
+        'Allowed forms: {"action":{"type":"speak","message":"text"}}, {"action":{"type":"move","roomId":"id"}}, {"action":{"type":"wait"}}.',
         'Speech must be nonempty and at most 8000 characters. The server validates and applies all actions.',
         `Your identity: ${JSON.stringify({ id: agent.id, name: agent.name, roomId: agent.roomId })}`,
         `Your instructions: ${agent.instructions}`,
@@ -58,21 +59,58 @@ export async function performTurn(
     provider: agent.provider,
     model: agent.model,
     messages,
+    responseFormat: {
+      name: 'terrarium_action',
+      schema: actionResponseJsonSchema,
+    },
     signal,
   });
   signal.throwIfAborted();
-  let action;
+  const diagnostic = [
+    `Model: ${agent.model}.`,
+    result.responseId ? `Response: ${result.responseId}.` : '',
+    result.requestId ? `Request: ${result.requestId}.` : '',
+    `Output: ${result.content.length} characters; preview: ${JSON.stringify(result.content.slice(0, 240))}${result.content.length > 240 ? '…' : ''}`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  let value: unknown;
   try {
-    action = actionSchema.parse(JSON.parse(result.content));
-  } catch {
-    throw new Error('The model returned an invalid action.');
+    value = JSON.parse(result.content);
+  } catch (error) {
+    const reason =
+      error instanceof Error
+        ? error.message.slice(0, 160)
+        : 'JSON parsing failed.';
+    throw new Error(
+      `The model returned invalid JSON: ${reason} ${diagnostic}`,
+    );
   }
-  const accepted = await world.applyAction(
-    agent.id,
-    agent.revision,
-    action,
-    stillCurrent,
-  );
+  const parsed = actionResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .slice(0, 5)
+      .map(
+        (issue) =>
+          `${issue.path.join('.') || '(root)'}: ${issue.message.slice(0, 160)} (${issue.code})`,
+      )
+      .join('; ');
+    throw new Error(
+      `The model response failed action validation: ${issues}. ${diagnostic}`,
+    );
+  }
+  const action = parsed.data.action;
+  const accepted = await world
+    .applyAction(agent.id, agent.revision, action, stillCurrent)
+    .catch((error: unknown) => {
+      const reason =
+        error instanceof Error
+          ? error.message
+          : 'World validation or persistence failed.';
+      throw new Error(
+        `The ${action.type} action could not be applied: ${reason} ${diagnostic}`,
+      );
+    });
   onApplied();
   if (accepted.message) onMessage(accepted.message);
   if (accepted.moved) await onMove();

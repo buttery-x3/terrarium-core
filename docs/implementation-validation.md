@@ -6,7 +6,7 @@ Validated on Windows with Node 24.15.0 and pnpm 10.26.2, 18 October 2026. Implem
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pnpm build`             | Six packages built; zero errors.                                                                                                                                                                                        |
 | `pnpm check`             | Both Svelte frontends: zero errors and zero warnings.                                                                                                                                                                   |
-| `pnpm test`              | 31 tests passed: 8 shared-contract, 3 persistence, 4 provider/auth, 12 turn/scheduler, and 4 UI/socket integration cases. Terrain has no automated test files.                                                          |
+| `pnpm test`              | 49 tests passed: 8 shared-contract, 3 persistence, 13 provider/auth, 21 turn/scheduler, and 4 UI/socket integration cases. Terrain has no automated test files.                                                          |
 | `pnpm dev`               | Server and primary UI start; package watchers compile without errors. Initial shared package output is built before watchers start.                                                                                     |
 | Optional terrain         | `pnpm dev:terrain` starts the retained view separately.                                                                                                                                                                 |
 | Startup paths            | Root and server-directory config loads resolve the same root database and loopback configuration. A temporary `DATABASE_PATH` passed through root development startup and created the selected test database.           |
@@ -25,4 +25,16 @@ Context tests enforce the latest 50 current-room messages with speaker identity 
 
 ## Limits of the evidence
 
-The 16-agent scenario uses fake providers; it is not a long-duration live-model load test. One real Luna turn verifies this account's authentication and action path, not all models or prolonged refresh behavior. Browser checks are manual; socket recovery is automated. Development watchers briefly reconnect the UI while recompiling shared packages. Credentials and test databases are local ignored data and are excluded from the review branch.
+The 16-agent scenario uses fake providers; it is not a long-duration live-model load test. The real Luna checks verify this account's current authentication and action path, not all models or prolonged refresh behavior. Browser checks are manual; socket recovery is automated. Development watchers briefly reconnect the UI while recompiling shared packages. Credentials and test databases are local ignored data and are excluded from the review branch.
+
+## Strict action output follow-up
+
+The earlier implementation requested JSON only through instructions and collapsed parse/schema failures into “The model returned an invalid action.” Increasing conversation complexity can compete with those instructions, but the old diagnostics did not retain enough evidence to identify the exact historical failures.
+
+The approved fix sends a strict Responses JSON schema through the existing ChatGPT authentication path. A direct capability probe returned HTTP 200 and a valid wrapped wait action despite conflicting formatting instructions. Live stream inspection also established that this route sends completed message items before an empty final output list. The reader now handles that shape, separates commentary from the final action, and preserves diagnostic IDs.
+
+Six real `gpt-6-luna` turns passed through the built provider, turn handler and world application: two each for speech, movement and waiting. Each used an isolated in-memory world with 50 synthetic messages containing competing suggestions, JSON examples and requests for other output formats; the second set used longer messages. All six returned the requested action, with the expected saved-message counts, movement and notifications. No production conversation was changed by these checks.
+
+The 18 additional automated cases cover strict request formatting, authoritative completed output, empty final output lists, commentary separation, provider schema rejection without fallback, failed/incomplete/refused streams, multiple final messages, bounded provider diagnostics, full room history, invalid JSON/fields/length/destination, and detailed failure state after three attempts. Existing lifecycle, persistence and concurrency checks continue to pass.
+
+A manual Socket.IO check against an isolated temporary server received `Attempt 3/3 failed`, the `action.message` field error, model, response ID, output length and bounded preview through `run:state`; no conversation message was saved. `pnpm build`, `pnpm check`, `pnpm test` and normal `pnpm dev` startup passed after the fix. The running application retains the existing account connection and starts stopped.

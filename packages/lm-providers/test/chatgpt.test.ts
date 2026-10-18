@@ -10,7 +10,9 @@ import { protect, unprotect } from '../src/protected-storage.js';
 afterEach(() => vi.restoreAllMocks());
 const stream = (...events: unknown[]) =>
   new Response(
-    events.map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`).join(''),
+    events
+      .map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`)
+      .join(''),
     { headers: { 'content-type': 'text/event-stream' } },
   );
 const auth = { token: async () => 'synthetic-token' } as ChatGptAuth;
@@ -33,7 +35,10 @@ describe('ChatGPT integration', () => {
           response: { status: 'completed' },
         }),
       ),
-    ).resolves.toBe('{"type":"wait"}');
+    ).resolves.toMatchObject({
+      content: '{"type":"wait"}',
+      finishReason: 'completed',
+    });
   });
   it('uses the ChatGPT catalog shape and plan-authorized Responses request', async () => {
     const fetcher = vi
@@ -72,6 +77,206 @@ describe('ChatGPT integration', () => {
     });
     expect(options!.redirect).toBe('error');
   });
+  it('enforces the supplied schema and reads authoritative completed output with diagnostic IDs', async () => {
+    const response = stream(
+      { type: 'response.output_text.delta', delta: 'intermediate text' },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp_completed',
+          status: 'completed',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [
+                { type: 'output_text', text: '{"action":{"type":"wait"}}' },
+              ],
+            },
+          ],
+        },
+      },
+    );
+    response.headers.set('x-request-id', 'req_completed');
+    const fetcher = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(response);
+    const schema = {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    };
+    const result = await createChatGptProvider(auth).complete({
+      provider: 'chatgpt',
+      model: 'gpt-6-luna',
+      messages: [],
+      responseFormat: { name: 'test_action', schema },
+    });
+    expect(
+      JSON.parse(fetcher.mock.calls[0][1]!.body as string).text,
+    ).toEqual({
+      format: {
+        type: 'json_schema',
+        name: 'test_action',
+        strict: true,
+        schema,
+      },
+    });
+    expect(result).toEqual({
+      content: '{"action":{"type":"wait"}}',
+      finishReason: 'completed',
+      responseId: 'resp_completed',
+      requestId: 'req_completed',
+    });
+  });
+  it('accepts ChatGPT plan streams with an empty final output list and ignores commentary', async () => {
+    const message = (text: string, phase: string) => ({
+      type: 'message',
+      role: 'assistant',
+      phase,
+      content: [{ type: 'output_text', text }],
+    });
+    await expect(
+      readResponse(
+        stream(
+          {
+            type: 'response.output_text.delta',
+            output_index: 0,
+            delta: 'Considering the discussion.',
+          },
+          {
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: message('Considering the discussion.', 'commentary'),
+          },
+          {
+            type: 'response.output_text.delta',
+            output_index: 1,
+            delta: '{"action":',
+          },
+          {
+            type: 'response.output_item.done',
+            output_index: 1,
+            item: message('{"action":{"type":"wait"}}', 'final_answer'),
+          },
+          {
+            type: 'response.completed',
+            response: { id: 'resp_plan', status: 'completed', output: [] },
+          },
+        ),
+      ),
+    ).resolves.toMatchObject({
+      content: '{"action":{"type":"wait"}}',
+      responseId: 'resp_plan',
+    });
+  });
+  it('uses completed text without duplicating deltas when no output items are repeated', async () => {
+    await expect(
+      readResponse(
+        stream(
+          {
+            type: 'response.output_text.delta',
+            output_index: 0,
+            content_index: 0,
+            delta: '{"action":',
+          },
+          {
+            type: 'response.output_text.done',
+            output_index: 0,
+            content_index: 0,
+            text: '{"action":{"type":"wait"}}',
+          },
+          {
+            type: 'response.completed',
+            response: { status: 'completed', output: [] },
+          },
+        ),
+      ),
+    ).resolves.toMatchObject({ content: '{"action":{"type":"wait"}}' });
+  });
+  it('reports an unsupported schema without silently retrying an unconstrained request', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json(
+        {
+          error: {
+            code: 'invalid_json_schema',
+            param: 'text.format.schema',
+            message: 'Unsupported schema keyword.',
+          },
+        },
+        { status: 400, headers: { 'x-request-id': 'req_schema' } },
+      ),
+    );
+    await expect(
+      createChatGptProvider(auth).complete({
+        provider: 'chatgpt',
+        model: 'test-model',
+        messages: [],
+        responseFormat: { name: 'test', schema: {} },
+      }),
+    ).rejects.toThrow(
+      /HTTP 400.*invalid_json_schema.*text.format.schema.*Unsupported schema keyword.*req_schema.*test-model/,
+    );
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+  it.each([
+    {
+      type: 'response.failed',
+      response: {
+        id: 'resp_failure',
+        error: { code: 'server_error', message: 'Please retry.' },
+      },
+    },
+    {
+      type: 'response.incomplete',
+      response: {
+        id: 'resp_failure',
+        incomplete_details: { reason: 'max_output_tokens' },
+      },
+    },
+    { type: 'response.refusal.done', response: { id: 'resp_failure' } },
+  ])('distinguishes a $type stream failure', async (event) => {
+    const result = readResponse(stream(event));
+    await expect(result).rejects.toThrow(event.type);
+    await expect(result).rejects.toThrow('resp_failure');
+    if ('incomplete_details' in event.response)
+      await expect(result).rejects.toThrow('max_output_tokens');
+    if ('error' in event.response)
+      await expect(result).rejects.toThrow('server_error');
+  });
+  it('rejects multiple completed messages instead of joining them into malformed JSON', async () => {
+    const message = {
+      type: 'message',
+      role: 'assistant',
+      content: [
+        { type: 'output_text', text: '{"action":{"type":"wait"}}' },
+      ],
+    };
+    await expect(
+      readResponse(
+        stream({
+          type: 'response.completed',
+          response: { status: 'completed', output: [message, message] },
+        }),
+      ),
+    ).rejects.toThrow('2 output messages');
+  });
+  it('bounds provider error details and omits unrelated response fields', async () => {
+    const result = readResponse(
+      Response.json(
+        {
+          error: {
+            message: 'x'.repeat(1000),
+            authorization: 'synthetic-secret',
+          },
+        },
+        { status: 500 },
+      ),
+    ).catch((error: Error) => error.message);
+    expect(await result).not.toContain('synthetic-secret');
+    expect(((await result) as string).length).toBeLessThan(400);
+  });
   it('validates OAuth state and issued registration identity', () => {
     expect(() =>
       validateCallback(
@@ -103,7 +308,9 @@ describe('ChatGPT integration', () => {
     'protects credentials and detects tampering',
     () => {
       const encrypted = protect('synthetic secret');
-      expect(encrypted.includes(Buffer.from('synthetic secret'))).toBe(false);
+      expect(encrypted.includes(Buffer.from('synthetic secret'))).toBe(
+        false,
+      );
       expect(unprotect(encrypted)).toBe('synthetic secret');
       encrypted[encrypted.length - 1] ^= 1;
       expect(() => unprotect(encrypted)).toThrow();

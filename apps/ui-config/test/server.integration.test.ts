@@ -18,7 +18,7 @@ async function setup() {
     quiet: true,
     provider: {
       name: 'fake',
-      complete: async () => ({ content: '{"type":"wait"}' }),
+      complete: async () => ({ content: '{"action":{"type":"wait"}}' }),
     },
   });
   await application.app.listen({ port: 0, host: '127.0.0.1' });

@@ -199,7 +199,8 @@ export class Scheduler {
           break;
         } catch (error) {
           if (!current()) break;
-          failure = error instanceof Error ? error.message : 'The turn failed.';
+          const reason = error instanceof Error ? error.message : 'The turn failed.';
+          failure = `Attempt ${attempt + 1}/${this.options.retries + 1} failed: ${reason}`;
           if (applied) break;
           if (attempt < this.options.retries)
             await delay(this.options.backoffMs * 2 ** attempt, undefined, {

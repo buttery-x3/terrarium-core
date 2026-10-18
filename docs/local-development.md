@@ -42,6 +42,16 @@ Sign-in uses an ephemeral loopback callback and a ten-minute timeout. If opened 
 
 The scheduler permits four requests and one active turn per agent. Attempts time out after 60 seconds, retrying at most twice with 1/2-second backoff. Exhausted failures remain visible and schedule another turn after the configured cadence. State-read failures pause with a recovery message. Restart starts stopped. Context uses only the current room, including history before arrival; the UI's room selection does not affect agent knowledge.
 
+## Model output and diagnostics
+
+Agent turns use Responses `text.format` with `type: "json_schema"` and `strict: true` through the existing ChatGPT sign-in token. The response is wrapped as `{"action":{"type":"speak","message":"..."}}`, `{"action":{"type":"move","roomId":"..."}}`, or `{"action":{"type":"wait"}}`. The wrapper permits a nested choice while keeping the schema root an object. Every object rejects extra fields. Speech requires non-whitespace content and an 8,000-character maximum. Local validation and world checks still run before applying the action; a valid shape alone cannot establish that a destination exists or a turn is current.
+
+This route was verified with real `gpt-6-luna` calls using Terrarium's existing ChatGPT connection. No additional credentials or dependencies are needed. Models that reject the schema produce an explicit provider error; Terrarium does not silently fall back to unconstrained text. See the official [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs) and [ChatGPT token-sharing inference guide](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
+
+The stream reader waits for successful completion and uses the final assistant message, separating commentary from action text. ChatGPT plan streams can leave `response.completed.output` empty, so completed output-item events are retained. Multiple final messages, refusals, unsupported tool calls and incomplete streams fail explicitly.
+
+An exhausted turn shows the attempt count and specific failure in the agent's existing status area. Invalid JSON and action-schema failures include the model, failing fields, response/request IDs when available, output length and a preview capped at 240 characters. Application failures identify the proposed action and reason. Provider errors include HTTP status or stream event, bounded error code/message/parameter/reason, and available IDs. Credentials and complete room histories are not included. These are current run diagnostics, not a persistent error archive; starting the next turn or choosing Stop clears the error.
+
 ## Socket contracts
 
 Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }`:

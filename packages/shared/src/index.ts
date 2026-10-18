@@ -28,6 +28,42 @@ export const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('move'), roomId: roomIdSchema }).strict(),
   z.object({ type: z.literal('wait') }).strict(),
 ]);
+export const actionResponseSchema = z.object({ action: actionSchema }).strict();
+export const actionResponseJsonSchema = {
+  type: 'object',
+  properties: {
+    action: {
+      anyOf: [
+        {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['speak'] },
+            message: { type: 'string', minLength: 1, maxLength: 8000, pattern: '\\S' },
+          },
+          required: ['type', 'message'],
+          additionalProperties: false,
+        },
+        {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['move'] },
+            roomId: { type: 'string', minLength: 1 },
+          },
+          required: ['type', 'roomId'],
+          additionalProperties: false,
+        },
+        {
+          type: 'object',
+          properties: { type: { type: 'string', enum: ['wait'] } },
+          required: ['type'],
+          additionalProperties: false,
+        },
+      ],
+    },
+  },
+  required: ['action'],
+  additionalProperties: false,
+};
 export const cursorSchema = z.object({ createdAt: z.string().datetime(), id: z.string().min(1) }).strict();
 export const historyInputSchema = z.object({
   roomId: roomIdSchema, before: cursorSchema.optional(), after: cursorSchema.optional(),
