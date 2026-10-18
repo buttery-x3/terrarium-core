@@ -9,3 +9,8 @@ build
 dist
 coverage
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.db.migrating
+.vite

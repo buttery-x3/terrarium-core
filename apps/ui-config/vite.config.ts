@@ -3,12 +3,13 @@ import { defineConfig } from 'vite';
 
 export default defineConfig(({ mode }) => {
   const isDev = mode === 'development';
-  const proxyTarget = 'http://localhost:3000';
+  const proxyTarget = 'http://127.0.0.1:3000';
 
   return {
     plugins: [svelte()],
     server: {
       port: 4173,
+      strictPort: true,
       proxy: isDev
         ? {
             '/socket.io': {

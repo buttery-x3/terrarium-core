@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
     "preview": "vite preview",
     "lint": "eslint src --ext .ts,.svelte",
-    "test": "vitest"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@terrarium/shared": "workspace:*",
     "pixi.js": "^8.3.4",
     "socket.io-client": "^4.7.5",
     "svelte": "^5.0.0",

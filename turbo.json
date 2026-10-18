@@ -3,7 +3,8 @@
   "tasks": {
     "dev": {
       "cache": false,
-      "persistent": true
+      "persistent": true,
+      "passThroughEnv": ["DATABASE_PATH", "PORT", "LOG_LEVEL", "LOCALAPPDATA"]
     },
     "build": {
       "dependsOn": ["^build"],
@@ -13,7 +14,12 @@
       "dependsOn": ["^lint"],
       "outputs": []
     },
+    "check": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
     "test": {
+      "cache": false,
       "dependsOn": ["^test"],
       "outputs": []
     }

@@ -11,9 +11,11 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -w -p tsconfig.json",
     "lint": "eslint src --ext .ts",
-    "test": "vitest"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@primno/dpapi": "2.0.1",
+    "jose": "6.2.12",
     "zod": "^3.23.8"
   },
   "devDependencies": {
