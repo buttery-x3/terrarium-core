@@ -60,6 +60,67 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('exports readable Markdown with protected labels, multiline messages and empty rooms while running', async () => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    await application.world.saveRoom({ id: 'room-1', name: 'Reading *room* [one] <&>\nnext', description: 'Not in conversation export' });
+    const agent = await application.world.saveAgent({
+      name: 'A **speaker** [name]', instructions: 'Private agent settings', roomId: 'room-1', provider: 'chatgpt', model: 'gpt-6-luna',
+      enabled: true, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
+    });
+    const content = 'Hello, 世界 🌱\r\n\r\n# A heading inside a message\n```ts\nconst value = "<example>";\n```\nLast line.';
+    const accepted = await application.world.applyAction(agent.id, agent.revision, { type: 'speak', message: content }, () => true);
+    await application.world.deleteAgent(agent.id);
+    await application.world.speak('room-2', 'Another room');
+    await application.scheduler.start();
+    const state = await application.world.state();
+    const updated = vi.fn(), message = vi.fn();
+    config.on('world:state', updated);
+    config.on('conversation:message', message);
+    const result = await request(config, 'history:export', {});
+    expect(result.ok).toBe(true);
+    expect(result.value).toMatch(/^# Terrarium conversations\n\nExported: \d{4}-\d{2}-\d{2}T/);
+    expect(result.value).toContain('## Reading \\*room\\* \\[one\\] &lt;&amp;&gt; next\n');
+    expect(result.value).toContain(`**A \\*\\*speaker\\*\\* \\[name\\]** — ${accepted.message!.createdAt}`);
+    expect(result.value).toContain(content.replace(/\r\n?/g, '\n').split('\n').map(line => `> ${line}`).join('\n'));
+    expect(result.value).toContain('## room-2\n\n**Human**');
+    expect(result.value).toContain('## room-5\n\n_No messages._\n');
+    expect(result.value).not.toContain('Private agent settings');
+    expect(result.value).not.toContain('Not in conversation export');
+    expect(updated).not.toHaveBeenCalled();
+    expect(message).not.toHaveBeenCalled();
+    expect(await application.world.state()).toEqual(state);
+    expect(application.scheduler.snapshot().state).toBe('running');
+    application.scheduler.pause();
+    expect((await request(config, 'history:export', {})).ok).toBe(true);
+    application.scheduler.stop();
+    expect((await request(config, 'history:export', {})).ok).toBe(true);
+  });
+  it('exports beyond one page and one MiB over the existing socket connection without truncation', async () => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    for (let index = 0; index < 160; index++)
+      await application.world.speak('room-1', `Message ${index}: ${'x'.repeat(7900)}`);
+    const result = await config.timeout(10000).emitWithAck('history:export', {});
+    expect(result.ok).toBe(true);
+    expect(Buffer.byteLength(result.value, 'utf8')).toBeGreaterThan(1024 * 1024);
+    expect(result.value.match(/^> Message \d+:/gm)).toHaveLength(160);
+    expect(result.value.indexOf('> Message 0:')).toBeLessThan(result.value.indexOf('> Message 159:'));
+    expect(result.value).toContain(`> Message 159: ${'x'.repeat(7900)}`);
+    expect(result.value).toContain('## room-5\n\n_No messages._');
+  });
+  it('rejects export filters and reports read failures without returning a partial file', async () => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    for (const input of [null, { roomId: 'room-1' }, { limit: 100 }])
+      expect((await request(config, 'history:export', input)).ok).toBe(false);
+    vi.spyOn(application.world, 'exportConversations').mockRejectedValueOnce(new Error('Database unavailable'));
+    const result = await request(config, 'history:export', {});
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result).not.toHaveProperty('value');
+    expect((await request(config, 'history:export', {})).ok).toBe(true);
+  });
   it.each(['running', 'paused', 'stopped'])('deletes an agent while %s, cancels its turn and preserves messages', async (state) => {
     let complete!: (value: { content: string }) => void;
     const provider = {

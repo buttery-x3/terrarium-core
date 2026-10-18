@@ -58,6 +58,12 @@ Choose a JSON file to validate and preview each room/agent addition or update. I
 
 Choose **Stop**, then **Apply import**. All changes commit in one database transaction; a failed write rolls the entire import back. Enabled flags are preserved, but import never starts a run. Start and competing room/agent writes are blocked while an import is being applied. If the file or saved configuration has changed since preview, preview it again. The UI invalidates previews after a world update or disconnection. Once imported, choose **Start** when ready.
 
+## Export conversations
+
+Choose **Export conversations** under **Conversations** to download `terrarium-conversations.md`. One readable UTF-8 Markdown file contains a heading for every room, with all saved messages ordered oldest first by timestamp and ID. Each message includes its saved speaker name, timestamp and full text as a blockquote. Multiline text is retained, empty rooms show **No messages**, and deleted agents' past speech keeps its original speaker name.
+
+The export reads all history, including messages beyond the page currently displayed. Room names and messages come from one consistent database snapshot, so exporting works while stopped, running or paused without changing the run or saved data. Messages saved after that snapshot appear in the next export. Room/agent settings and credentials are excluded. The file is a conversation transcript; configuration import continues to accept only configuration JSON.
+
 ## Clear conversation history
 
 Choose **Stop**, then use **Clear saved messages from** under **Conversations** to select **Current room** or **All rooms**. Choose **Clear conversation** to review the scope, then **Permanently delete messages** to confirm, or **Cancel clearing** to keep the conversation. Deletion cannot be undone. Room and agent settings, including enabled flags and room assignments, remain unchanged.
@@ -84,6 +90,7 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `config:message` | `{ roomId, message }`; trimmed length 1–8,000; returns saved message.                                                                                                    |
 | `history:get`    | `{ roomId, before?, after? }`; cursors `{ createdAt, id }`; choose before or after; returns `{ messages, hasMore }`.                                                     |
+| `history:export` | `{}`; returns one Markdown string containing every room and all saved messages from a consistent snapshot; available in any run state. |
 | `history:clear`  | `{ scope: 'room', roomId }` or `{ scope: 'all' }`; requires a stopped run; returns `{ roomIds, deletedMessages }` after deletion commits. |
 | `rooms:save`     | `{ id?, name, description }`; omit ID to create; returns saved configuration.                                                                                            |
 | `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |

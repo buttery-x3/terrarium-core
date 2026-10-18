@@ -161,6 +161,12 @@ On 18 October 2026, the user approved a **Delete [agent name]** button beside ea
 
 Extend the existing config UI, shared command schema, server handler and persistence world. Reuse scheduler invalidation, block deletion during configuration import, and validate missing IDs and failed writes. Verify durable deletion, preserved history/configuration, running/paused/stopped behavior, late responses, confirmation/cancel, form cleanup and reload. No dependencies or migrations are needed. Push to the existing review PR before merging main.
 
+## Approved follow-up: Markdown conversation export
+
+On 18 October 2026, the user approved an **Export conversations** button under **Conversations**. Download one Markdown file with a separate heading for each room and every saved message oldest first, including older pages and deleted agents' speech. Include speaker names, timestamps and full message text; mark empty rooms explicitly. Export a consistent snapshot while the run continues.
+
+Extend the existing config UI, socket commands, shared export type and persistence world without new dependencies or migrations. Verify complete ordered history, multiline text, safe heading labels, empty rooms, deleted-agent speech, concurrent writes, large socket responses and error handling. Check the actual browser download in an isolated world, then push to the existing review PR without merging main.
+
 ## Validation and review evidence
 
 For each implementation slice, run `pnpm build` with zero errors and `pnpm dev`; confirm the server starts, frontends compile, and no runtime crash occurs. Perform one relevant manual functional check and record its result in the pull request. Persistence work must also prove migrations apply cleanly and queries compile against both fresh and upgraded databases.

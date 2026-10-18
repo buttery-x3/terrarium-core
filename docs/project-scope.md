@@ -17,6 +17,7 @@ Personality is editable instructions. No schema fixes population size or persona
 | Startup and access  | Initial package builds precede watchers. Root environment/database paths are explicit. The API binds to loopback; socket controls accept approved local UI origins.                      |
 | Messages            | Runtime validation, save before broadcast, one saved record for config and terrain views, success/error acknowledgements. Human and agent speech use the same insertion operation.       |
 | History             | Stable timestamp/ID ordering, 100-record pages, room filtering, live delivery merged by message ID; reconnect refreshes saved history. |
+| Conversation export | Download one Markdown transcript for every room with full saved history, speaker names, timestamps and empty-room markers. Uses a consistent snapshot in any run state. |
 | Conversation clearing | Confirm permanent deletion for the current room or all rooms while stopped. Preserve room/agent settings; reset both views and agent context, reject stale history responses and late turns. |
 | World configuration | Versioned migration preserves messages. Five initial rooms; no automatic agents. Create/edit rooms and create/edit/disable/delete agents; persisted membership. Agent deletion requires confirmation, cancels its turn and preserves past messages. |
 | Configuration files | Export all room/agent settings as versioned JSON; validate and preview imports; merge by ID in one transaction while stopped. Preserve omitted records and history. |

@@ -15,6 +15,7 @@ import {
   roomInputSchema,
   runCommandSchema,
   type ConversationMessage,
+  type ConversationExport,
   type Result,
 } from '@terrarium/shared';
 import {
@@ -24,6 +25,23 @@ import {
 } from '@terrarium/lm-providers';
 import { Scheduler } from './scheduler.js';
 import { performTurn } from './turns.js';
+
+function conversationMarkdown(snapshot: ConversationExport) {
+  const label = (value: string) => value
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/[\\`*_[\]{}()#!|]/g, '\\$&');
+  const lines = ['# Terrarium conversations', '', `Exported: ${snapshot.exportedAt}`, ''];
+  for (const room of snapshot.rooms) {
+    lines.push(`## ${label(room.name)}`, '');
+    if (!room.messages.length) lines.push('_No messages._', '');
+    for (const message of room.messages) {
+      lines.push(`**${label(message.speaker)}** — ${label(message.createdAt)}`, '');
+      lines.push(message.content.replace(/\r\n?/g, '\n').split('\n').map(line => `> ${line}`).join('\n'), '');
+    }
+  }
+  return lines.join('\n');
+}
 
 export async function createApplication(options: {
   db: ReturnType<typeof createDb>;
@@ -148,6 +166,9 @@ export async function createApplication(options: {
       return message;
     });
     command('history:get', historyInputSchema, (input) => world.history(input));
+    command('history:export', z.object({}).strict(), async () =>
+      conversationMarkdown(await world.exportConversations()),
+    );
     command('history:clear', clearHistorySchema, async (input) => {
       checkHistoryWrite();
       if (scheduler.snapshot().state !== 'stopped')

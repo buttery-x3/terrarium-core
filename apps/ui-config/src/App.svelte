@@ -126,6 +126,15 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     notice = "Configuration exported.";
   }
+  async function exportConversations() {
+    const markdown = await request<string>("history:export", {});
+    const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = "terrarium-conversations.md";
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notice = "Conversations exported from all rooms.";
+  }
   async function previewConfiguration() {
     importPreview = undefined;
     if (importConfiguration) importPreview = await request<ConfigurationPreview>("config:preview", importConfiguration);
@@ -236,6 +245,8 @@
   </section>
   <section>
     <h2>Conversations</h2>
+    <button disabled={!connected || busy} on:click={() => perform(exportConversations)}>Export conversations</button>
+    <p>Download all saved messages from every room as Markdown.</p>
     <label>Room <select bind:value={selectedRoom} on:change={() => { clearConfirmation = undefined; void loadHistory(selectedRoom); }}>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
     <p>{rooms.find(room => room.id === selectedRoom)?.description ?? ""}</p>
     <label>Clear saved messages from <select bind:value={clearScope} disabled={busy} on:change={() => { clearConfirmation = undefined; }}><option value="room">Current room</option><option value="all">All rooms</option></select></label>

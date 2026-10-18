@@ -6,6 +6,7 @@ import type {
   AgentAction,
   AgentInput,
   ConversationMessage,
+  ConversationExport,
   Configuration,
   ConfigurationPreview,
   ClearHistoryInput,
@@ -73,6 +74,25 @@ export class World {
         rooms: state.rooms,
         agents: state.agents.map(({ revision, ...agent }) => agent),
       });
+    });
+  }
+
+  async exportConversations(): Promise<ConversationExport> {
+    return this.db.transaction().execute(async (db) => {
+      const rooms = await db.selectFrom('rooms')
+        .select(['id', 'name']).orderBy('id').execute();
+      const rows = await db.selectFrom('messages').selectAll()
+        .orderBy('room_id').orderBy('created_at').orderBy('id').execute();
+      const messages = new Map<string, ConversationMessage[]>();
+      for (const row of rows) {
+        const roomMessages = messages.get(row.room_id) ?? [];
+        roomMessages.push(messageRecord(row));
+        messages.set(row.room_id, roomMessages);
+      }
+      return {
+        exportedAt: new Date().toISOString(),
+        rooms: rooms.map(room => ({ ...room, messages: messages.get(room.id) ?? [] })),
+      };
     });
   }
 

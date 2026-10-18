@@ -115,6 +115,10 @@ export type ConversationMessage = {
   id: string; roomId: string; agentId: string; speaker: string; createdAt: string; content: string;
 };
 export type HistoryPage = { messages: ConversationMessage[]; hasMore: boolean };
+export type ConversationExport = {
+  exportedAt: string;
+  rooms: { id: string; name: string; messages: ConversationMessage[] }[];
+};
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 export type AgentActivity = { agentId: string; state: 'scheduled' | 'running' | 'error'; dueAt?: number; error?: string };
 export type RunState = { state: 'stopped' | 'running' | 'paused'; agents: AgentActivity[]; concurrency: number; error?: string };

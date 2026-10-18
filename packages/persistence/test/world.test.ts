@@ -41,6 +41,69 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('exports every room and all ordered messages, including a deleted agent and older pages', async () => {
+    const world = await fixture();
+    await world.db.insertInto('messages').values(['tie-b', 'tie-a'].map(id => ({
+      id, room_id: 'room-1', agent_id: 'legacy', speaker_name: 'Legacy speaker',
+      created_at: '2026-01-01T00:00:00.000Z', content: id,
+    }))).execute();
+    for (let index = 0; index < 205; index++) await world.speak('room-1', `Message ${index}`);
+    const agent = await world.saveAgent(agentInput);
+    const accepted = await world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Keep the full text.\nSecond line.' }, () => true);
+    await world.deleteAgent(agent.id);
+    const other = await world.speak('room-2', 'Other room conversation');
+    const state = await world.state();
+    const snapshot = await world.exportConversations();
+    expect(Number.isFinite(Date.parse(snapshot.exportedAt))).toBe(true);
+    expect(snapshot.rooms.map(room => room.id)).toEqual(state.rooms.map(room => room.id));
+    expect(snapshot.rooms[0].messages).toHaveLength(208);
+    expect(snapshot.rooms[0].messages.slice(0, 2).map(message => message.id)).toEqual(['tie-a', 'tie-b']);
+    expect(snapshot.rooms[0].messages[2].content).toBe('Message 0');
+    expect(snapshot.rooms[0].messages[207]).toEqual(accepted.message);
+    expect(snapshot.rooms[1].messages).toEqual([other]);
+    expect(snapshot.rooms.slice(2).every(room => room.messages.length === 0)).toBe(true);
+    expect(snapshot.rooms[0]).not.toHaveProperty('description');
+    expect(snapshot).not.toHaveProperty('agents');
+    expect(await world.state()).toEqual(state);
+    expect((await world.history({ roomId: 'room-1' })).messages).toHaveLength(100);
+  });
+  it('keeps room names and messages in one snapshot during a concurrent database write', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
+    directories.push(directory);
+    const path = join(directory, 'export-snapshot.db');
+    const writer = new Database(path);
+    writer.pragma('journal_mode = WAL');
+    const db = createDb(path);
+    databases.push(db);
+    try {
+      await ensureTables(db);
+      const world = new World(db);
+      await world.saveRoom({ id: 'room-1', name: 'Before export', description: '' });
+      const before = await world.speak('room-1', 'Before export message');
+      let changed = false;
+      const snapshotDb = db.withPlugin({
+        transformQuery: args => args.node,
+        async transformResult(args) {
+          if (!changed && args.result.rows.some(row => row.name === 'Before export')) {
+            changed = true;
+            writer.transaction(() => {
+              writer.prepare('UPDATE rooms SET name = ? WHERE id = ?').run('After export', 'room-1');
+              writer.prepare('INSERT INTO messages (id, room_id, agent_id, speaker_name, created_at, content) VALUES (?, ?, ?, ?, ?, ?)')
+                .run('later-message', 'room-1', 'config-ui', 'Human', '2026-12-01T00:00:00.000Z', 'After export message');
+            })();
+          }
+          return args.result;
+        },
+      });
+      const snapshot = await new World(snapshotDb).exportConversations();
+      expect(changed).toBe(true);
+      expect(snapshot.rooms[0]).toMatchObject({ name: 'Before export', messages: [before] });
+      expect((await world.rooms())[0].name).toBe('After export');
+      expect((await world.history({ roomId: 'room-1' })).messages).toHaveLength(2);
+    } finally {
+      writer.close();
+    }
+  });
   it('permanently deletes one agent while keeping its named messages and other configuration', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
     directories.push(directory);
