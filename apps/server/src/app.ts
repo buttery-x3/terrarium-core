@@ -8,6 +8,7 @@ import {
   agentInputSchema,
   configurationSchema,
   configurationImportSchema,
+  clearHistorySchema,
   historyInputSchema,
   messageInputSchema,
   roomInputSchema,
@@ -56,6 +57,11 @@ export async function createApplication(options: {
   const config = io.of('/config'),
     terrain = io.of('/terrain');
   const world = new World(options.db);
+  let clearingHistory = false;
+  const checkHistoryWrite = () => {
+    if (clearingHistory)
+      throw new Error('Conversation clearing is in progress. Try again when it finishes.');
+  };
   let importingConfiguration = false;
   const checkConfigurationWrite = () => {
     if (importingConfiguration)
@@ -123,7 +129,7 @@ export async function createApplication(options: {
                   )
                   .join('; ')
               : error instanceof Error &&
-                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT|Configuration)/.test(
+                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT|Configuration|Conversation)/.test(
                     error.message,
                   )
                 ? error.message
@@ -135,11 +141,26 @@ export async function createApplication(options: {
       });
     };
     command('config:message', messageInputSchema, async (input) => {
+      checkHistoryWrite();
       const message = await world.speak(input.roomId, input.message);
       publishMessage(message);
       return message;
     });
     command('history:get', historyInputSchema, (input) => world.history(input));
+    command('history:clear', clearHistorySchema, async (input) => {
+      checkHistoryWrite();
+      if (scheduler.snapshot().state !== 'stopped')
+        throw new Error('Conversation clearing requires a stopped run. Choose Stop first.');
+      clearingHistory = true;
+      try {
+        const result = await world.clearHistory(input);
+        config.emit('conversation:cleared', result);
+        terrain.emit('conversation:cleared', result);
+        return result;
+      } finally {
+        clearingHistory = false;
+      }
+    });
     command('rooms:save', roomInputSchema, async (input) => {
       checkConfigurationWrite();
       const room = await world.saveRoom(input);
@@ -176,6 +197,7 @@ export async function createApplication(options: {
       }
     });
     command('run:control', runCommandSchema, async (input) => {
+      if (input === 'start') checkHistoryWrite();
       if (input === 'start') checkConfigurationWrite();
       if (
         input === 'start' &&

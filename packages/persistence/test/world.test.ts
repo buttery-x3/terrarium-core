@@ -41,6 +41,52 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('clears only the selected room while preserving other history and all configuration', async () => {
+    const world = await fixture();
+    const agent = await world.saveAgent(agentInput);
+    await world.speak('room-1', 'Human message');
+    await world.applyAction(agent.id, agent.revision, { type: 'speak', message: 'Agent message' }, () => true);
+    const kept = await world.speak('room-2', 'Keep this room');
+    const state = await world.state();
+    expect(await world.clearHistory({ scope: 'room', roomId: 'room-1' })).toEqual({ roomIds: ['room-1'], deletedMessages: 2 });
+    expect(await world.history({ roomId: 'room-1' })).toEqual({ messages: [], hasMore: false });
+    expect((await world.history({ roomId: 'room-2' })).messages).toEqual([kept]);
+    expect(await world.state()).toEqual(state);
+    await expect(world.clearHistory({ scope: 'room', roomId: 'missing' })).rejects.toThrow('Room does not exist');
+    expect((await world.history({ roomId: 'room-2' })).messages).toEqual([kept]);
+  });
+  it('keeps all-room clearing after reopening the database and accepts new conversations', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
+    directories.push(directory);
+    const path = join(directory, 'clear.db');
+    const db = createDb(path);
+    await ensureTables(db);
+    const world = new World(db);
+    await world.saveAgent(agentInput);
+    await world.speak('room-1', 'First room');
+    await world.speak('room-2', 'Second room');
+    const state = await world.state();
+    expect((await world.clearHistory({ scope: 'all' })).deletedMessages).toBe(2);
+    await db.destroy();
+    const reopened = createDb(path);
+    databases.push(reopened);
+    await ensureTables(reopened);
+    const saved = new World(reopened);
+    expect(await saved.state()).toEqual(state);
+    expect(await reopened.selectFrom('messages').selectAll().execute()).toEqual([]);
+    expect((await saved.clearHistory({ scope: 'all' })).deletedMessages).toBe(0);
+    const message = await saved.speak('room-1', 'Fresh conversation');
+    expect((await saved.history({ roomId: 'room-1' })).messages).toEqual([message]);
+  });
+  it('rolls back the entire clear if deletion fails', async () => {
+    const world = await fixture();
+    const first = await world.speak('room-1', 'Keep first');
+    const second = await world.speak('room-2', 'Keep second');
+    await sql`CREATE TRIGGER reject_clear BEFORE DELETE ON messages WHEN OLD.room_id = 'room-2' BEGIN SELECT RAISE(ABORT, 'Injected clear failure'); END`.execute(world.db);
+    await expect(world.clearHistory({ scope: 'all' })).rejects.toThrow('Injected clear failure');
+    expect((await world.history({ roomId: 'room-1' })).messages).toEqual([first]);
+    expect((await world.history({ roomId: 'room-2' })).messages).toEqual([second]);
+  });
   it('round trips all room and agent settings without history or runtime revisions', async () => {
     const source = await fixture(),
       destination = await fixture();

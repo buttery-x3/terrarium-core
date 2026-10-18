@@ -2,7 +2,7 @@
   import { Application, Graphics, Text } from "pixi.js";
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
-  import type { ConversationMessage } from "@terrarium/shared";
+  import type { ConversationMessage, HistoryCleared } from "@terrarium/shared";
 
   let container: HTMLDivElement | null = null;
   let app: Application | null = null;
@@ -90,6 +90,16 @@
     });
   };
 
+  const clearMessages = (roomIds: string[]) => {
+    roomIds.forEach((id) => {
+      const room = roomStates.get(id);
+      if (!room) return;
+      room.message.text = "";
+      room.highlightUntil = 0;
+      drawRoom(room.graphics, baseColor);
+    });
+  };
+
   const blendColor = (from: number, to: number, ratio: number) => {
     const fromR = (from >> 16) & 0xff;
     const fromG = (from >> 8) & 0xff;
@@ -125,6 +135,7 @@
       });
 
     socket.on("connect", () => {
+      clearMessages([...roomStates.keys()]);
       console.info("terrain connected", socket.id);
     });
 
@@ -155,6 +166,10 @@
       if (!room) return;
       room.highlightUntil = Date.now() + 1000;
       room.message.text = payload.content;
+    });
+
+    socket.on("conversation:cleared", (payload: HistoryCleared) => {
+      clearMessages(payload.roomIds);
     });
 
     return () => {

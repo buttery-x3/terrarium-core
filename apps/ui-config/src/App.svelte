@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
   import { configurationSchema, configurationFileLimitBytes, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
-  import type { Agent, AgentInput, AuthState, ConversationMessage, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
+  import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
   let connected = false;
@@ -12,9 +12,9 @@
   let histories: Record<string, ConversationMessage[]> = {};
   let older: Record<string, boolean> = {};
   let loaded = new Set<string>();
-  let recovering = new Map<string, HistoryCursor | undefined>();
-  let loading = new Map<string, number>();
-  let connectionEpoch = 0;
+  let loading = new Map<string, symbol>();
+  let clearScope: "room" | "all" = "room";
+  let clearConfirmation: { input: ClearHistoryInput; label: string } | undefined;
   let message = "";
   let error = "";
   let notice = "";
@@ -57,24 +57,38 @@
   }
   async function loadHistory(room: string, loadOlder = false) {
     if (!room || !connected || loading.has(room)) return;
-    if (!loadOlder && loaded.has(room) && !recovering.has(room)) return;
-    const epoch = connectionEpoch;
-    loading.set(room, epoch);
+    if (!loadOlder && loaded.has(room)) return;
+    const token = Symbol();
+    loading.set(room, token);
     try {
-      const wasLoaded = loaded.has(room);
-      let after = recovering.get(room);
       const before = loadOlder ? cursor(histories[room]?.[0]) : undefined;
-      do {
-        const page = await request<HistoryPage>("history:get", { roomId: room, ...(before ? { before } : after ? { after } : {}) });
-        if (epoch !== connectionEpoch) return;
-        merge(room, page.messages);
-        if (loadOlder || !wasLoaded) older = { ...older, [room]: page.hasMore };
-        if (loadOlder || !after || !page.hasMore || !page.messages.length) break;
-        after = cursor(page.messages[page.messages.length - 1]);
-      } while (true);
-      loaded.add(room); recovering.delete(room);
-    } catch (failure) { if (epoch === connectionEpoch) error = failure instanceof Error ? failure.message : "Could not load history."; }
-    finally { if (loading.get(room) === epoch) loading.delete(room); }
+      const page = await request<HistoryPage>("history:get", { roomId: room, ...(before ? { before } : {}) });
+      if (loading.get(room) !== token) return;
+      merge(room, page.messages);
+      older = { ...older, [room]: page.hasMore };
+      loaded.add(room);
+    } catch (failure) { if (loading.get(room) === token) error = failure instanceof Error ? failure.message : "Could not load history."; }
+    finally { if (loading.get(room) === token) loading.delete(room); }
+  }
+  function resetHistory(roomIds: string[]) {
+    const remaining = { ...histories }, remainingOlder = { ...older };
+    for (const room of roomIds) {
+      delete remaining[room]; delete remainingOlder[room];
+      loaded.delete(room); loading.delete(room);
+    }
+    histories = remaining; older = remainingOlder;
+  }
+  function confirmClear() {
+    clearConfirmation = clearScope === "all"
+      ? { input: { scope: "all" }, label: "all rooms" }
+      : { input: { scope: "room", roomId: selectedRoom }, label: `room “${rooms.find(room => room.id === selectedRoom)?.name ?? selectedRoom}”` };
+  }
+  async function clearHistory() {
+    if (!clearConfirmation) return;
+    const selection = clearConfirmation;
+    clearConfirmation = undefined;
+    const result = await request<HistoryCleared>("history:clear", selection.input);
+    notice = `Cleared ${result.deletedMessages} saved messages from ${selection.label}. Rooms and agents are unchanged.`;
   }
   async function perform(action: () => Promise<void>) {
     error = ""; notice = ""; busy = true;
@@ -133,11 +147,12 @@
   }
   onMount(() => {
     socket.on("connect", () => {
-      connected = true; connectionEpoch++;
+      connected = true;
+      // INVARIANT: reconnect discards caches that may have missed a conversation clear.
+      histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
-      recovering = new Map([...loaded].map(room => [room, cursor(histories[room]?.[histories[room].length - 1]) ?? { id: '0', createdAt: '1970-01-01T00:00:00.000Z' }]));
     });
-    socket.on("disconnect", () => { connected = false; connectionEpoch++; loading.clear(); importPreview = undefined; });
+    socket.on("disconnect", () => { connected = false; loading.clear(); importPreview = undefined; clearConfirmation = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
@@ -147,7 +162,11 @@
       void loadHistory(selectedRoom);
     });
     socket.on("conversation:message", (item: ConversationMessage) => merge(item.roomId, [item]));
-    socket.on("run:state", (state: RunState) => { runState = state; });
+    socket.on("conversation:cleared", (result: HistoryCleared) => {
+      resetHistory(result.roomIds); clearConfirmation = undefined;
+      void loadHistory(selectedRoom);
+    });
+    socket.on("run:state", (state: RunState) => { runState = state; if (state.state !== "stopped") clearConfirmation = undefined; });
     socket.on("auth:state", (state: AuthState) => {
       const newlyConnected = state.connected && !auth.connected;
       auth = state; if (!state.pending) signInUrl = "";
@@ -205,8 +224,18 @@
   </section>
   <section>
     <h2>Conversations</h2>
-    <label>Room <select bind:value={selectedRoom} on:change={() => loadHistory(selectedRoom)}>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
+    <label>Room <select bind:value={selectedRoom} on:change={() => { clearConfirmation = undefined; void loadHistory(selectedRoom); }}>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
     <p>{rooms.find(room => room.id === selectedRoom)?.description ?? ""}</p>
+    <label>Clear saved messages from <select bind:value={clearScope} disabled={busy} on:change={() => { clearConfirmation = undefined; }}><option value="room">Current room</option><option value="all">All rooms</option></select></label>
+    <button disabled={!connected || busy || runState.state !== "stopped" || (clearScope === "room" && !selectedRoom)} on:click={confirmClear}>Clear conversation</button>
+    {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
+    {#if clearConfirmation}
+      <div role="group" aria-label="Confirm conversation clearing">
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agent conversation context. Rooms, agents and their settings will be kept.</p>
+        <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
+        <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
+      </div>
+    {/if}
     {#if older[selectedRoom]}<button disabled={!connected} on:click={() => loadHistory(selectedRoom, true)}>Load older messages</button>{/if}
     <ol class="conversation" aria-label="Conversation history">
       {#each histories[selectedRoom] ?? [] as item (item.id)}
@@ -214,8 +243,8 @@
       {:else}<li>No saved messages in this room yet.</li>{/each}
     </ol>
     <form on:submit|preventDefault={() => perform(async () => {
-      const sent = await request<ConversationMessage>("config:message", { roomId: selectedRoom, message });
-      merge(sent.roomId, [sent]); message = ""; notice = "Message saved.";
+      await request<ConversationMessage>("config:message", { roomId: selectedRoom, message });
+      message = ""; notice = "Message saved.";
     })}>
       <label>Message <textarea bind:value={message} maxlength="8000" required rows="3"></textarea></label>
       <button disabled={!connected || busy || !selectedRoom || !message.trim()}>Send message</button>

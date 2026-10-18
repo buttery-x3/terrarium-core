@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { io, type Socket } from 'socket.io-client';
 import { createApplication } from '../../server/src/app.js';
+import { assembleContext } from '../../server/src/turns.js';
+import type { LmProvider } from '@terrarium/lm-providers';
 import {
   createDb,
   ensureTables,
@@ -9,17 +11,17 @@ import {
 const sockets: Socket[] = [];
 let application: Awaited<ReturnType<typeof createApplication>>,
   db: ReturnType<typeof createDb>;
-async function setup() {
+async function setup(provider: LmProvider = {
+  name: 'fake',
+  complete: async () => ({ content: '{"action":{"type":"wait"}}' }),
+}) {
   db = createDb(':memory:');
   await ensureTables(db);
   application = await createApplication({
     db,
     origins: ['http://localhost:4173'],
     quiet: true,
-    provider: {
-      name: 'fake',
-      complete: async () => ({ content: '{"action":{"type":"wait"}}' }),
-    },
+    provider,
   });
   await application.app.listen({ port: 0, host: '127.0.0.1' });
   const address = application.app.server.address();
@@ -58,6 +60,97 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('broadcasts room and all-room clearing to both views and removes agent context', async () => {
+    const url = await setup(), config = connect(url), other = connect(url), terrain = connect(url, 'terrain');
+    await Promise.all([ready(config), ready(other), ready(terrain)]);
+    const agent = await application.world.saveAgent({
+      name: 'Observer', instructions: 'Observe.', roomId: 'room-1', provider: 'chatgpt', model: 'gpt-6-luna',
+      enabled: false, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
+    });
+    const original = await application.world.state();
+    await application.world.speak('room-1', 'Clear context');
+    await application.world.speak('room-2', 'Keep context');
+    const observed = [vi.fn(), vi.fn(), vi.fn()];
+    [config, other, terrain].forEach((socket, index) => socket.on('conversation:cleared', observed[index]));
+    const result = await request(config, 'history:clear', { scope: 'room', roomId: 'room-1' });
+    expect(result).toEqual({ ok: true, value: { roomIds: ['room-1'], deletedMessages: 1 } });
+    await vi.waitFor(() => observed.forEach((listener) => expect(listener).toHaveBeenCalledWith(result.value)));
+    expect((await assembleContext(application.world, agent))[1].content).toBe('[]');
+    expect((await request(other, 'history:get', { roomId: 'room-2' })).value.messages).toHaveLength(1);
+    const cleared = await request(config, 'history:clear', { scope: 'all' });
+    expect(cleared.ok).toBe(true);
+    expect(cleared.value.roomIds).toHaveLength(5);
+    expect(cleared.value.deletedMessages).toBe(1);
+    expect(await application.world.state()).toEqual(original);
+    other.close();
+    const reconnected = connect(url);
+    await ready(reconnected);
+    expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages).toEqual([]);
+  });
+  it.each(['running', 'paused'])('rejects conversation clearing while %s', async (state) => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    await application.world.speak('room-1', 'Keep while active');
+    await application.scheduler.start();
+    if (state === 'paused') application.scheduler.pause();
+    expect(await request(config, 'history:clear', { scope: 'all' })).toMatchObject({ ok: false, error: expect.stringContaining('Choose Stop') });
+    expect((await application.world.history({ roomId: 'room-1' })).messages).toHaveLength(1);
+  });
+  it('rejects invalid clear selections without deleting or notifying', async () => {
+    const url = await setup(), config = connect(url);
+    await ready(config);
+    const message = await application.world.speak('room-1', 'Keep');
+    const cleared = vi.fn();
+    config.on('conversation:cleared', cleared);
+    for (const input of [null, {}, { scope: 'room' }, { scope: 'room', roomId: 'missing' }, { scope: 'all', roomId: 'room-1' }])
+      expect((await request(config, 'history:clear', input)).ok).toBe(false);
+    expect(cleared).not.toHaveBeenCalled();
+    expect((await application.world.history({ roomId: 'room-1' })).messages).toEqual([message]);
+  });
+  it('blocks starting and messages during clearing and releases the guard after failure', async () => {
+    const url = await setup(), config = connect(url), other = connect(url);
+    await Promise.all([ready(config), ready(other)]);
+    const notified = vi.fn();
+    config.on('conversation:cleared', notified);
+    let fail!: (error: Error) => void;
+    const pending = new Promise<never>((_, reject) => { fail = reject; });
+    const clear = vi.spyOn(application.world, 'clearHistory').mockReturnValueOnce(pending);
+    const clearing = request(config, 'history:clear', { scope: 'all' });
+    await vi.waitFor(() => expect(clear).toHaveBeenCalledOnce());
+    for (const [event, payload] of [
+      ['run:control', 'start'],
+      ['config:message', { roomId: 'room-1', message: 'Blocked' }],
+      ['history:clear', { scope: 'all' }],
+    ]) expect((await request(other, event, payload)).error).toContain('clearing is in progress');
+    fail(new Error('Injected clear failure'));
+    expect((await clearing).ok).toBe(false);
+    expect(notified).not.toHaveBeenCalled();
+    expect((await request(other, 'config:message', { roomId: 'room-1', message: 'Allowed' })).ok).toBe(true);
+    expect((await request(other, 'history:clear', { scope: 'all' })).ok).toBe(true);
+    expect((await request(other, 'run:control', 'start')).ok).toBe(true);
+  });
+  it('discards a late agent reply after Stop and clearing', async () => {
+    let complete!: (value: { content: string }) => void;
+    const provider = { name: 'fake', complete: vi.fn(() => new Promise<{ content: string }>((resolve) => { complete = resolve; })) };
+    const url = await setup(provider), config = connect(url);
+    await ready(config);
+    await application.world.saveAgent({
+      name: 'Late', instructions: 'Speak.', roomId: 'room-1', provider: 'chatgpt', model: 'gpt-6-luna',
+      enabled: true, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
+    });
+    await application.world.speak('room-1', 'Old context');
+    await request(config, 'run:control', 'start');
+    await application.scheduler.tick();
+    await vi.waitFor(() => expect(provider.complete).toHaveBeenCalledOnce());
+    await request(config, 'run:control', 'stop');
+    expect((await request(config, 'history:clear', { scope: 'all' })).ok).toBe(true);
+    const seen = vi.fn();
+    config.on('conversation:message', seen);
+    complete({ content: '{"action":{"type":"speak","message":"Stale reply"}}' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect((await request(config, 'history:get', { roomId: 'room-1' })).value.messages).toEqual([]);
+    expect(seen).not.toHaveBeenCalled();
+  });
   it('exports, previews and imports configuration, publishing saved changes while remaining stopped', async () => {
     const url = await setup(),
       config = connect(url),

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { configurationSchema } from '@terrarium/shared';
+import { clearHistorySchema, configurationSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import type {
   Agent,
@@ -8,6 +8,8 @@ import type {
   ConversationMessage,
   Configuration,
   ConfigurationPreview,
+  ClearHistoryInput,
+  HistoryCleared,
   HistoryInput,
   HistoryPage,
   RoomInput,
@@ -296,6 +298,23 @@ export class World {
       .execute((db) =>
         this.insertMessage(db, roomId, 'config-ui', 'Human', content),
       );
+  }
+
+  async clearHistory(input: ClearHistoryInput): Promise<HistoryCleared> {
+    const selection = clearHistorySchema.parse(input);
+    return this.db.transaction().execute(async (db) => {
+      let rooms = db.selectFrom('rooms').select('id');
+      if (selection.scope === 'room')
+        rooms = rooms.where('id', '=', selection.roomId);
+      const roomIds = (await rooms.execute()).map((room) => room.id);
+      if (selection.scope === 'room' && !roomIds.length)
+        throw new Error('Room does not exist.');
+      let query = db.deleteFrom('messages');
+      if (selection.scope === 'room')
+        query = query.where('room_id', '=', selection.roomId);
+      const result = await query.executeTakeFirstOrThrow();
+      return { roomIds, deletedMessages: Number(result.numDeletedRows) };
+    });
   }
 
   async history(input: HistoryInput, limit = 100): Promise<HistoryPage> {

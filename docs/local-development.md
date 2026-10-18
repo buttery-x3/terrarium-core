@@ -50,6 +50,14 @@ Choose a JSON file to validate and preview each room/agent addition or update. I
 
 Choose **Stop**, then **Apply import**. All changes commit in one database transaction; a failed write rolls the entire import back. Enabled flags are preserved, but import never starts a run. Start and competing room/agent writes are blocked while an import is being applied. If the file or saved configuration has changed since preview, preview it again. The UI invalidates previews after a world update or disconnection. Once imported, choose **Start** when ready.
 
+## Clear conversation history
+
+Choose **Stop**, then use **Clear saved messages from** under **Conversations** to select **Current room** or **All rooms**. Choose **Clear conversation** to review the scope, then **Permanently delete messages** to confirm, or **Cancel clearing** to keep the conversation. Deletion cannot be undone. Room and agent settings, including enabled flags and room assignments, remain unchanged.
+
+Clearing deletes saved human and agent messages in one transaction. Subsequent agent turns read the remaining history, so deleted messages no longer enter their conversation context. Stop invalidates pending turns; late replies cannot restore the cleared conversation. The server rejects clearing while running or paused and blocks Start, new human messages and another clear while deletion is in progress. A failed deletion rolls back and emits no clear notification.
+
+Connected config and terrain views reset affected rooms immediately. Pending history responses are discarded for cleared rooms. Reconnecting refreshes the latest saved page instead of retaining potentially deleted cached messages; **Load older messages** still retrieves older saved pages. Clearing does not erase personality instructions or room descriptions.
+
 ## Model output and diagnostics
 
 Agent turns use Responses `text.format` with `type: "json_schema"` and `strict: true` through the existing ChatGPT sign-in token. The response is wrapped as `{"action":{"type":"speak","message":"..."}}`, `{"action":{"type":"move","roomId":"..."}}`, or `{"action":{"type":"wait"}}`. The wrapper permits a nested choice while keeping the schema root an object. Every object rejects extra fields. Speech requires non-whitespace content and an 8,000-character maximum. Local validation and world checks still run before applying the action; a valid shape alone cannot establish that a destination exists or a turn is current.
@@ -68,6 +76,7 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `config:message` | `{ roomId, message }`; trimmed length 1–8,000; returns saved message.                                                                                                    |
 | `history:get`    | `{ roomId, before?, after? }`; cursors `{ createdAt, id }`; choose before or after; returns `{ messages, hasMore }`.                                                     |
+| `history:clear`  | `{ scope: 'room', roomId }` or `{ scope: 'all' }`; requires a stopped run; returns `{ roomIds, deletedMessages }` after deletion commits. |
 | `rooms:save`     | `{ id?, name, description }`; omit ID to create; returns saved configuration.                                                                                            |
 | `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |
 | `config:export`  | `{}`; returns the versioned configuration file object. |
@@ -77,6 +86,6 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | `auth:login`     | `{}`; returns browser sign-in URL. Credentials stay on the server.                                                                                                       |
 | `auth:models`    | `{}`; returns visible model slugs.                                                                                                                                       |
 
-`world:state`, `run:state`, and `auth:state` synchronize the operator UI. Both namespaces receive `conversation:message` after persistence, carrying `{ id, roomId, agentId, speaker, createdAt, content }`. Humans use agent ID `config-ui` and speaker `Human`. `/terrain` also receives `rooms:list`.
+`world:state`, `run:state`, and `auth:state` synchronize the operator UI. Both namespaces receive `conversation:message` after persistence, carrying `{ id, roomId, agentId, speaker, createdAt, content }`, and `conversation:cleared` carrying `{ roomIds, deletedMessages }` after deletion commits. Humans use agent ID `config-ui` and speaker `Human`. `/terrain` also receives `rooms:list`.
 
-History pages contain up to 100 messages ordered oldest to newest by saved timestamp and ID. Initially select the latest page; `before` retrieves older pages; `after` retrieves missed messages forward. The client merges by ID, freezes reconnect cursors before live events arrive, and follows all forward pages. New timestamps advance monotonically to prevent same-millisecond inserts falling behind a cursor.
+History pages contain up to 100 messages ordered oldest to newest by saved timestamp and ID. Initially select the latest page; `before` retrieves older pages; `after` remains available for forward retrieval. The client merges live delivery and history by ID. On reconnect, it discards local history and pagination caches and fetches the latest page so offline deletion is reflected. Cleared rooms invalidate pending history requests; stale acknowledgements cannot repopulate them. New timestamps advance monotonically while messages remain saved to prevent same-millisecond inserts falling behind a cursor.

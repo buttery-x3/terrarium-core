@@ -69,6 +69,10 @@ export const historyInputSchema = z.object({
   roomId: roomIdSchema, before: cursorSchema.optional(), after: cursorSchema.optional(),
 }).strict().refine(value => !(value.before && value.after), 'Choose before or after, not both.');
 export const runCommandSchema = z.enum(['start', 'pause', 'stop']);
+export const clearHistorySchema = z.discriminatedUnion('scope', [
+  z.object({ scope: z.literal('room'), roomId: roomIdSchema }).strict(),
+  z.object({ scope: z.literal('all') }).strict(),
+]);
 export const configurationFileLimitBytes = 512 * 1024;
 export const configurationSchema = z.object({
   format: z.literal('terrarium-config'),
@@ -101,6 +105,8 @@ export type RoomInput = z.infer<typeof roomInputSchema>;
 export type AgentInput = z.infer<typeof agentInputSchema>;
 export type AgentAction = z.infer<typeof actionSchema>;
 export type HistoryInput = z.infer<typeof historyInputSchema>;
+export type ClearHistoryInput = z.infer<typeof clearHistorySchema>;
+export type HistoryCleared = { roomIds: string[]; deletedMessages: number };
 export type HistoryCursor = z.infer<typeof cursorSchema>;
 export type Room = { id: string; name: string; description: string };
 export type Agent = Omit<AgentInput, 'id'> & { id: string; revision: number };

@@ -5,9 +5,16 @@ import {
   agentInputSchema,
   historyInputSchema,
   configurationSchema,
+  clearHistorySchema,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('requires an explicit room or all-room selection for conversation clearing', () => {
+    expect(clearHistorySchema.parse({ scope: 'room', roomId: 'room-1' })).toEqual({ scope: 'room', roomId: 'room-1' });
+    expect(clearHistorySchema.parse({ scope: 'all' })).toEqual({ scope: 'all' });
+    for (const input of [null, {}, { scope: 'room' }, { scope: 'room', roomId: '' }, { scope: 'all', roomId: 'room-1' }, { scope: 'other' }])
+      expect(clearHistorySchema.safeParse(input).success).toBe(false);
+  });
   const configuration = {
     format: 'terrarium-config',
     version: 1,

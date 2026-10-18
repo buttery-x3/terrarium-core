@@ -149,6 +149,12 @@ On 18 October 2026, the user approved exporting all room/agent settings to one r
 
 The implementation extends the existing config UI, shared schemas, socket commands and persistence operations without new dependencies or migrations. Preview tokens detect changes to the file or saved configuration before apply. Tests cover round trips, invalid files, duplicate IDs, missing room references, stale previews, rollback and stopped-run enforcement. Browser validation exercises file selection, preview, apply, download, re-import and reload in a separate test world. Changes remain on the review branch.
 
+## Approved follow-up: conversation clearing
+
+On 18 October 2026, the user approved a **Clear conversation** UI with current-room/all-room scope, confirmation before permanent deletion, and a stopped-run requirement. Clearing removes human and agent messages from storage and future agent context while retaining rooms, agents and all their settings. Both views reset affected messages, pending history responses are invalidated, and reconnect refreshes saved history to reflect clears missed while offline.
+
+Implementation extends the existing shared contract, persistence world, server commands and both frontends; no dependencies, schema migration or build configuration changes are needed. Verify scope isolation, durable deletion, rollback, preserved settings, stopped-run enforcement, concurrent commands, late agent output, confirmation/cancel behavior and stale/reconnecting browser history. Push to the existing review branch without merging main.
+
 ## Validation and review evidence
 
 For each implementation slice, run `pnpm build` with zero errors and `pnpm dev`; confirm the server starts, frontends compile, and no runtime crash occurs. Perform one relevant manual functional check and record its result in the pull request. Persistence work must also prove migrations apply cleanly and queries compile against both fresh and upgraded databases.
