@@ -6,6 +6,8 @@ import { z } from 'zod';
 import { World, type createDb } from '@terrarium/persistence';
 import {
   agentInputSchema,
+  configurationSchema,
+  configurationImportSchema,
   historyInputSchema,
   messageInputSchema,
   roomInputSchema,
@@ -54,6 +56,11 @@ export async function createApplication(options: {
   const config = io.of('/config'),
     terrain = io.of('/terrain');
   const world = new World(options.db);
+  let importingConfiguration = false;
+  const checkConfigurationWrite = () => {
+    if (importingConfiguration)
+      throw new Error('Configuration import is in progress. Try again when it finishes.');
+  };
   const publishMessage = (message: ConversationMessage) => {
     config.emit('conversation:message', message);
     terrain.emit('conversation:message', message);
@@ -116,7 +123,7 @@ export async function createApplication(options: {
                   )
                   .join('; ')
               : error instanceof Error &&
-                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT)/.test(
+                  /^(Room|Agent|Destination|ChatGPT|Connect ChatGPT|Reconnect|A ChatGPT|Configuration)/.test(
                     error.message,
                   )
                 ? error.message
@@ -134,17 +141,42 @@ export async function createApplication(options: {
     });
     command('history:get', historyInputSchema, (input) => world.history(input));
     command('rooms:save', roomInputSchema, async (input) => {
+      checkConfigurationWrite();
       const room = await world.saveRoom(input);
       await publishWorld();
       return room;
     });
     command('agents:save', agentInputSchema, async (input) => {
+      checkConfigurationWrite();
       const agent = await world.saveAgent(input);
       await scheduler.changed();
       await publishWorld();
       return agent;
     });
+    command('config:export', z.object({}).strict(), () =>
+      world.exportConfiguration(),
+    );
+    command('config:preview', configurationSchema, (input) =>
+      world.previewConfiguration(input),
+    );
+    command('config:import', configurationImportSchema, async (input) => {
+      checkConfigurationWrite();
+      if (scheduler.snapshot().state !== 'stopped')
+        throw new Error('Configuration import requires a stopped run. Choose Stop first.');
+      importingConfiguration = true;
+      try {
+        const result = await world.importConfiguration(
+          input.configuration, input.previewToken,
+        );
+        await scheduler.changed();
+        await publishWorld();
+        return result;
+      } finally {
+        importingConfiguration = false;
+      }
+    });
     command('run:control', runCommandSchema, async (input) => {
+      if (input === 'start') checkConfigurationWrite();
       if (
         input === 'start' &&
         options.auth &&

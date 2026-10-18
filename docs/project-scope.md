@@ -18,6 +18,7 @@ Personality is editable instructions. No schema fixes population size or persona
 | Messages            | Runtime validation, save before broadcast, one saved record for config and terrain views, success/error acknowledgements. Human and agent speech use the same insertion operation.       |
 | History             | Stable timestamp/ID ordering, 100-record pages, room filtering, reconnect recovery merged by message ID.                                                                                 |
 | World configuration | Versioned migration preserves messages. Five initial rooms; no automatic agents. Create/edit rooms and create/edit/disable agents; persisted membership.                                 |
+| Configuration files | Export all room/agent settings as versioned JSON; validate and preview imports; merge by ID in one transaction while stopped. Preserve omitted records and history. |
 | Agents              | Editable name, instructions, model, cadence, context limit, room, enabled state. Context includes latest 1–50 current-room messages, including before arrival.                           |
 | Model integration   | ChatGPT OAuth with PKCE and verified identity, Windows protected storage, model discovery, completed Responses streams. Initial model: `gpt-6-luna`. Other adapters remain unused mocks. |
 | Actions             | `speak`, `move`, `wait`. Destinations and agent/run revisions are validated before mutation. Technical failures remain operational errors.                                               |

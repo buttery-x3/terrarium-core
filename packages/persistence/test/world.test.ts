@@ -3,6 +3,8 @@ import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { sql } from 'kysely';
+import type { Configuration } from '@terrarium/shared';
 import {
   createDb,
   ensureTables,
@@ -39,6 +41,167 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('round trips all room and agent settings without history or runtime revisions', async () => {
+    const source = await fixture(),
+      destination = await fixture();
+    const room = await source.saveRoom({
+      name: 'Quiet garden',
+      description: 'A reflective room.',
+    });
+    const agent = await source.saveAgent({
+      ...agentInput,
+      name: 'Gardener',
+      instructions: 'Ask careful questions.\nUse examples.',
+      roomId: room.id,
+      maxIntervalMs: 5000,
+      contextMessageLimit: 12,
+    });
+    await source.speak(room.id, 'History stays here.');
+    const configuration = await source.exportConfiguration();
+    expect(Object.keys(configuration).sort()).toEqual([
+      'agents',
+      'format',
+      'rooms',
+      'version',
+    ]);
+    expect(configuration.agents[0]).not.toHaveProperty('revision');
+    expect(JSON.stringify(configuration)).not.toContain(
+      'History stays here.',
+    );
+    const preview = await destination.previewConfiguration(configuration);
+    await destination.importConfiguration(
+      JSON.parse(JSON.stringify(configuration)),
+      preview.token,
+    );
+    expect(await destination.exportConfiguration()).toEqual(configuration);
+    expect(await destination.agent(agent.id)).toMatchObject({
+      enabled: true,
+      revision: 0,
+      roomId: room.id,
+    });
+    expect(
+      (await destination.history({ roomId: room.id })).messages,
+    ).toEqual([]);
+  });
+  it('merges by ID, preserves omitted records and history, and invalidates old agent revisions', async () => {
+    const world = await fixture();
+    const existing = await world.saveAgent(agentInput);
+    const kept = await world.saveAgent({
+      ...agentInput,
+      name: 'Keep me',
+      enabled: false,
+    });
+    const message = await world.speak('room-1', 'Keep this conversation.');
+    const configuration: Configuration = {
+      format: 'terrarium-config',
+      version: 1,
+      rooms: [
+        { id: 'room-1', name: 'Renamed', description: 'Updated' },
+        { id: 'new-room', name: 'New room', description: '' },
+      ],
+      agents: [
+        {
+          ...agentInput,
+          id: existing.id,
+          name: 'Updated',
+          roomId: 'new-room',
+          enabled: false,
+        },
+        { ...agentInput, id: 'new-agent', name: 'New agent' },
+      ],
+    };
+    const preview = await world.previewConfiguration(configuration);
+    expect(preview.rooms.map((room) => room.operation)).toEqual([
+      'update',
+      'add',
+    ]);
+    expect(preview.agents.map((agent) => agent.operation)).toEqual([
+      'update',
+      'add',
+    ]);
+    await world.importConfiguration(configuration, preview.token);
+    expect(await world.agent(kept.id)).toEqual(kept);
+    expect((await world.rooms()).map((room) => room.id)).toContain(
+      'room-5',
+    );
+    expect(await world.agent(existing.id)).toMatchObject({
+      name: 'Updated',
+      enabled: false,
+      roomId: 'new-room',
+      revision: existing.revision + 1,
+    });
+    expect((await world.history({ roomId: 'room-1' })).messages).toEqual([
+      message,
+    ]);
+    await expect(
+      world.applyAction(
+        existing.id,
+        existing.revision,
+        { type: 'wait' },
+        () => true,
+      ),
+    ).rejects.toThrow('no longer current');
+  });
+  it('rejects unknown room references in both preview and import without writes', async () => {
+    const world = await fixture(),
+      before = await world.state();
+    const configuration: Configuration = {
+      format: 'terrarium-config',
+      version: 1,
+      rooms: [{ id: 'new-room', name: 'New', description: '' }],
+      agents: [{ ...agentInput, id: 'new-agent', roomId: 'missing' }],
+    };
+    await expect(world.previewConfiguration(configuration)).rejects.toThrow(
+      'unknown room',
+    );
+    await expect(
+      world.importConfiguration(configuration, '0'.repeat(64)),
+    ).rejects.toThrow('unknown room');
+    expect(await world.state()).toEqual(before);
+  });
+  it('rejects a stale preview when either the file or saved configuration changes', async () => {
+    const world = await fixture();
+    const configuration = await world.exportConfiguration();
+    const preview = await world.previewConfiguration(configuration);
+    const altered = structuredClone(configuration);
+    altered.rooms[0].name = 'Changed file';
+    await expect(
+      world.importConfiguration(altered, preview.token),
+    ).rejects.toThrow('changed since preview');
+    await world.saveRoom({
+      ...configuration.rooms[0],
+      name: 'Changed database',
+    });
+    await expect(
+      world.importConfiguration(configuration, preview.token),
+    ).rejects.toThrow('changed since preview');
+    expect((await world.rooms())[0].name).toBe('Changed database');
+  });
+  it('rolls back room and earlier agent writes if a later insert fails', async () => {
+    const world = await fixture();
+    await world.saveAgent(agentInput);
+    const before = await world.state();
+    const configuration: Configuration = {
+      format: 'terrarium-config',
+      version: 1,
+      rooms: [
+        { id: 'room-1', name: 'Must roll back', description: '' },
+        { id: 'new-room', name: 'Must disappear', description: '' },
+      ],
+      agents: [
+        { ...agentInput, id: 'first-agent' },
+        { ...agentInput, id: 'fail-agent' },
+      ],
+    };
+    const preview = await world.previewConfiguration(configuration);
+    await sql`CREATE TRIGGER reject_import BEFORE INSERT ON agents WHEN NEW.id = 'fail-agent' BEGIN SELECT RAISE(ABORT, 'Injected import failure'); END`.execute(
+      world.db,
+    );
+    await expect(
+      world.importConfiguration(configuration, preview.token),
+    ).rejects.toThrow('Injected import failure');
+    expect(await world.state()).toEqual(before);
+  });
   it('initializes once and preserves a legacy database and existing messages', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
     directories.push(directory);

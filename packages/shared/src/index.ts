@@ -69,7 +69,34 @@ export const historyInputSchema = z.object({
   roomId: roomIdSchema, before: cursorSchema.optional(), after: cursorSchema.optional(),
 }).strict().refine(value => !(value.before && value.after), 'Choose before or after, not both.');
 export const runCommandSchema = z.enum(['start', 'pause', 'stop']);
+export const configurationFileLimitBytes = 512 * 1024;
+export const configurationSchema = z.object({
+  format: z.literal('terrarium-config'),
+  version: z.literal(1),
+  rooms: z.array(roomInputSchema.extend({ id: roomIdSchema })),
+  agents: z.array(agentInputSchema.and(z.object({ id: z.string().min(1) }))),
+}).strict().superRefine((value, context) => {
+  for (const kind of ['rooms', 'agents'] as const) {
+    const ids = new Set<string>();
+    value[kind].forEach((item, index) => {
+      if (ids.has(item.id)) context.addIssue({ code: z.ZodIssueCode.custom, path: [kind, index, 'id'], message: 'Duplicate ID in configuration.' });
+      ids.add(item.id);
+    });
+  }
+  if (new TextEncoder().encode(JSON.stringify(value, null, 2) + '\n').byteLength > configurationFileLimitBytes)
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Configuration must fit in a 512 KiB JSON file.' });
+});
+export const configurationImportSchema = z.object({
+  configuration: configurationSchema,
+  previewToken: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
 
+export type Configuration = z.infer<typeof configurationSchema>;
+export type ConfigurationPreview = {
+  token: string;
+  rooms: { id: string; name: string; operation: 'add' | 'update' }[];
+  agents: { id: string; name: string; operation: 'add' | 'update' }[];
+};
 export type RoomInput = z.infer<typeof roomInputSchema>;
 export type AgentInput = z.infer<typeof agentInputSchema>;
 export type AgentAction = z.infer<typeof actionSchema>;

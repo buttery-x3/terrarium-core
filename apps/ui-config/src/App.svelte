@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
+  import { configurationSchema, configurationFileLimitBytes, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ConversationMessage, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
@@ -34,6 +35,9 @@
   let minimumSeconds = 10;
   let maximumSeconds = 30;
   let contextMessages = 50;
+  let importConfiguration: Configuration | undefined;
+  let importPreview: ConfigurationPreview | undefined;
+  let importFileName = "";
 
   const cursor = (item: ConversationMessage | undefined): HistoryCursor | undefined => item ? { id: item.id, createdAt: item.createdAt } : undefined;
   function request<T>(event: string, payload: unknown): Promise<T> {
@@ -88,15 +92,55 @@
     try { models = await request<string[]>("auth:models", {}); }
     catch (failure) { error = failure instanceof Error ? failure.message : "Could not load ChatGPT models."; }
   }
+  function clearImport() { importConfiguration = undefined; importPreview = undefined; importFileName = ""; }
+  async function exportConfiguration() {
+    const configuration = await request<Configuration>("config:export", {});
+    const url = URL.createObjectURL(new Blob([JSON.stringify(configuration, null, 2) + "\n"], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = "terrarium-config.json";
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notice = "Configuration exported.";
+  }
+  async function previewConfiguration() {
+    importPreview = undefined;
+    if (importConfiguration) importPreview = await request<ConfigurationPreview>("config:preview", importConfiguration);
+  }
+  async function readConfigurationFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    clearImport();
+    if (!file) return;
+    await perform(async () => {
+      if (file.size > configurationFileLimitBytes) throw new Error("Choose a JSON file smaller than 512 KiB.");
+      let value: unknown;
+      try { value = JSON.parse((await file.text()).replace(/^\uFEFF/, "")); }
+      catch { throw new Error("The selected file is not valid JSON."); }
+      const parsed = configurationSchema.safeParse(value);
+      if (!parsed.success) throw new Error(parsed.error.issues.slice(0, 10).map(issue => `${issue.path.join(".") || "Configuration"}: ${issue.message}`).join("; "));
+      importConfiguration = parsed.data; importFileName = file.name;
+      await previewConfiguration();
+    });
+    input.value = "";
+  }
+  async function applyConfiguration() {
+    if (!importConfiguration || !importPreview) return;
+    const payload = { configuration: importConfiguration, previewToken: importPreview.token };
+    importPreview = undefined;
+    const result = await request<ConfigurationPreview>("config:import", payload);
+    clearImport(); editRoom(); editAgent();
+    notice = `Configuration imported. Rooms saved: ${result.rooms.length}; agents saved: ${result.agents.length}. Choose Start when ready.`;
+  }
   onMount(() => {
     socket.on("connect", () => {
       connected = true; connectionEpoch++;
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
       recovering = new Map([...loaded].map(room => [room, cursor(histories[room]?.[histories[room].length - 1]) ?? { id: '0', createdAt: '1970-01-01T00:00:00.000Z' }]));
     });
-    socket.on("disconnect", () => { connected = false; connectionEpoch++; loading.clear(); });
+    socket.on("disconnect", () => { connected = false; connectionEpoch++; loading.clear(); importPreview = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
+      importPreview = undefined;
       rooms = state.rooms; agents = state.agents;
       if (!rooms.some(room => room.id === selectedRoom)) selectedRoom = rooms[0]?.id ?? "";
       if (!agentRoom) agentRoom = selectedRoom;
@@ -134,6 +178,30 @@
     <button disabled={!connected || busy || !auth.connected || runState.state === "running"} on:click={() => perform(async () => { runState = await request("run:control", "start"); })}>{runState.state === "paused" ? "Resume" : "Start"}</button>
     <button disabled={!connected || busy || runState.state !== "running"} on:click={() => perform(async () => { runState = await request("run:control", "pause"); })}>Pause</button>
     <button disabled={!connected || busy || runState.state === "stopped"} on:click={() => perform(async () => { runState = await request("run:control", "stop"); })}>Stop</button>
+  </section>
+  <section>
+    <h2>Configuration files</h2>
+    <p>Save rooms and agents as JSON, including instructions, model, timing, enabled state and current room. Conversation history and ChatGPT credentials stay separate.</p>
+    <button disabled={!connected || busy} on:click={() => perform(exportConfiguration)}>Export configuration</button>
+    <label>Import configuration JSON <input type="file" accept=".json,application/json" disabled={!connected || busy} on:change={readConfigurationFile} /></label>
+    <p>Files can be up to 512 KiB. Import updates matching IDs and adds new IDs. Entries absent from the file are kept.</p>
+    {#if runState.state !== "stopped"}<p>Choose Stop before applying an import. Imported agents keep their enabled settings; Start remains a separate action.</p>{/if}
+    {#if importConfiguration}
+      <h3>Preview: {importFileName}</h3>
+      {#if importPreview}
+        <p>Rooms: {importPreview.rooms.filter(item => item.operation === "add").length} to add, {importPreview.rooms.filter(item => item.operation === "update").length} to update. Agents: {importPreview.agents.filter(item => item.operation === "add").length} to add, {importPreview.agents.filter(item => item.operation === "update").length} to update.</p>
+        <ul aria-label="Configuration changes">
+          {#each importPreview.rooms as room}<li>{room.operation === "add" ? "Add" : "Update"} room: {room.name} ({room.id})</li>{/each}
+          {#each importPreview.agents as agent}<li>{agent.operation === "add" ? "Add" : "Update"} agent: {agent.name} ({agent.id})</li>{/each}
+        </ul>
+        <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(applyConfiguration)}>Apply import</button>
+      {:else}
+        <p>Preview the file against the current saved configuration before applying it.</p>
+        <button disabled={!connected || busy} on:click={() => perform(previewConfiguration)}>Preview again</button>
+      {/if}
+      <button disabled={busy} on:click={clearImport}>Cancel import</button>
+      <details><summary>View configuration JSON</summary><pre class="configuration-json">{JSON.stringify(importConfiguration, null, 2)}</pre></details>
+    {/if}
   </section>
   <section>
     <h2>Conversations</h2>
@@ -213,6 +281,7 @@
   textarea { width: 100%; box-sizing: border-box; }
   .conversation { max-height: 28rem; overflow-y: auto; padding-left: 1.5rem; }
   .conversation p { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .configuration-json { max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
   time { font-size: 0.85rem; }
   [role="alert"] { color: #a21919; }
 </style>

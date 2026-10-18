@@ -143,6 +143,12 @@ The user resolved these decisions before the affected work:
 - Actions `speak`, `move`, `wait`; latest 1–50 messages from the current room, including before arrival. No departed-room history enters subsequent turns.
 - Four concurrent calls, one turn per agent, 60-second attempts, two retries with 1/2-second backoff. Pause finishes active turns; stop, disable, edits, and movement invalidate stale results. Exhausted failures remain visible and schedule another turn after the configured cadence.
 
+## Approved follow-up: JSON configuration files
+
+On 18 October 2026, the user approved exporting all room/agent settings to one readable, versioned JSON file and importing through a validation preview. Matching IDs update existing entries; new IDs create entries; omitted entries remain. Imports apply in one transaction while the run is stopped, preserve enabled flags, and never start agents automatically. History, credentials and runtime state are excluded.
+
+The implementation extends the existing config UI, shared schemas, socket commands and persistence operations without new dependencies or migrations. Preview tokens detect changes to the file or saved configuration before apply. Tests cover round trips, invalid files, duplicate IDs, missing room references, stale previews, rollback and stopped-run enforcement. Browser validation exercises file selection, preview, apply, download, re-import and reload in a separate test world. Changes remain on the review branch.
+
 ## Validation and review evidence
 
 For each implementation slice, run `pnpm build` with zero errors and `pnpm dev`; confirm the server starts, frontends compile, and no runtime crash occurs. Perform one relevant manual functional check and record its result in the pull request. Persistence work must also prove migrations apply cleanly and queries compile against both fresh and upgraded databases.

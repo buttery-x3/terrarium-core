@@ -42,6 +42,14 @@ Sign-in uses an ephemeral loopback callback and a ten-minute timeout. If opened 
 
 The scheduler permits four requests and one active turn per agent. Attempts time out after 60 seconds, retrying at most twice with 1/2-second backoff. Exhausted failures remain visible and schedule another turn after the configured cadence. State-read failures pause with a recovery message. Restart starts stopped. Context uses only the current room, including history before arrival; the UI's room selection does not affect agent knowledge.
 
+## Export and import configuration
+
+Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 1`, `rooms`, and `agents`. It exports a consistent snapshot of all saved room and agent settings, including stable IDs, instructions, model, interval values in milliseconds, context limits, enabled flags and current room assignments. Conversation history, ChatGPT credentials, run state and internal agent revisions are excluded.
+
+Choose a JSON file to validate and preview each room/agent addition or update. IDs determine identity: matching IDs are updated, new IDs are created, and saved entries absent from the file remain. Names are editable labels, not matching keys. Every entry needs an ID. Agent room references may point to either a room in the file or an existing saved room. Unknown references, duplicate IDs, unsupported versions, extra fields and invalid settings are rejected with details. Files and their formatted representation must fit within 512 KiB, below the existing socket transport limit.
+
+Choose **Stop**, then **Apply import**. All changes commit in one database transaction; a failed write rolls the entire import back. Enabled flags are preserved, but import never starts a run. Start and competing room/agent writes are blocked while an import is being applied. If the file or saved configuration has changed since preview, preview it again. The UI invalidates previews after a world update or disconnection. Once imported, choose **Start** when ready.
+
 ## Model output and diagnostics
 
 Agent turns use Responses `text.format` with `type: "json_schema"` and `strict: true` through the existing ChatGPT sign-in token. The response is wrapped as `{"action":{"type":"speak","message":"..."}}`, `{"action":{"type":"move","roomId":"..."}}`, or `{"action":{"type":"wait"}}`. The wrapper permits a nested choice while keeping the schema root an object. Every object rejects extra fields. Speech requires non-whitespace content and an 8,000-character maximum. Local validation and world checks still run before applying the action; a valid shape alone cannot establish that a destination exists or a turn is current.
@@ -62,6 +70,9 @@ Commands on `/config` acknowledge `{ ok: true, value }` or `{ ok: false, error }
 | `history:get`    | `{ roomId, before?, after? }`; cursors `{ createdAt, id }`; choose before or after; returns `{ messages, hasMore }`.                                                     |
 | `rooms:save`     | `{ id?, name, description }`; omit ID to create; returns saved configuration.                                                                                            |
 | `agents:save`    | `{ id?, name, instructions, roomId, provider: 'chatgpt', model, enabled, minIntervalMs, maxIntervalMs, contextMessageLimit }`; returns saved configuration and revision. |
+| `config:export`  | `{}`; returns the versioned configuration file object. |
+| `config:preview` | Configuration file object; validates references and returns `{ token, rooms, agents }`, each preview entry containing `{ id, name, operation: 'add' \| 'update' }`. |
+| `config:import`  | `{ configuration, previewToken }`; requires a stopped run and a current preview; atomically merges configuration and returns the applied preview. |
 | `run:control`    | `'start'`, `'pause'`, `'stop'`; returns run state.                                                                                                                       |
 | `auth:login`     | `{}`; returns browser sign-in URL. Credentials stay on the server.                                                                                                       |
 | `auth:models`    | `{}`; returns visible model slugs.                                                                                                                                       |

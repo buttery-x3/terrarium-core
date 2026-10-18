@@ -1,13 +1,17 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { configurationSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import type {
   Agent,
   AgentAction,
   AgentInput,
   ConversationMessage,
+  Configuration,
+  ConfigurationPreview,
   HistoryInput,
   HistoryPage,
   RoomInput,
+  WorldState,
 } from '@terrarium/shared';
 import type { DB } from './index.js';
 
@@ -56,6 +60,120 @@ export class World {
   }
   async state() {
     return { rooms: await this.rooms(), agents: await this.agents() };
+  }
+
+  async exportConfiguration(): Promise<Configuration> {
+    return this.db.transaction().execute(async (db) => {
+      const state = await new World(db).state();
+      return configurationSchema.parse({
+        format: 'terrarium-config',
+        version: 1,
+        rooms: state.rooms,
+        agents: state.agents.map(({ revision, ...agent }) => agent),
+      });
+    });
+  }
+
+  private configurationPreview(
+    configuration: Configuration,
+    state: WorldState,
+  ): ConfigurationPreview {
+    const roomIds = new Set(
+      [...state.rooms, ...configuration.rooms].map((room) => room.id),
+    );
+    for (const agent of configuration.agents) {
+      if (!roomIds.has(agent.roomId))
+        throw new Error(
+          `Configuration agent ${JSON.stringify(agent.name)} refers to an unknown room: ${JSON.stringify(agent.roomId)}.`,
+        );
+    }
+    const rooms = new Set(state.rooms.map((room) => room.id));
+    const agents = new Set(state.agents.map((agent) => agent.id));
+    return {
+      token: createHash('sha256')
+        .update(JSON.stringify({ configuration, state }))
+        .digest('hex'),
+      rooms: configuration.rooms.map((room) => ({
+        id: room.id,
+        name: room.name,
+        operation: rooms.has(room.id) ? 'update' : 'add',
+      })),
+      agents: configuration.agents.map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        operation: agents.has(agent.id) ? 'update' : 'add',
+      })),
+    };
+  }
+
+  async previewConfiguration(
+    input: Configuration,
+  ): Promise<ConfigurationPreview> {
+    const configuration = configurationSchema.parse(input);
+    return this.db
+      .transaction()
+      .execute(async (db) =>
+        this.configurationPreview(
+          configuration,
+          await new World(db).state(),
+        ),
+      );
+  }
+
+  async importConfiguration(
+    input: Configuration,
+    previewToken: string,
+  ): Promise<ConfigurationPreview> {
+    const configuration = configurationSchema.parse(input);
+    return this.db.transaction().execute(async (db) => {
+      const state = await new World(db).state();
+      const preview = this.configurationPreview(configuration, state);
+      if (preview.token !== previewToken)
+        throw new Error(
+          'Configuration changed since preview. Preview the file again before importing.',
+        );
+      // INVARIANT: the preview covers both the submitted file and the current saved configuration.
+      for (const room of configuration.rooms) {
+        await db
+          .insertInto('rooms')
+          .values(room)
+          .onConflict((conflict) =>
+            conflict
+              .column('id')
+              .doUpdateSet({
+                name: room.name,
+                description: room.description,
+              }),
+          )
+          .execute();
+      }
+      const revisions = new Map(
+        state.agents.map((agent) => [agent.id, agent.revision]),
+      );
+      for (const agent of configuration.agents) {
+        const values = {
+          id: agent.id,
+          name: agent.name,
+          instructions: agent.instructions,
+          room_id: agent.roomId,
+          provider: agent.provider,
+          model: agent.model,
+          enabled: Number(agent.enabled),
+          min_interval_ms: agent.minIntervalMs,
+          max_interval_ms: agent.maxIntervalMs,
+          context_message_limit: agent.contextMessageLimit,
+          revision: (revisions.get(agent.id) ?? -1) + 1,
+        };
+        await db
+          .insertInto('agents')
+          .values(values)
+          .onConflict((conflict) =>
+            conflict.column('id').doUpdateSet(values),
+          )
+          .execute();
+      }
+      return preview;
+    });
   }
 
   async saveRoom(input: RoomInput) {
