@@ -668,6 +668,24 @@ describe('independent decision scheduling', () => {
     expect(scheduler.snapshot().agents[0].nextEmoteAt).toBe(1240000);
   });
 
+  it('shows a future speech plan and its remaining delay during an earlier reflection', async () => {
+    let now = 1000000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    await world.saveAgent({ ...input, timingOverrides });
+    const seen: DecisionOpportunity[] = [];
+    const scheduler = makeScheduler(async (_agent, _signal, _current, _applied, _attempt, opportunity) => {
+      seen.push(opportunity!);
+      return { reflectionProcessed: true, action: { type: 'wait' }, speechPlan: {
+        delayMs: opportunity!.pendingSpeechPlan?.remainingMs ?? 90000, replyToId: null, targetAgentId: null,
+      } };
+    });
+    await scheduler.start(); await scheduler.tick(); await finished(scheduler);
+    now = 1060000; await scheduler.tick(); await finished(scheduler);
+    expect(seen[1]).toMatchObject({ reflection: true, speech: false,
+      pendingSpeechPlan: { dueAt: 1090000, requestedAt: 1000000, remainingMs: 30000, replyToId: null, targetAgentId: null } });
+    expect(scheduler.snapshot().agents[0].nextSpeechAt).toBe(1090000);
+  });
+
   it('freezes every deadline while Pause permits an active reflection to finish', async () => {
     let now = 1000000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);

@@ -184,7 +184,7 @@ describe('evidence-based relationship memory', () => {
     await world.saveReflection(a.id, a.revision, { reaction: 'Private reaction', intention: 'Observe' }, () => true);
     await db.updateTable('agents').set({ energy: 42 }).where('id', '=', a.id).execute();
     const diagnostic = await world.scheduleTurn(a, Date.now());
-    const { relationships, news, prompts: { appraisals, relationshipSummary, newsSelection, ...prompts }, ...settings } = defaultSettings;
+    const { relationships, news, media, prompts: { appraisals, relationshipSummary, newsSelection, mediaParticipation, mediaVote, ...prompts }, ...settings } = defaultSettings;
     await db.updateTable('settings').set({ value: JSON.stringify({ ...settings, scheduling: { ...settings.scheduling, reflectionIntervalMs: 120000 }, prompts: { ...prompts, reflection: 'Custom reflection rule' } }) }).execute();
     for (const table of ['appraisals', 'relationships', 'relationship_summaries'] as const) await db.schema.dropTable(table).execute();
     await db.deleteFrom('schema_migrations').where('version', '=', 5).execute();
@@ -195,7 +195,7 @@ describe('evidence-based relationship memory', () => {
     expect((await world.reflection(a.id)).reaction).toBe('Private reaction');
     const saved = (await appraise(a, source.id)).acceptedAppraisals[0];
     const configuration = await world.exportConfiguration();
-    expect(configuration.version).toBe(6);
+    expect(configuration.version).toBe(7);
     expect(JSON.stringify(configuration)).not.toContain(saved.reason);
     await db.destroy(); db = createDb(path); await ensureTables(db); world = new World(db); await world.interruptUnfinished();
     expect((await appraise(a, source.id)).duplicateAppraisalIds).toEqual([saved.id]);

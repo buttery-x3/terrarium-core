@@ -60,6 +60,34 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('starts idle media directly and requests genuine replacement votes independently of speech', async () => {
+    const votes: string[] = [];
+    const url = await setup({ name: 'fake', complete: async request => {
+      if (request.responseFormat?.name === 'terrarium_media_vote') { votes.push(request.messages[1].content); return { content: '{"choice":"change"}' }; }
+      return { content: JSON.stringify({ reflection: null, speechPlan: null, requestEmote: false, engagement: null, appraisals: [], action: { type: 'wait' } }) };
+    } }), config = connect(url); await ready(config);
+    const settings = (await application.world.settings()).value;
+    await request(config, 'settings:save', { ...settings, media: { ...settings.media, enabled: true, roomId: 'room-1' } });
+    const input = { instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt' as const, model: 'fake', enabled: true,
+      minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 };
+    const a = await application.world.saveAgent({ ...input, name: 'A' }), b = await application.world.saveAgent({ ...input, name: 'B' });
+    await application.world.applyAction(a.id, a.revision, { type: 'propose-media', title: 'Spirited Away', description: 'A child enters an unfamiliar spirit world.' }, () => true);
+    const first = (await request(config, 'media:state', {})).value;
+    expect(first.current.title).toBe('Spirited Away'); expect(first.activeBallot).toBeNull(); expect(first.remainingMs).toBe(600000);
+    await application.world.applyAction(b.id, b.revision, { type: 'propose-media', title: 'Planet Earth', description: 'A television series about wildlife.' }, () => true);
+    const pending = (await request(config, 'media:state', {})).value.activeBallot;
+    expect(pending.votes.every((vote: any) => vote.choice === null && vote.status === 'pending')).toBe(true);
+    expect((await request(config, 'media:preview', { agentId: a.id, ballotId: pending.id })).value.payload).toBeDefined();
+    expect(votes).toEqual([]);
+    await request(config, 'run:control', 'start');
+    await vi.waitFor(async () => expect((await request(config, 'media:state', {})).value.current.title).toBe('Planet Earth'), { timeout: 3000 });
+    await request(config, 'run:control', 'stop');
+    expect(votes).toHaveLength(2);
+    const saved = (await request(config, 'media:ballot', { id: pending.id })).value;
+    expect(saved.status).toBe('passed'); expect(saved.counts.change).toBe(2);
+    expect((await request(config, 'media:ballots', {})).value.ballots).toHaveLength(1);
+    expect((await request(config, 'media:state', {})).value.current.title).toBe('Planet Earth');
+  });
   it('previews searched news without calling the model and refreshes the saved feed through sockets', async () => {
     const complete = vi.fn(async () => ({ content: '{}' }));
     const url = await setup({ name: 'fake', complete }), config = connect(url); await ready(config);
@@ -148,7 +176,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(6);
+    expect(exported.version).toBe(7);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -417,7 +445,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 6,
+      version: 7,
       agents: [],
     });
     const configuration = {

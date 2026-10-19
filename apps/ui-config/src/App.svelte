@@ -5,8 +5,9 @@
   import AgentInspector from "./AgentInspector.svelte";
   import RelationshipPanel from "./RelationshipPanel.svelte";
   import NewsPanel from "./NewsPanel.svelte";
+  import MediaPanel from "./MediaPanel.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
-  import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
+  import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, MediaState, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
   let connected = false;
@@ -47,6 +48,9 @@
   let reflectionRequest = 0;
   let relationshipVersion = 0;
   let newsVersion = 0;
+  let mediaVersion = 0;
+  let mediaState: MediaState | undefined;
+  let mediaStateSequence = 0;
   let diagnosticAgent = "", diagnosticRoom = "", diagnosticAction = "", diagnosticOutcome = "", diagnosticFrom = "", diagnosticTo = "";
   let diagnosticPage: DiagnosticPage = { records: [], hasMore: false };
   let diagnosticBefore: number | undefined;
@@ -149,6 +153,11 @@
       if (sequence === reflectionRequest && connected) reflections = states;
     } catch (failure) { if (sequence === reflectionRequest && connected) error = failure instanceof Error ? failure.message : "Could not load private character state."; }
   }
+  async function loadMediaState() {
+    const sequence = ++mediaStateSequence;
+    try { const state = await request<MediaState>("media:state", {}); if (connected && sequence === mediaStateSequence) mediaState = state; }
+    catch (failure) { if (connected && sequence === mediaStateSequence) error = failure instanceof Error ? failure.message : "Could not load media state."; }
+  }
   async function deleteAgent() {
     if (!deleteAgentConfirmation) return;
     const agent = deleteAgentConfirmation;
@@ -197,6 +206,19 @@
     await previewConfiguration();
     notice = "News Room setup is ready under Configuration files. Review the preview, then choose Apply import to save it.";
   }
+  async function previewMediaRoomSetup() {
+    const configuration = await request<Configuration>("config:export", {});
+    const savedSettings = configuration.settings ?? activeSettings;
+    importConfiguration = configurationSchema.parse({ ...configuration,
+      rooms: configuration.rooms.some(room => room.id === "media-room") ? configuration.rooms : [...configuration.rooms, {
+        id: "media-room", name: "Media Room", isFoodSource: false,
+        description: "Residents suggest movies or TV shows to watch together. The current title and description appear on the screen; replacing something already playing requires a local vote.",
+      }], settings: { ...savedSettings, media: { ...savedSettings.media, enabled: true, roomId: "media-room" } },
+    });
+    importFileName = "Media Room setup";
+    await previewConfiguration();
+    notice = "Media Room setup is ready under Configuration files. Review the preview, then choose Apply import to save it.";
+  }
   async function readConfigurationFile(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
@@ -224,7 +246,7 @@
   }
   function diagnosticFilter(): DiagnosticFilter {
     return { ...(diagnosticAgent ? { agentId: diagnosticAgent } : {}), ...(diagnosticRoom ? { roomId: diagnosticRoom } : {}),
-      ...(diagnosticAction ? { action: diagnosticAction as "speak" | "move" | "wait" | "eat" } : {}),
+      ...(diagnosticAction ? { action: diagnosticAction as NonNullable<DiagnosticFilter["action"]> } : {}),
       ...(diagnosticOutcome ? { outcome: diagnosticOutcome } : {}),
       ...(diagnosticFrom ? { from: new Date(diagnosticFrom).toISOString() } : {}),
       ...(diagnosticTo ? { to: new Date(diagnosticTo).toISOString() } : {}) };
@@ -262,11 +284,12 @@
       connected = true;
       void loadDiagnostics();
       void loadReflections();
+      void loadMediaState();
       // INVARIANT: reconnect discards caches that may have missed a conversation clear.
       histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
     });
-    socket.on("disconnect", () => { connected = false; reflections = []; reflectionRequest++; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
+    socket.on("disconnect", () => { connected = false; reflections = []; mediaState = undefined; mediaStateSequence++; reflectionRequest++; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
@@ -289,6 +312,8 @@
     socket.on("reflection:changed", () => { void loadReflections(); });
     socket.on("relationships:changed", () => { relationshipVersion++; });
     socket.on("news:changed", () => { newsVersion++; });
+    socket.on("media:state", (state: MediaState) => { mediaStateSequence++; mediaState = state; });
+    socket.on("media:changed", () => { mediaVersion++; void loadMediaState(); });
     socket.on("conversation:cleared", (result: HistoryCleared) => {
       resetHistory(result.roomIds); clearConfirmation = undefined;
       void loadHistory(selectedRoom);
@@ -362,7 +387,7 @@
     {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
     {#if clearConfirmation}
       <div role="group" aria-label="Confirm conversation clearing">
-        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions, intentions, appraisal evidence and relationship summaries are retained and may still reflect this conversation. The current news display and selected-news history are retained. Affected exchange subscriptions are cleared. Use Reset relationship memory separately to clear relationship evidence and dependent private state. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions, intentions, appraisal evidence and relationship summaries are retained and may still reflect this conversation. The current news display, selected-news history, media programmes, ballots and individual votes are retained. Affected exchange subscriptions are cleared. Use Reset relationship memory separately to clear relationship evidence and dependent private state. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
         <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
       </div>
@@ -451,6 +476,7 @@
   </section>
   <RelationshipPanel {agents} {connected} stopped={runState.state === "stopped"} refreshVersion={relationshipVersion} {request} />
   <NewsPanel {connected} enabled={activeSettings.news.enabled} roomName={rooms.find(room => room.id === activeSettings.news.roomId)?.name ?? activeSettings.news.roomId} nextDueAt={runState.nextNewsAt} schedulerError={runState.newsError} refreshVersion={newsVersion} {request} />
+  <MediaPanel {connected} enabled={activeSettings.media.enabled} roomName={rooms.find(room => room.id === activeSettings.media.roomId)?.name ?? activeSettings.media.roomId} state={mediaState} refreshVersion={mediaVersion} {request} />
   <section aria-label="Shared settings">
     <h2>Shared behaviour and energy</h2>
     <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
@@ -480,6 +506,18 @@
       <p>One shared request selects a sourced headline for the assigned room. Topics and the editable news prompt guide variety; web search must be supported by the selected model and account. A failure retains the existing display.</p>
       <button type="button" disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(previewNewsRoomSetup)}>Preview News Room setup</button>
       <p>Previews renaming room-1 to News Room, updating its description and enabling news there using the existing configuration import. Saved profiles, IDs and room history are retained. The preview uses saved configuration; save other edits first.</p>
+      <h3>Movies and TV</h3>
+      <label><input type="checkbox" bind:checked={settings.media.enabled} /> Enable movie and TV proposals</label>
+      <label>Media room <select bind:value={settings.media.roomId}>
+        {#if !rooms.some(room => room.id === settings.media.roomId)}<option value={settings.media.roomId}>{settings.media.roomId} (not created yet)</option>{/if}
+        {#each rooms as room}<option value={room.id}>{room.name}</option>{/each}
+      </select></label>
+      <label>Playback duration (seconds of running simulation) <input type="number" min="0.001" step="0.001" value={settings.media.programmeDurationMs / 1000} required on:input={event => { settings.media.programmeDurationMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
+      <label>Replacement vote deadline (running seconds) <input type="number" min="0.001" step="0.001" value={settings.media.ballotDurationMs / 1000} required on:input={event => { settings.media.ballotDurationMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
+      <label>Replacement proposal cooldown (running seconds) <input type="number" min="0.001" step="0.001" value={settings.media.proposalCooldownMs / 1000} required on:input={event => { settings.media.proposalCooldownMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
+      <p>Agents suggest a movie or TV title and short description from memory. Their recollections are simulation material; no catalogue lookup is required. Idle playback starts immediately. Replacements need a strict majority of the original enabled local residents. The cooldown never blocks starting an idle screen.</p>
+      <button type="button" disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(previewMediaRoomSetup)}>Preview Media Room setup</button>
+      <p>Previews adding media-room if absent and enabling media there. Existing rooms and profiles are kept. Review and apply under Configuration files; the preview uses saved settings.</p>
       <h3>Observable activity</h3>
       <label><input type="checkbox" bind:checked={settings.activity.roomEventsEnabled} /> Record automatic room arrival and departure events</label>
       <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Allow observable emote opportunities</label>
@@ -495,7 +533,7 @@
       <p>Each operation uses its applicable sections below, followed by resolved context and enforced protocol constraints. Preview the operation to inspect the exact request order. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}
         {@const key = name as keyof typeof defaultPrompts}
-        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance", appraisals: "Relationship appraisal guidance", relationshipSummary: "Relationship summary guidance", newsSelection: "News selection guidance" })[key]}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance", appraisals: "Relationship appraisal guidance", relationshipSummary: "Relationship summary guidance", newsSelection: "News selection guidance", mediaParticipation: "Movie and TV participation guidance", mediaVote: "Media vote guidance" })[key]}
           <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
         </label>
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>
@@ -530,8 +568,8 @@
       <label>Agent ID (empty for all; deleted IDs supported) <input bind:value={diagnosticAgent} list="diagnostic-agents" /></label>
       <datalist id="diagnostic-agents">{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</datalist>
       <label>Decision room <select bind:value={diagnosticRoom}><option value="">All rooms</option>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
-      <label>Action <select bind:value={diagnosticAction}><option value="">All actions</option>{#each ["speak", "emote", "move", "wait", "eat"] as action}<option value={action}>{action}</option>{/each}</select></label>
-      <label>Outcome <select bind:value={diagnosticOutcome}><option value="">All outcomes</option>{#each ["scheduled", "running", "completed", "applied", "applied-noop", "applied-notification-failure", "provider", "timeout", "parse", "schema", "world-validation", "persistence", "stale", "cancelled", "cancelled-before-start", "interrupted", "diagnostic-failure"] as outcome}<option value={outcome}>{outcome}</option>{/each}</select></label>
+      <label>Action <select bind:value={diagnosticAction}><option value="">All actions</option>{#each ["speak", "emote", "move", "wait", "eat", "relationship-summary", "news", "propose-media", "media-vote"] as action}<option value={action}>{action}</option>{/each}</select></label>
+      <label>Outcome <select bind:value={diagnosticOutcome}><option value="">All outcomes</option>{#each ["scheduled", "running", "completed", "applied", "applied-noop", "applied-notification-failure", "provider", "timeout", "parse", "schema", "world-validation", "persistence", "stale", "cancelled", "cancelled-before-start", "cancelled-no-vote", "vote-invalid", "vote-missing", "interrupted", "diagnostic-failure"] as outcome}<option value={outcome}>{outcome}</option>{/each}</select></label>
       <label>Scheduled from <input type="datetime-local" bind:value={diagnosticFrom} /></label>
       <label>Scheduled through <input type="datetime-local" bind:value={diagnosticTo} /></label>
       <button disabled={!connected || diagnosticLoading}>Apply filters / latest page</button>

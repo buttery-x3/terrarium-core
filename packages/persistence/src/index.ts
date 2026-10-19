@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Kysely, SqliteDialect, type Generated } from 'kysely';
-import { defaultSettings, upgradeSavedSettings, type ConversationMessage } from '@terrarium/shared';
+import { defaultSettings, upgradeSavedSettings, type ConversationMessage, type MediaVoteChoice, type MediaVoteRecord } from '@terrarium/shared';
 
 export interface DB {
   rooms: {
@@ -63,6 +63,13 @@ export interface DB {
   };
   news_sources: { canonical_url: string; news_item_id: string };
   news_state: { id: number; current_item_id: string | null; last_attempt_at: string | null; last_success_at: string | null; error: string | null };
+  media_state: { id: number; current_programme: string | null; remaining_ms: number; cooldown_remaining_ms: number; clock_at: number | null;
+    active_ballot_id: string | null; last_ballot_id: string | null };
+  media_ballots: { sequence: Generated<number>; id: string; room_id: string; programme_id: string; current_programme: string;
+    proposer_id: string; proposer_name: string; title: string; description: string; opened_at: string; closed_at: string | null;
+    remaining_ms: number; electorate_count: number; required_change_votes: number; status: 'open' | 'passed' | 'failed' | 'cancelled' };
+  media_votes: { ballot_id: string; voter_id: string; voter_name: string; status: MediaVoteRecord['status'];
+    choice: MediaVoteChoice | null; voted_at: string | null; error: string | null };
   observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
   settings: { id: number; version: number; value: string };
@@ -235,6 +242,29 @@ export const ensureTables = async (db: Kysely<DB>) => {
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
     await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     await db.insertInto('schema_migrations').values({ version: 6 }).execute();
+  }
+  if (!applied.some(row => row.version === 7)) {
+    await db.schema.createTable('media_state').addColumn('id', 'integer', column => column.primaryKey())
+      .addColumn('current_programme', 'text').addColumn('remaining_ms', 'integer', column => column.notNull())
+      .addColumn('cooldown_remaining_ms', 'integer', column => column.notNull()).addColumn('clock_at', 'integer')
+      .addColumn('active_ballot_id', 'text').addColumn('last_ballot_id', 'text').execute();
+    await db.insertInto('media_state').values({ id: 1, current_programme: null, remaining_ms: 0, cooldown_remaining_ms: 0,
+      clock_at: null, active_ballot_id: null, last_ballot_id: null }).execute();
+    await db.schema.createTable('media_ballots').addColumn('sequence', 'integer', column => column.primaryKey().autoIncrement())
+      .addColumn('id', 'text', column => column.notNull().unique()).addColumn('room_id', 'text', column => column.notNull())
+      .addColumn('programme_id', 'text', column => column.notNull()).addColumn('current_programme', 'text', column => column.notNull())
+      .addColumn('proposer_id', 'text', column => column.notNull()).addColumn('proposer_name', 'text', column => column.notNull())
+      .addColumn('title', 'text', column => column.notNull()).addColumn('description', 'text', column => column.notNull())
+      .addColumn('opened_at', 'text', column => column.notNull()).addColumn('closed_at', 'text')
+      .addColumn('remaining_ms', 'integer', column => column.notNull()).addColumn('electorate_count', 'integer', column => column.notNull())
+      .addColumn('required_change_votes', 'integer', column => column.notNull()).addColumn('status', 'text', column => column.notNull()).execute();
+    await db.schema.createTable('media_votes').addColumn('ballot_id', 'text', column => column.notNull())
+      .addColumn('voter_id', 'text', column => column.notNull()).addColumn('voter_name', 'text', column => column.notNull())
+      .addColumn('status', 'text', column => column.notNull()).addColumn('choice', 'text').addColumn('voted_at', 'text').addColumn('error', 'text')
+      .addPrimaryKeyConstraint('media_ballot_voter', ['ballot_id', 'voter_id']).execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 7 }).execute();
   }
   });
 };

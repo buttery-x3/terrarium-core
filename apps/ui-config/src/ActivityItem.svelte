@@ -6,7 +6,7 @@
 <li data-event-type={item.type} title={`Record ${item.id} · ${item.roomId}`}>
   <strong>{item.speaker}</strong> · {item.type}
   <time datetime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
-  <p>{#if item.type === "news"}News display: {item.content}{:else if item.type === "speak"}{item.content}{:else}<em>{item.content}</em>{/if}</p>
+  <p>{#if item.type === "news"}News display: {item.content}{:else if item.type === "media"}Media room: {item.content}{:else if item.type === "speak"}{item.content}{:else}<em>{item.content}</em>{/if}</p>
 </li>
 
 <style>

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolveScheduling, type Agent, type AgentActivity, type ConversationMessage, type DecisionOpportunity, type RunState, type Settings } from '@terrarium/shared';
-import { DiagnosticError, type World } from '@terrarium/persistence';
+import { ActionError, DiagnosticError, type World } from '@terrarium/persistence';
 import { TurnError } from './turns.js';
 import type { DecisionResult } from './reflection.js';
 
@@ -9,7 +9,12 @@ type TurnHandler = (agent: Agent, signal: AbortSignal, stillCurrent: () => boole
 type SummaryHandler = (agent: Agent, targetAgentId: string, signal: AbortSignal, stillCurrent: () => boolean,
   onApplied: () => void, attemptId?: string) => Promise<void>;
 type NewsHandler = (signal: AbortSignal, stillCurrent: () => boolean, onApplied: () => void, dueAt: number, requestedAt: number) => Promise<void>;
-type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity; summaryTargetId?: string };
+export type MediaHandlers = {
+  vote: (agent: Agent, ballotId: string, signal: AbortSignal, stillCurrent: () => boolean, onApplied: () => void, attemptId?: string) => Promise<void>;
+  changed: (events: ConversationMessage[]) => Promise<void>;
+};
+type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity;
+  summaryTargetId?: string; ballotId?: string; applied?: boolean };
 type ActiveNews = { controller: AbortController; epoch: number; dueAt: number; requestedAt: number };
 type SummaryJob = { observerId: string; targetAgentId: string; dueAt: number; requestedAt: number; intervalMs: number };
 const newsFlightKey = Symbol('system-news');
@@ -27,6 +32,7 @@ export class Scheduler {
   private activity = new Map<string, AgentActivity>();
   private schedules = new Map<string, Schedule>();
   private summaries = new Map<string, SummaryJob>();
+  private votes = new Map<string, { voterId: string; ballotId: string; requestedAt: number }>();
   private flights = new Map<string | symbol, Promise<unknown>>();
   private newsActive?: ActiveNews;
   private newsDueAt?: number;
@@ -43,7 +49,8 @@ export class Scheduler {
   constructor(private world: World, private handler: TurnHandler, private publish: (state: RunState) => void,
     private options = { concurrency: 4, timeoutMs: 60000, retries: 2, backoffMs: 1000 },
     private summaryHandler?: SummaryHandler,
-    private newsHandler?: NewsHandler) {}
+    private newsHandler?: NewsHandler,
+    private media?: MediaHandlers) {}
 
   snapshot(): RunState {
     return { state: this.state, agents: [...this.activity.values()].map(activity => {
@@ -52,6 +59,7 @@ export class Scheduler {
         nextReflectionAt: Math.min(schedule.reflectionAt, schedule.engagementAt ?? Infinity),
         nextSpeechAt: schedule.speechPlan?.dueAt, nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
         nextRelationshipSummaryAt: this.nextSummary(activity.agentId)?.dueAt,
+        nextVoteAt: this.votes.get(activity.agentId)?.requestedAt,
       } : {}) };
     }), concurrency: this.options.concurrency, ...(this.error ? { error: this.error } : {}),
       ...(this.newsDueAt !== undefined ? { nextNewsAt: this.newsDueAt } : {}), ...(this.newsError ? { newsError: this.newsError } : {}) };
@@ -83,11 +91,24 @@ export class Scheduler {
       this.refreshActivity(candidate.observerId);
     }
   }
+  private async advanceMedia(now = Date.now(), running?: boolean) {
+    const events = await this.world.syncMedia(now, running);
+    if (events.length) await this.media?.changed(events);
+  }
+  private async discoverVotes() {
+    if (!this.media) return;
+    const candidates = await this.world.voteCandidates(20);
+    if (this.state === 'stopped') return;
+    this.votes = new Map(candidates.filter(candidate => this.schedules.has(candidate.voterId)).map(candidate => [candidate.voterId, candidate]));
+    for (const [id, active] of this.active) if (active.ballotId && !active.applied && this.votes.get(id)?.ballotId !== active.ballotId &&
+      !await this.world.voteInput(id, active.ballotId)) active.controller.abort();
+    for (const id of this.schedules.keys()) this.refreshActivity(id, this.activity.get(id)?.error);
+  }
   private refreshActivity(id: string, error?: string) {
     const schedule = this.schedules.get(id);
     if (!schedule || this.active.has(id)) return;
     this.activity.set(id, { agentId: id, state: error ? 'error' : 'scheduled',
-      dueAt: Math.min(this.due(schedule), this.nextSummary(id)?.dueAt ?? Infinity), ...(error ? { error } : {}) });
+      dueAt: Math.min(this.due(schedule), this.nextSummary(id)?.dueAt ?? Infinity, this.votes.get(id)?.requestedAt ?? Infinity), ...(error ? { error } : {}) });
   }
   watch() { this.timer ??= setInterval(() => { void this.tick(); }, 500); }
   close() { if (this.timer) clearInterval(this.timer); this.timer = undefined; return this.stop(); }
@@ -110,6 +131,7 @@ export class Scheduler {
     }
     this.pausedAt = undefined; this.error = undefined; this.state = 'running';
     await this.world.syncEnergy(Date.now(), true);
+    await this.advanceMedia(Date.now(), true);
     try { await this.changed(); } catch (error) { this.fail(error); throw error; }
     this.emit();
   }
@@ -117,14 +139,18 @@ export class Scheduler {
     if (this.state !== 'running') return;
     this.pausedAt = Date.now(); this.state = 'paused';
     void this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error));
+    void this.advanceMedia(Date.now(), false).catch(error => this.fail(error));
     this.emit();
   }
   async stop() {
     this.state = 'stopped'; this.pausedAt = undefined; this.epoch += 1; this.error = undefined;
     for (const active of this.active.values()) active.controller.abort();
     this.newsActive?.controller.abort(); this.newsDueAt = undefined; this.newsRequestedAt = undefined; this.newsError = undefined;
-    this.schedules.clear(); this.summaries.clear(); this.activity.clear(); this.emit();
-    await Promise.allSettled([this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error)), ...this.pending]);
+    this.schedules.clear(); this.summaries.clear(); this.votes.clear(); this.activity.clear(); this.emit();
+    await Promise.allSettled([this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error)),
+      this.advanceMedia(Date.now(), false).catch(error => this.fail(error)), ...this.pending]);
+    const mediaEvents = await this.world.cancelMediaBallots('stopped');
+    if (mediaEvents.length) await this.media?.changed(mediaEvents);
     await this.world.clearEngagements();
   }
   hasActiveWork() { return this.active.size > 0 || Boolean(this.newsActive) || this.pending.size > 0 || this.flights.size > 0; }
@@ -200,6 +226,7 @@ export class Scheduler {
       this.error = 'Could not read saved agent state. Check the database, then resume.';
     }
     void this.world.syncEnergy(Date.now(), false).catch(() => {});
+    void this.advanceMedia(Date.now(), false).catch(() => {});
     this.emit();
   }
 
@@ -208,7 +235,7 @@ export class Scheduler {
     this.ticking = true;
     const epoch = this.epoch;
     try {
-      await this.world.syncEnergy(); await this.changed(); await this.discoverSummaries();
+      await this.world.syncEnergy(); await this.advanceMedia(); await this.changed(); await this.discoverSummaries(); await this.discoverVotes();
       const agents = await this.world.agents();
       if (this.state !== 'running' || this.epoch !== epoch) return;
       agents.sort((a, b) => (this.activity.get(a.id)?.dueAt ?? Infinity) - (this.activity.get(b.id)?.dueAt ?? Infinity));
@@ -216,22 +243,25 @@ export class Scheduler {
       for (const agent of agents) {
         // INVARIANT: a timed-out handler retains its slot until it actually settles.
         if (this.occupiedSlots() >= this.options.concurrency) break;
-        const schedule = this.schedules.get(agent.id), now = Date.now(), summary = this.nextSummary(agent.id);
-        const dueAt = Math.min(schedule ? this.due(schedule) : Infinity, summary?.dueAt ?? Infinity);
+        const schedule = this.schedules.get(agent.id), now = Date.now(), summary = this.nextSummary(agent.id), vote = this.votes.get(agent.id);
+        const dueAt = Math.min(schedule ? this.due(schedule) : Infinity, summary?.dueAt ?? Infinity, vote?.requestedAt ?? Infinity);
         if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || dueAt > now) continue;
-        const summarizing = summary?.dueAt === dueAt, engagement = (schedule.engagementAt ?? Infinity) <= now;
-        const opportunity: DecisionOpportunity = summarizing ? { reflection: false, speech: false, emote: false,
-          requestedAt: summary.requestedAt, reason: 'cadence' } : {
+        const voting = vote?.requestedAt === dueAt, summarizing = !voting && summary?.dueAt === dueAt, engagement = (schedule.engagementAt ?? Infinity) <= now;
+        const opportunity: DecisionOpportunity = voting || summarizing ? { reflection: false, speech: false, emote: false,
+          requestedAt: voting ? vote.requestedAt : summary!.requestedAt, reason: 'cadence' } : {
           reflection: schedule.reflectionAt <= now || engagement,
           speech: (schedule.speechPlan?.dueAt ?? Infinity) <= now, emote: schedule.emoteAt <= now,
           requestedAt: schedule.speechPlan?.dueAt === dueAt ? schedule.speechPlan.requestedAt : dueAt,
           reason: engagement ? 'engagement' : (schedule.speechPlan?.dueAt ?? Infinity) <= now ? 'scheduled-speech' : 'cadence',
           ...((schedule.speechPlan?.dueAt ?? Infinity) <= now ? { speechPlan: { ...schedule.speechPlan! } } : {}),
+          ...(schedule.speechPlan && schedule.speechPlan.dueAt > now ? {
+            pendingSpeechPlan: { ...schedule.speechPlan, remainingMs: schedule.speechPlan.dueAt - now },
+          } : {}),
         };
-        const operation = summarizing ? 'relationship-summary' : opportunity.reflection ? 'reflection' : opportunity.speech ? 'speech' : 'emote';
+        const operation = voting ? 'media-vote' : summarizing ? 'relationship-summary' : opportunity.reflection ? 'reflection' : opportunity.speech ? 'speech' : 'emote';
         const active: ActiveTurn = { controller: new AbortController(), revision: agent.revision, epoch: this.epoch,
           turnId: await this.world.scheduleTurn(agent, dueAt, operation, opportunity.requestedAt), opportunity,
-          ...(summarizing ? { summaryTargetId: summary.targetAgentId } : {}) };
+          ...(summarizing ? { summaryTargetId: summary!.targetAgentId } : {}), ...(voting ? { ballotId: vote!.ballotId } : {}) };
         if (this.state !== 'running' || this.epoch !== epoch) { await this.world.endTurn(active.turnId, 'cancelled-before-start'); break; }
         if (opportunity.reflection) { schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs; schedule.engagementAt = undefined; }
         if (opportunity.speech) schedule.speechPlan = undefined;
@@ -302,9 +332,12 @@ export class Scheduler {
             cancel = () => reject(signal.reason ?? new Error('Turn cancelled.'));
             signal.addEventListener('abort', cancel, { once: true }); if (signal.aborted) cancel();
           });
-          const handler = active.summaryTargetId
-            ? this.summaryHandler!(agent, active.summaryTargetId, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId)
-            : this.handler(agent, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId, active.opportunity);
+          const onApplied = () => { applied = true; active.applied = true; };
+          const handler = active.ballotId
+            ? this.media!.vote(agent, active.ballotId, signal, () => current() && !signal.aborted, onApplied, attemptId)
+            : active.summaryTargetId
+              ? this.summaryHandler!(agent, active.summaryTargetId, signal, () => current() && !signal.aborted, onApplied, attemptId)
+              : this.handler(agent, signal, () => current() && !signal.aborted, onApplied, attemptId, active.opportunity);
           this.flights.set(agent.id, handler);
           const settledHandler = handler.finally(() => {
             settled = true; if (this.flights.get(agent.id) === handler) this.flights.delete(agent.id);
@@ -318,10 +351,16 @@ export class Scheduler {
           const reason = error instanceof Error ? error.message : 'The turn failed.';
           outcome = !current() ? 'cancelled' : attemptController.signal.aborted ? 'timeout' : error instanceof TurnError ? error.category : 'provider';
           if (error instanceof DiagnosticError) { this.fail(error); outcome = 'diagnostic-failure'; }
+          if (active.ballotId && !applied && current() && outcome === 'timeout') {
+            try {
+              const saved = await this.world.recordMediaVoteFailure(agent.id, agent.revision, active.ballotId, 'missing', reason, current, attemptId);
+              await this.media!.changed(saved.events);
+            } catch (failure) { if (!(failure instanceof ActionError && failure.category === 'stale')) throw failure; }
+          }
           await this.world.updateDiagnostic(attemptId, { error: reason }, applied ? 'applied-notification-failure' : outcome);
           if (!current() || error instanceof DiagnosticError) break;
           failure = 'Attempt ' + (attempt + 1) + '/' + (this.options.retries + 1) + ' failed: ' + reason;
-          if (applied || outcome === 'stale') break;
+          if (applied || outcome === 'stale' || active.ballotId) break;
           if (attempt < this.options.retries) await delay(this.options.backoffMs * 2 ** attempt, undefined, { signal: active.controller.signal });
           if (!settled) break;
         } finally { clearTimeout(timeout); if (cancel) signal.removeEventListener('abort', cancel); }
@@ -333,6 +372,7 @@ export class Scheduler {
       if (this.active.get(agent.id) === active) this.active.delete(agent.id);
       try {
         await this.world.endTurn(active.turnId, outcome);
+        if (active.ballotId) this.votes.delete(agent.id);
         if (active.summaryTargetId && this.epoch === active.epoch) {
           const key = JSON.stringify([agent.id, active.summaryTargetId]), job = this.summaries.get(key);
           if (job && failure) job.dueAt = this.now() + job.intervalMs;
@@ -341,9 +381,11 @@ export class Scheduler {
         const schedule = this.schedules.get(agent.id), latest = await this.world.agent(agent.id);
         if (schedule && latest?.enabled && this.state !== 'stopped' && this.epoch === active.epoch && schedule.revision === active.revision) {
           const now = this.now();
-          if (!active.summaryTargetId) schedule.lastDecisionAt = now;
-          if (schedule.engagementAt !== undefined)
-            schedule.engagementAt = Math.max(schedule.engagementAt, now + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
+          if (!active.summaryTargetId && !active.ballotId) {
+            schedule.lastDecisionAt = now;
+            if (schedule.engagementAt !== undefined)
+              schedule.engagementAt = Math.max(schedule.engagementAt, now + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
+          }
           if (active.opportunity.reflection) schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs;
           if (active.opportunity.emote) {
             schedule.emoteCheckedAt = now;

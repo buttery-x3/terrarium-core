@@ -23,7 +23,7 @@ Personality retains the existing editable `instructions` field. Motivations and 
 | Configuration files | Export all room/agent settings as versioned JSON; validate and preview imports; merge by ID in one transaction while stopped. Preserve omitted records and history. |
 | Agents              | Editable name, instructions, model, independent timing overrides, personal memory limit, room, enabled state. Persistent FIFO of 1–50 personally observed items across rooms; new-agent form defaults to 30. |
 | Model integration   | ChatGPT OAuth with PKCE and verified identity, Windows protected storage, model discovery, completed Responses streams. Initial model: `gpt-6-luna`. Other adapters remain unused mocks. |
-| Actions             | `speak`, `move`, `eat`, `emote`, and silent `wait`. Speech/emote eligibility is independent; no opportunity requires outward activity. Successful moves produce local departure/arrival activity when enabled. Technical failures remain operational errors. |
+| Actions             | `speak`, `move`, `eat`, `emote`, silent `wait`, and local `propose-media`. Speech/emote eligibility is independent; no opportunity requires outward activity. Successful moves produce local departure/arrival activity when enabled. Technical failures remain operational errors. |
 | Scheduling          | One active operation per agent, four concurrent requests, independent reflection/speech/emote schedules, 60-second attempts, two retries. Pause finishes active work; stop/disable/edits/movement discard stale results. |
 | Web interface       | Timeline, older messages, reconnect recovery, room/agent forms, ChatGPT connection, run controls, activity/error feedback.                                                               |
 | Terrain             | Optional existing Pixi view consumes the shared conversation event. Further graphical development remains deferred.                                                                      |
@@ -62,11 +62,17 @@ Defaults allow two appraisals per reflection and summary work approximately ever
 
 The third branch adds a configurable shared news display backed by real web-search requests through the existing ChatGPT provider. A ten-minute default interval, configurable topic mix and recent-headline context seek varied stories, including sport, discoveries and lighter material. Published items retain source URLs and dates. Search evidence validation and persistent deduplication prevent accepting unverified URLs or repeating known headlines/articles; failed or empty selections retain the current display.
 
-New headlines are local world events. Residents see the current display on arrival without receiving earlier conversations. The operator can inspect state, errors, timing, selected-item history and exact request previews. Migration 6 leaves news disabled and room names intact; the approved room-1 rename/enabling is available through a stopped configuration preview. Version-6 configuration stores settings, not runtime headlines. No dependency or additional credential is added. Movie/TV playback remains the final planned branch.
+New headlines are local world events. Residents see the current display on arrival without receiving earlier conversations. The operator can inspect state, errors, timing, selected-item history and exact request previews. Migration 6 leaves news disabled and room names intact; the approved room-1 rename/enabling is available through a stopped configuration preview. Version-6 configuration stores settings, not runtime headlines. No dependency or additional credential is added.
+
+## FLAME-148 media stage
+
+The fourth branch lets agents propose a movie or TV title and short description from their own recollections, including invented details. An idle display starts immediately; changing something already playing requires a strict-majority vote of the original enabled local electorate, with a real vote from the proposer. Playback ends after ten running minutes by default. New arrivals receive current title/description/remaining time, without earlier room conversation. Pause/Stop freeze programme time; Stop/restart cancel unresolved ballots while preserving playback remainder.
+
+Individual votes remain operator-only. Missing, invalid, withdrawn and cancelled requests are recorded honestly and never counted as agreement. Public events contain proposals and aggregate outcomes. The operator can inspect current state, ballots, vote records and exact pending vote previews. Editable settings default to a two-minute ballot deadline and five-minute replacement-proposal cooldown, which never blocks an idle start. The stopped setup preview adds/enables `media-room` while keeping existing rooms. Migration/configuration version 7 preserve prior data, and runtime playback/votes remain separate from configuration exports. No catalogue, streaming service, dependency or credential is added.
 
 ## Deferred scope
 
-Movie/TV playback is the final approved FLAME-148 stage. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
+Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
 
 ## Release boundaries
 

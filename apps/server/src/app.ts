@@ -30,6 +30,7 @@ import { Scheduler } from './scheduler.js';
 import { performDecision, previewDecision } from './reflection.js';
 import { performRelationshipSummary, previewRelationshipSummary } from './relationships.js';
 import { performNews, previewNews } from './news.js';
+import { performMediaVote, previewMediaVote } from './media.js';
 
 function conversationMarkdown(snapshot: ConversationExport) {
   const label = (value: string) => value
@@ -108,6 +109,7 @@ export async function createApplication(options: {
     config.emit('world:state', state);
     config.emit('reflection:changed');
     config.emit('news:changed');
+    config.emit('media:changed');
     terrain.emit(
       'rooms:list',
       state.rooms.map((room) => room.id),
@@ -130,6 +132,7 @@ export async function createApplication(options: {
       );
       config.emit('reflection:changed');
       config.emit('relationships:changed');
+      config.emit('media:changed');
       return result;
     },
     (state) => { config.emit('run:state', state); config.emit('diagnostics:changed'); },
@@ -142,11 +145,24 @@ export async function createApplication(options: {
       try { await performNews(world, options.provider, signal, current, applied, publishMessage, dueAt, requestedAt); }
       finally { config.emit('news:changed'); }
     },
+    {
+      vote: async (agent, ballotId, signal, current, applied, attemptId) => {
+        try { await performMediaVote(world, agent, ballotId, options.provider, signal, current, applied,
+          async events => { events.forEach(publishMessage); config.emit('media:changed'); }, attemptId); }
+        finally { config.emit('media:changed'); }
+      },
+      changed: async events => {
+        events.forEach(publishMessage);
+        config.emit('media:changed');
+      },
+    },
   );
   scheduler.watch();
   const energyUpdates = setInterval(() => {
     void world.agents().then(agents => config.emit('energy:state', agents.map(({ id, energy }) => ({ id, energy }))))
       .catch(() => config.emit('operation:error', 'Could not read current energy.'));
+    void world.mediaState().then(state => config.emit('media:state', state))
+      .catch(() => config.emit('operation:error', 'Could not read current media activity.'));
   }, 1000);
 
   config.on('connection', (socket) => {
@@ -253,6 +269,15 @@ export async function createApplication(options: {
     command('news:history', z.object({ before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
       input => world.newsHistory(input));
     command('news:preview', z.object({}).strict(), () => previewNews(world));
+    command('media:state', z.object({}).strict(), () => world.mediaState());
+    command('media:ballots', z.object({ before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
+      input => world.mediaBallots(input));
+    command('media:ballot', z.object({ id: z.string().min(1) }).strict(), input => world.mediaBallot(input.id));
+    command('media:preview', z.object({ agentId: z.string().min(1), ballotId: z.string().min(1) }).strict(), async input => {
+      const agent = await world.agent(input.agentId);
+      if (!agent) throw new Error('Agent does not exist.');
+      return previewMediaVote(world, agent, input.ballotId);
+    });
     command('relationships:list', relationshipFilterSchema, input => world.relationshipPage(input));
     command('relationships:appraisals', relationshipFilterSchema, input => world.appraisals(input));
     command('relationships:appraisal', z.object({ id: z.string().min(1) }).strict(), input => world.appraisal(input.id));

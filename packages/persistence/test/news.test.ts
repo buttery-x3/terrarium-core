@@ -107,7 +107,7 @@ describe('shared current news', () => {
     await expect(publish({ ...item, sourceUrls: ['https://example.org/science/marine-species?gclid=another'] })).rejects.toThrow('repeats');
     expect((await world.history({ roomId: 'room-1' })).messages).toEqual([]);
     const exported = await world.exportConfiguration();
-    expect(exported.version).toBe(6); expect(JSON.stringify(exported)).not.toContain(item.headline);
+    expect(exported.version).toBe(7); expect(JSON.stringify(exported)).not.toContain(item.headline);
   });
 
   it('upgrades version 5 without renaming rooms or changing existing private state and validates explicit room assignment', async () => {
@@ -115,7 +115,7 @@ describe('shared current news', () => {
     const agent = await world.saveAgent({ ...input, intention: 'Authored intention' });
     await world.saveReflection(agent.id, agent.revision, { reaction: 'Preserved state', intention: 'Observe' }, () => true);
     const source = await world.speak('room-1', 'Preserved archive');
-    const { news, prompts: { newsSelection, ...prompts }, ...settings } = defaultSettings;
+    const { news, media, prompts: { newsSelection, mediaParticipation, mediaVote, ...prompts }, ...settings } = defaultSettings;
     await db.updateTable('settings').set({ value: JSON.stringify({ ...settings, scheduling: { ...settings.scheduling, reflectionIntervalMs: 120000 },
       relationships: { ...settings.relationships, maxAppraisalsPerReflection: 1 }, prompts: { ...prompts, relationshipSummary: 'Custom summary instructions' } }) }).execute();
     for (const table of ['news_items', 'news_sources', 'news_state'] as const) await db.schema.dropTable(table).execute();

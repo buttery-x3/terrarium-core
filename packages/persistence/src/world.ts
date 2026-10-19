@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema,
-  appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema, newsProposalSchema, newsHistoryFilterSchema, canonicalNewsUrl } from '@terrarium/shared';
+  appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema, newsProposalSchema, newsHistoryFilterSchema, canonicalNewsUrl, mediaVoteChoiceSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import { sql } from 'kysely';
 import type {
@@ -22,6 +22,7 @@ import type {
   AppraisalProposal, AppraisalRecord, RelationshipState, RelationshipSummary, RelationshipSummaryInput, RelationshipSummaryProposal,
   RelationshipContext, RelationshipFilter, RelationshipPage, AppraisalPage, RelationshipSummaryPage,
   NewsProposal, NewsItem, NewsState, NewsHistoryFilter, NewsHistoryPage,
+  MediaProgramme, MediaBallotPublic, MediaBallot, MediaState, MediaDisplay, MediaVoteChoice, MediaVoteRecord, MediaVoteInput, MediaBallotPage,
 } from '@terrarium/shared';
 import type { DB } from './index.js';
 
@@ -83,6 +84,11 @@ const summaryRecord = (row: Selectable<DB['relationship_summaries']>): Relations
   throughSequence: row.through_sequence, previousSummaryId: row.previous_summary_id, appraisalIds: JSON.parse(row.appraisal_ids) });
 const newsRecord = (row: Selectable<DB['news_items']>): NewsItem => ({ id: row.id, sequence: row.sequence, headline: row.headline,
   description: row.description, category: row.category, publishedAt: row.published_at, retrievedAt: row.retrieved_at, sourceUrls: JSON.parse(row.source_urls) });
+const mediaVoteRecord = (row: Selectable<DB['media_votes']>): MediaVoteRecord => ({ voterId: row.voter_id, voterName: row.voter_name,
+  status: row.status, choice: row.choice, votedAt: row.voted_at, error: row.error });
+const publicBallot = (ballot: MediaBallot): MediaBallotPublic => ({ id: ballot.id, roomId: ballot.roomId, proposerId: ballot.proposerId,
+  proposerName: ballot.proposerName, title: ballot.title, description: ballot.description, openedAt: ballot.openedAt,
+  remainingMs: ballot.remainingMs, electorateCount: ballot.electorateCount, requiredChangeVotes: ballot.requiredChangeVotes });
 
 export class World {
   private energyClock: number | undefined;
@@ -119,6 +125,8 @@ export class World {
     const settings = settingsSchema.parse(value);
     if (settings.news.enabled && !(await this.rooms()).some(room => room.id === settings.news.roomId))
       throw new Error('News requires an existing assigned room before it can be enabled.');
+    if (settings.media.enabled && !(await this.rooms()).some(room => room.id === settings.media.roomId))
+      throw new Error('Media requires an existing assigned room before it can be enabled.');
     for (const agent of await this.agents()) resolveScheduling(settings, agent);
     if (settings.energy.enabled && !(await this.rooms()).some(room => room.isFoodSource))
       throw new Error('Configuration requires at least one food-source room before energy can be enabled.');
@@ -154,7 +162,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 6,
+        version: 7,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -208,10 +216,12 @@ export class World {
     if (configuration.version < 4) defaults.push('Older settings use shared reflection, speech and emote timing defaults when absent. Private reflections are not imported.');
     if (configuration.version < 5) defaults.push('Older settings use default optional appraisal capacity and relationship-summary timing. Runtime appraisals and summaries are not imported.');
     if (configuration.version < 6) defaults.push('News is disabled by default for older settings. Existing room names, archives and runtime news history are preserved.');
+    if (configuration.version < 7) defaults.push('Media is disabled by default for older settings. Runtime programmes and ballots are not imported.');
     const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
     if (settings.news.enabled && !mergedRooms.has(settings.news.roomId)) throw new Error('News requires an existing assigned room before it can be enabled.');
+    if (settings.media.enabled && !mergedRooms.has(settings.media.roomId)) throw new Error('Media requires an existing assigned room before it can be enabled.');
     if (settings.energy.enabled && ![...mergedRooms.values()].some(room => room.isFoodSource))
       throw new Error('Configuration requires at least one food-source room while energy is enabled.');
     if (state.agents.some(agent => agent.energy > settings.energy.maximum))
@@ -442,6 +452,201 @@ export class World {
     let query = this.db.updateTable('reflections').set({ engagement_room_id: null, engagement_root_message_id: null, engagement_target_agent_id: null });
     if (agentId) query = query.where(eb => eb.or([eb('agent_id', '=', agentId), eb('engagement_target_agent_id', '=', agentId)]));
     await query.execute();
+  }
+
+  async mediaBallot(id: string): Promise<MediaBallot | null> {
+    const row = await this.db.selectFrom('media_ballots').selectAll().where('id', '=', id).executeTakeFirst();
+    if (!row) return null;
+    const votes = (await this.db.selectFrom('media_votes').selectAll().where('ballot_id', '=', id).orderBy('voter_id').execute()).map(mediaVoteRecord);
+    const counts = { change: 0, keep: 0, abstain: 0, pending: 0, invalid: 0, missing: 0, withdrawn: 0, cancelled: 0 };
+    for (const vote of votes) {
+      if (vote.status === 'cast') { if (vote.choice) counts[vote.choice]++; }
+      else counts[vote.status]++;
+    }
+    return { id: row.id, sequence: row.sequence, roomId: row.room_id, programmeId: row.programme_id, current: JSON.parse(row.current_programme),
+      proposerId: row.proposer_id, proposerName: row.proposer_name, title: row.title, description: row.description, openedAt: row.opened_at,
+      closedAt: row.closed_at, status: row.status, remainingMs: row.remaining_ms, electorateCount: row.electorate_count,
+      requiredChangeVotes: row.required_change_votes, votes, counts };
+  }
+
+  async mediaBallots(input: NewsHistoryFilter = {}): Promise<MediaBallotPage> {
+    const filter = newsHistoryFilterSchema.parse(input);
+    let query = this.db.selectFrom('media_ballots').select(['id', 'sequence']);
+    if (filter.before) query = query.where('sequence', '<', filter.before);
+    const rows = await query.orderBy('sequence', 'desc').limit(filter.limit + 1).execute();
+    const ballots: MediaBallotPage['ballots'] = [];
+    for (const row of rows.slice(0, filter.limit)) {
+      const { votes, current, ...summary } = (await this.mediaBallot(row.id))!;
+      ballots.push(summary);
+    }
+    return { ballots, hasMore: rows.length > filter.limit, next: ballots.at(-1)?.sequence };
+  }
+
+  async mediaState(): Promise<MediaState> {
+    const state = await this.db.selectFrom('media_state').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const activeBallot = state.active_ballot_id ? await this.mediaBallot(state.active_ballot_id) : null;
+    const lastBallot = state.last_ballot_id ? await this.mediaBallot(state.last_ballot_id) : null;
+    return { current: state.current_programme ? JSON.parse(state.current_programme) : null, remainingMs: state.remaining_ms,
+      cooldownRemainingMs: state.cooldown_remaining_ms, ballot: activeBallot ? publicBallot(activeBallot) : null, activeBallot, lastBallot };
+  }
+
+  async mediaDisplay(roomId: string): Promise<MediaDisplay | null> {
+    const { media } = (await this.settings()).value;
+    if (!media.enabled || media.roomId !== roomId) return null;
+    const { current, remainingMs, cooldownRemainingMs, ballot } = await this.mediaState();
+    return { current, remainingMs, cooldownRemainingMs, ballot };
+  }
+
+  private async finishMediaBallot(id: string, cancelled?: string): Promise<ConversationMessage[]> {
+    let ballot = await this.mediaBallot(id);
+    if (!ballot || ballot.status !== 'open') return [];
+    if (cancelled) {
+      await this.db.updateTable('media_votes').set({ status: 'cancelled', error: cancelled.slice(0, 1000) })
+        .where('ballot_id', '=', id).where('status', '=', 'pending').execute();
+      ballot = (await this.mediaBallot(id))!;
+    }
+    if (!cancelled && ballot.counts.pending) return [];
+    const { media } = (await this.settings()).value;
+    const status = cancelled ? 'cancelled' : ballot.counts.change >= ballot.requiredChangeVotes ? 'passed' : 'failed';
+    await this.db.updateTable('media_ballots').set({ status, closed_at: new Date().toISOString(), remaining_ms: 0 }).where('id', '=', id).execute();
+    await this.db.updateTable('media_state').set({ active_ballot_id: null, last_ballot_id: id, cooldown_remaining_ms: media.proposalCooldownMs }).where('id', '=', 1).execute();
+    if (status === 'passed') {
+      const programme: MediaProgramme = { id: randomUUID(), title: ballot.title, description: ballot.description,
+        proposerId: ballot.proposerId, proposerName: ballot.proposerName, startedAt: new Date().toISOString() };
+      await this.db.updateTable('media_state').set({ current_programme: JSON.stringify(programme), remaining_ms: media.programmeDurationMs }).where('id', '=', 1).execute();
+    }
+    const counts = ballot.counts;
+    const result = `Vote ${status}: ${counts.change} change, ${counts.keep} keep, ${counts.abstain} abstain, ${counts.missing} missing, ${counts.invalid} invalid, ${counts.withdrawn} withdrawn, ${counts.cancelled} cancelled.`;
+    const detail = status === 'passed' ? ` Now playing ${ballot.title}: ${ballot.description}` : cancelled ? ` ${cancelled}` : ' The current programme continues.';
+    return [await this.insertMessage(this.db, ballot.roomId, 'world-media', 'Media display', result + detail, 'media')];
+  }
+
+  private async advanceMedia(now: number, running?: boolean): Promise<ConversationMessage[]> {
+    const row = await this.db.selectFrom('media_state').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const { media } = (await this.settings()).value;
+    const elapsed = row.clock_at === null ? 0 : Math.max(0, now - row.clock_at);
+    const active = media.enabled && (running ?? row.clock_at !== null);
+    const remaining = Math.max(0, row.remaining_ms - elapsed), events: ConversationMessage[] = [];
+    await this.db.updateTable('media_state').set({ remaining_ms: row.current_programme ? remaining : 0,
+      cooldown_remaining_ms: Math.max(0, row.cooldown_remaining_ms - elapsed), clock_at: active ? now : null }).where('id', '=', 1).execute();
+    if (row.active_ballot_id) await this.db.updateTable('media_ballots').set(eb => ({ remaining_ms: eb.fn<number>('max', [eb('remaining_ms', '-', elapsed), eb.val(0)]) }))
+      .where('id', '=', row.active_ballot_id).where('status', '=', 'open').execute();
+    if (row.current_programme && remaining === 0) {
+      await this.db.updateTable('media_state').set({ current_programme: null, remaining_ms: 0 }).where('id', '=', 1).execute();
+      if (row.active_ballot_id) events.push(...await this.finishMediaBallot(row.active_ballot_id, 'The programme ended before the vote concluded.'));
+      events.push(await this.insertMessage(this.db, media.roomId, 'world-media', 'Media display', 'Nothing is currently playing.', 'media'));
+      return events;
+    }
+    if (row.active_ballot_id) {
+      const ballot = await this.mediaBallot(row.active_ballot_id);
+      if (ballot?.status === 'open') {
+        const localIds = new Set((await this.db.selectFrom('agents').select('id').where('room_id', '=', ballot.roomId).where('enabled', '=', 1).execute()).map(agent => agent.id));
+        for (const vote of ballot.votes) if (vote.status === 'pending' && !localIds.has(vote.voterId))
+          await this.db.updateTable('media_votes').set({ status: 'withdrawn', error: 'The resident left or became unavailable before voting.' })
+            .where('ballot_id', '=', ballot.id).where('voter_id', '=', vote.voterId).execute();
+        if (!media.enabled || media.roomId !== ballot.roomId || !row.current_programme || JSON.parse(row.current_programme).id !== ballot.programmeId)
+          events.push(...await this.finishMediaBallot(ballot.id, 'The room programme or capability changed.'));
+        else {
+          if (ballot.remainingMs <= 0) await this.db.updateTable('media_votes').set({ status: 'missing', error: 'The voting deadline passed without a response.' })
+            .where('ballot_id', '=', ballot.id).where('status', '=', 'pending').execute();
+          events.push(...await this.finishMediaBallot(ballot.id));
+        }
+      }
+    }
+    return events;
+  }
+
+  async syncMedia(now = Date.now(), running?: boolean): Promise<ConversationMessage[]> {
+    return this.db.transaction().execute(db => new World(db).advanceMedia(now, running));
+  }
+
+  async cancelMediaBallots(reason: string): Promise<ConversationMessage[]> {
+    return this.db.transaction().execute(async db => {
+      const world = new World(db), events = await world.advanceMedia(Date.now(), false);
+      const row = await db.selectFrom('media_state').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+      if (row.active_ballot_id) events.push(...await world.finishMediaBallot(row.active_ballot_id, reason));
+      return events;
+    });
+  }
+
+  private async proposeMedia(agent: Agent, action: Extract<AgentAction, { type: 'propose-media' }>): Promise<ConversationMessage[]> {
+    const { media } = (await this.settings()).value;
+    if (!media.enabled || media.roomId !== agent.roomId) throw new ActionError('world-validation', 'Programme proposals require the enabled media room.');
+    const events = await this.advanceMedia(Date.now()), state = await this.mediaState();
+    if (!state.current) {
+      const programme: MediaProgramme = { id: randomUUID(), title: action.title, description: action.description,
+        proposerId: agent.id, proposerName: agent.name, startedAt: new Date().toISOString() };
+      await this.db.updateTable('media_state').set({ current_programme: JSON.stringify(programme), remaining_ms: media.programmeDurationMs }).where('id', '=', 1).execute();
+      events.push(await this.insertMessage(this.db, agent.roomId, 'world-media', 'Media display', `${agent.name} starts ${action.title}: ${action.description}`, 'media'));
+      return events;
+    }
+    if (state.activeBallot) throw new ActionError('world-validation', 'This room already has an active programme vote.');
+    if (state.cooldownRemainingMs > 0) throw new ActionError('world-validation', 'Programme replacement proposals are cooling down.');
+    const electorate = await this.db.selectFrom('agents').select(['id', 'name']).where('room_id', '=', agent.roomId).where('enabled', '=', 1).execute();
+    const id = randomUUID();
+    await this.db.insertInto('media_ballots').values({ id, room_id: agent.roomId, programme_id: state.current.id, current_programme: JSON.stringify(state.current),
+      proposer_id: agent.id, proposer_name: agent.name, title: action.title, description: action.description, opened_at: new Date().toISOString(), closed_at: null,
+      remaining_ms: media.ballotDurationMs, electorate_count: electorate.length, required_change_votes: Math.floor(electorate.length / 2) + 1, status: 'open' }).execute();
+    await this.db.insertInto('media_votes').values(electorate.map(voter => ({ ballot_id: id, voter_id: voter.id, voter_name: voter.name,
+      status: 'pending' as const, choice: null, voted_at: null, error: null }))).execute();
+    await this.db.updateTable('media_state').set({ active_ballot_id: id }).where('id', '=', 1).execute();
+    events.push(await this.insertMessage(this.db, agent.roomId, 'world-media', 'Media display', `${agent.name} proposes ${action.title}: ${action.description} A vote is open for the ${electorate.length} eligible residents.`, 'media'));
+    return events;
+  }
+
+  async voteCandidates(limit = 20): Promise<{ voterId: string; ballotId: string; requestedAt: number }[]> {
+    limit = newsHistoryFilterSchema.parse({ limit }).limit;
+    const state = await this.mediaState();
+    if (!state.activeBallot) return [];
+    const candidates: { voterId: string; ballotId: string; requestedAt: number }[] = [];
+    for (const vote of state.activeBallot.votes) if (vote.status === 'pending' && await this.voteInput(vote.voterId, state.activeBallot.id)) {
+      candidates.push({ voterId: vote.voterId, ballotId: state.activeBallot.id, requestedAt: Date.parse(state.activeBallot.openedAt) });
+      if (candidates.length === limit) break;
+    }
+    return candidates;
+  }
+
+  async voteInput(voterId: string, ballotId: string): Promise<MediaVoteInput | null> {
+    const actor = await this.agent(voterId), ballot = await this.mediaBallot(ballotId), row = await this.db.selectFrom('media_state').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const { media } = (await this.settings()).value;
+    const elapsed = row.clock_at === null ? 0 : Math.max(0, Date.now() - row.clock_at);
+    if (!media.enabled || !actor?.enabled || !ballot || ballot.status !== 'open' || actor.roomId !== ballot.roomId || media.roomId !== ballot.roomId ||
+      row.active_ballot_id !== ballot.id || !row.current_programme || JSON.parse(row.current_programme).id !== ballot.programmeId ||
+      row.remaining_ms <= elapsed || ballot.remainingMs <= elapsed || !ballot.votes.some(vote => vote.voterId === voterId && vote.status === 'pending')) return null;
+    return { voterId, ballot: publicBallot(ballot), current: JSON.parse(row.current_programme) };
+  }
+
+  private async writeMediaVote(voterId: string, revision: number, ballotId: string, update: { status: 'cast' | 'invalid' | 'missing'; choice: MediaVoteChoice | null; error: string | null },
+    stillCurrent: () => boolean, attemptId?: string) {
+    return this.db.transaction().execute(async db => {
+      const world = new World(db), events = await world.advanceMedia(Date.now()), actor = await world.agent(voterId);
+      const check = () => {
+        if (!actor || !actor.enabled || actor.revision !== revision || !stillCurrent()) throw new ActionError('stale', 'This media vote is no longer current.');
+      };
+      check();
+      if (!await world.voteInput(voterId, ballotId)) throw new ActionError('stale', 'This resident is no longer eligible, the vote already ended, or a response was already recorded.');
+      if (attemptId) {
+        const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
+        if (record.ended_at) throw new ActionError('stale', 'This vote attempt has already ended.');
+      }
+      await db.updateTable('media_votes').set({ status: update.status, choice: update.choice, error: update.error?.slice(0, 1000) ?? null, voted_at: new Date().toISOString() })
+        .where('ballot_id', '=', ballotId).where('voter_id', '=', voterId).where('status', '=', 'pending').execute();
+      events.push(...await world.finishMediaBallot(ballotId));
+      const ballot = (await world.mediaBallot(ballotId))!;
+      if (attemptId) await world.updateDiagnostic(attemptId, { mediaBallotId: ballotId, mediaVote: ballot.votes.find(vote => vote.voterId === voterId), eventIds: events.map(event => event.id) },
+        update.status === 'cast' ? 'applied' : `vote-${update.status}`, 'media-vote');
+      check();
+      return { events, ballot };
+    });
+  }
+
+  async saveMediaVote(voterId: string, revision: number, ballotId: string, choice: MediaVoteChoice, stillCurrent: () => boolean, attemptId?: string) {
+    return this.writeMediaVote(voterId, revision, ballotId, { status: 'cast', choice: mediaVoteChoiceSchema.parse(choice), error: null }, stillCurrent, attemptId);
+  }
+
+  async recordMediaVoteFailure(voterId: string, revision: number, ballotId: string, status: 'invalid' | 'missing', error: string, stillCurrent: () => boolean, attemptId?: string) {
+    if (!['invalid', 'missing'].includes(status)) throw new ActionError('world-validation', 'A failed media vote must be recorded as invalid or missing.');
+    return this.writeMediaVote(voterId, revision, ballotId, { status, choice: null, error }, stillCurrent, attemptId);
   }
 
   async newsState(): Promise<NewsState> {
@@ -921,6 +1126,7 @@ export class World {
       }, decision.sourceIds);
       let message: ConversationMessage | undefined;
       const events: ConversationMessage[] = [];
+      if (action.type === 'propose-media') events.push(...await world.proposeMedia(agentRecord(row), action));
       if (action.type === 'speak' || action.type === 'emote')
         message = await this.insertMessage(
           db,
@@ -952,6 +1158,7 @@ export class World {
         if (action.roomId !== row.room_id) await world.clearEngagements(row.id);
         if (observableMove)
           events.push(await this.insertMessage(db, action.roomId, row.id, row.name, `${row.name} enters ${destination.name}.`, 'arrival'));
+        if (action.roomId !== row.room_id) events.push(...await world.advanceMedia(Date.now()));
       }
       let energyAfter = row.energy;
       if (action.type === 'eat') {
@@ -974,6 +1181,7 @@ export class World {
           passiveDecay: Math.max(0, (details.energySeen ?? row.energy) - row.energy),
           reflection,
           ...appraisals,
+          ...(action.type === 'propose-media' ? { media: await world.mediaState() } : {}),
         }, action.type === 'move' && !moved ? 'applied-noop' : 'applied', action.type);
       }
       check();
@@ -1050,6 +1258,8 @@ export class World {
     await this.db.updateTable('decisions').set({ outcome: 'interrupted', ended_at: new Date().toISOString(), reserved_bytes: 0 })
       .where('ended_at', 'is', null).execute();
     await this.clearEngagements();
+    await this.db.updateTable('media_state').set({ clock_at: null }).where('id', '=', 1).execute();
+    await this.cancelMediaBallots('The server restarted before the vote concluded.');
   }
 
   async diagnostics(input: DiagnosticFilter = {}, details = false): Promise<DiagnosticPage> {
