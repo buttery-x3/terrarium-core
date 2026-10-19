@@ -27,6 +27,8 @@ export async function contextProjection(world: World, agent: Agent) {
     activityRules: state.settings.activity,
     schedulingRules: resolveScheduling(state.settings, own),
     privateState: await snapshot.reflection(own.id),
+    relationshipRules: state.settings.relationships,
+    relationships: await snapshot.relevantRelationships(own.id),
     room: state.rooms.find(room => room.id === own.roomId),
     presentAgents: state.agents.filter(item => item.roomId === own.roomId && item.id !== own.id)
       .map(item => ({ id: item.id, name: item.name })),

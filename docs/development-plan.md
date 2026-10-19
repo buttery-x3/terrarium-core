@@ -204,8 +204,8 @@ On 19 October 2026 the user approved the FLAME-148 plan, including the revised n
 
 | Branch | Scope and status |
 | --- | --- |
-| `codex/flame-148-reflection` | Implemented for integration and validation: latest private reflection, independent speech/emote opportunities, inactivity, local exchange engagement, settings, previews and diagnostics. |
-| `codex/flame-148-relationships` | Planned: witnessed appraisals, directional capped scores, durable evidence and periodic evidence-linked summaries. |
+| `codex/flame-148-reflection` | Implemented and validated as `b3501a2`: latest private reflection, independent speech/emote opportunities, inactivity, local exchange engagement, settings, previews and diagnostics. |
+| `codex/flame-148-relationships` | Implemented for integration and validation: witnessed appraisals, directional capped scores, durable evidence and periodic evidence-linked summaries. |
 | `codex/flame-148-news` | Planned: shared web-search-based news selection, varied topics, recent-headline deduplication, sources and local room observations. |
 | `codex/flame-148-media` | Planned: agent-proposed movie/TV title and description, ten-minute playback, immediate starts when idle and votes for replacements. |
 

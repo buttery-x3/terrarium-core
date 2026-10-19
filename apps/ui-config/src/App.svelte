@@ -3,6 +3,7 @@
   import { io } from "socket.io-client";
   import ActivityItem from "./ActivityItem.svelte";
   import AgentInspector from "./AgentInspector.svelte";
+  import RelationshipPanel from "./RelationshipPanel.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
@@ -43,6 +44,7 @@
   let promptPreview: { payload: { model: string; instructions: string; input: unknown; text: unknown }; constraints: string } | undefined;
   let reflections: ReflectionState[] = [];
   let reflectionRequest = 0;
+  let relationshipVersion = 0;
   let diagnosticAgent = "", diagnosticRoom = "", diagnosticAction = "", diagnosticOutcome = "", diagnosticFrom = "", diagnosticTo = "";
   let diagnosticPage: DiagnosticPage = { records: [], hasMore: false };
   let diagnosticBefore: number | undefined;
@@ -270,6 +272,7 @@
     });
     socket.on("diagnostics:changed", () => { if (!diagnosticBefore) void loadDiagnostics(); });
     socket.on("reflection:changed", () => { void loadReflections(); });
+    socket.on("relationships:changed", () => { relationshipVersion++; });
     socket.on("conversation:cleared", (result: HistoryCleared) => {
       resetHistory(result.roomIds); clearConfirmation = undefined;
       void loadHistory(selectedRoom);
@@ -343,7 +346,7 @@
     {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
     {#if clearConfirmation}
       <div role="group" aria-label="Confirm conversation clearing">
-        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions and intentions are retained and may still reflect this conversation. Affected exchange subscriptions are cleared. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions, intentions, appraisal evidence and relationship summaries are retained and may still reflect this conversation. Affected exchange subscriptions are cleared. Use Reset relationship memory separately to clear relationship evidence and dependent private state. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
         <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
       </div>
@@ -430,6 +433,7 @@
       <button disabled={!connected || busy}>Save agent</button>
     </form>
   </section>
+  <RelationshipPanel {agents} {connected} stopped={runState.state === "stopped"} refreshVersion={relationshipVersion} {request} />
   <section aria-label="Shared settings">
     <h2>Shared behaviour and energy</h2>
     <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
@@ -444,6 +448,11 @@
       {/each}
       <label><input type="checkbox" bind:checked={settings.scheduling.engagementEnabled} /> Allow subscriptions to one local exchange per agent</label>
       <p>A reply in a subscribed exchange can advance one speech opportunity within the cooldown. Repeated triggers combine; leaving the exchange removes the subscription.</p>
+      <h3>Relationship appraisals and summaries</h3>
+      <label>Maximum appraisals per reflection <input type="number" min="0" max="5" step="1" bind:value={settings.relationships.maxAppraisalsPerReflection} required /></label>
+      <label>Relationship summary interval (seconds) <input type="number" min="0.001" step="0.001" value={settings.relationships.summaryIntervalMs / 1000} required on:input={event => { settings.relationships.summaryIntervalMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
+      <label>Maximum new appraisals per summary batch <input type="number" min="1" max="50" step="1" bind:value={settings.relationships.summaryBatchSize} required /></label>
+      <p>Appraisals use witnessed speech or authored emotes from other agents. Zero disables new appraisals. Changed relationships are summarized from bounded evidence batches. An observer's score and summary remain private to that observer and the operator.</p>
       <h3>Observable activity</h3>
       <label><input type="checkbox" bind:checked={settings.activity.roomEventsEnabled} /> Record automatic room arrival and departure events</label>
       <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Allow observable emote opportunities</label>
@@ -456,10 +465,10 @@
       <label>Low energy at or below <input type="number" min="0" max={settings.energy.maximum} step="any" bind:value={settings.energy.lowThreshold} required /></label>
       <p>Meals fill to maximum. Decay freezes while paused, stopped, individually disabled or offline. Stop/restart preserves energy. Zero energy does not restrict actions. At least one food-source room is required when enabled.</p>
       <h3>Shared prompt text</h3>
-      <p>These sections are assembled in the order below, followed by resolved local context and enforced protocol constraints. There is no hidden behavioural fallback.</p>
+      <p>Each operation uses its applicable sections below, followed by resolved context and enforced protocol constraints. Preview the operation to inspect the exact request order. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}
         {@const key = name as keyof typeof defaultPrompts}
-        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance" })[key]}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance", appraisals: "Relationship appraisal guidance", relationshipSummary: "Relationship summary guidance" })[key]}
           <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
         </label>
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>

@@ -126,6 +126,8 @@ export const defaultPrompts = {
   observations: 'Your personal memory contains only events you observed when present, including your own visible contributions. It travels with you between rooms. Read each item\'s timestamp, room and type: remembered activity is not necessarily happening now or here. Arriving gives you no earlier room transcript. You may listen, ask questions or mention experiences from elsewhere without any required greeting or topic change.',
   emotes: 'An emote is one short externally observable behaviour, at most 240 characters. Write in third person, identifying yourself. Quiet, mundane behaviour is enough, such as folding your arms and watching the doorway. Do not include inner thoughts, hidden intentions, monologues or quoted dialogue. Emotes cannot move you, feed you, create items, build machines or grant capabilities. Do not combine an emote with another action.',
   reflection: 'Reflect privately on your witnessed observations and current circumstances. Briefly report your current reaction and immediate intention, or return unchanged when neither changed. Nothing to do is valid. Decide independently whether to request later speech, engage with one local exchange, move, eat, or remain inactive. Reflection does not require public speech or an emote. A delayed speech request stores an intention; its words will be generated later against fresh context.',
+  appraisals: 'You may privately like or dislike a recent witnessed contribution and give a short specific reason. Appraisal is optional; an empty list is valid. Assess what this contribution prompted through your own personality and context, not whether it confirms an existing score. Only another resident\'s speech or authored emote in the supplied observations is eligible. Use its source ID; the application resolves the author and score. Existing impressions inform choices without requiring agreement, avoidance or another negative appraisal.',
+  relationshipSummary: 'Summarise this observer\'s personal impression of this resident using only the supplied appraisal evidence and previous summary. Acknowledge mixed evidence and revise impressions when appropriate. Describe interpretations rather than objective facts about the resident. Do not invent encounters, motives, private thoughts or locations. Keep the summary concise and cite supporting appraisal IDs from the supplied evidence or the previous summary. Numerical scores are calculated by the application and do not dictate behaviour.',
 };
 export const promptSettingsSchema = z.object({
   framing: z.string().trim().min(1).max(8000),
@@ -136,6 +138,8 @@ export const promptSettingsSchema = z.object({
   observations: z.string().trim().min(1).max(8000),
   emotes: z.string().trim().min(1).max(8000),
   reflection: z.string().trim().min(1).max(8000),
+  appraisals: z.string().trim().min(1).max(8000),
+  relationshipSummary: z.string().trim().min(1).max(8000),
 }).strict();
 export const settingsSchema = z.object({
   energy: z.object({
@@ -146,6 +150,8 @@ export const settingsSchema = z.object({
     'Initial energy and low threshold must not exceed maximum energy.'),
   prompts: promptSettingsSchema,
   scheduling: schedulingSchema,
+  relationships: z.object({ maxAppraisalsPerReflection: z.number().int().min(0).max(5),
+    summaryIntervalMs: z.number().int().positive().max(2147483647), summaryBatchSize: z.number().int().min(1).max(50) }).strict(),
   activity: z.object({ roomEventsEnabled: z.boolean(), emotesEnabled: z.boolean() }).strict(),
   diagnostics: z.object({ maxPayloadMiB: z.number().int().min(32).max(16384), retention: z.literal('manual') }).strict(),
 }).strict();
@@ -155,23 +161,31 @@ export const defaultSettings: Settings = {
   prompts: defaultPrompts,
   scheduling: { reflectionIntervalMs: 60000, speechMinDelayMs: 15000, speechMaxDelayMs: 150000,
     speechCooldownMs: 15000, emoteMinIntervalMs: 120000, emoteMaxIntervalMs: 300000, engagementEnabled: true },
+  relationships: { maxAppraisalsPerReflection: 2, summaryIntervalMs: 600000, summaryBatchSize: 20 },
   activity: { roomEventsEnabled: true, emotesEnabled: true },
   diagnostics: { maxPayloadMiB: 256, retention: 'manual' },
 };
-const version3SettingsSchema = settingsSchema.omit({ scheduling: true }).extend({
-  prompts: promptSettingsSchema.omit({ reflection: true }),
+const version4SettingsSchema = settingsSchema.omit({ relationships: true }).extend({
+  prompts: promptSettingsSchema.omit({ appraisals: true, relationshipSummary: true }),
 });
-const legacySettingsSchema = settingsSchema.omit({ activity: true, scheduling: true }).extend({
-  prompts: promptSettingsSchema.omit({ observations: true, emotes: true, reflection: true }),
+const version3SettingsSchema = version4SettingsSchema.omit({ scheduling: true }).extend({
+  prompts: version4SettingsSchema.shape.prompts.omit({ reflection: true }),
 });
+const legacySettingsSchema = version3SettingsSchema.omit({ activity: true }).extend({
+  prompts: version3SettingsSchema.shape.prompts.omit({ observations: true, emotes: true }),
+});
+export function upgradeRelationshipSettings(value: z.infer<typeof version4SettingsSchema>): Settings {
+  return { ...value, relationships: { ...defaultSettings.relationships }, prompts: { ...value.prompts,
+    appraisals: defaultPrompts.appraisals, relationshipSummary: defaultPrompts.relationshipSummary } };
+}
 export function upgradeReflectionSettings(value: z.infer<typeof version3SettingsSchema>): Settings {
   const previousActionSelection = 'Choose one available action first. Formulate speech only if you choose speak. Moving, eating, changing subject and remaining quietly content are valid choices. When emotes are enabled, choose emote instead of wait for a quiet turn; otherwise wait silently. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.';
   const previousReminders = 'Describe only actions the world supports as completed actions. Imaginary construction or saying you ate does not change the world. An optional brief intention is a self-report for this decision, not private reasoning or future memory.';
-  return { ...value, scheduling: { ...defaultSettings.scheduling }, prompts: { ...value.prompts,
+  return upgradeRelationshipSettings({ ...value, scheduling: { ...defaultSettings.scheduling }, prompts: { ...value.prompts,
     actionSelection: value.prompts.actionSelection === previousActionSelection ? defaultPrompts.actionSelection : value.prompts.actionSelection,
     reminders: value.prompts.reminders === previousReminders ? defaultPrompts.reminders : value.prompts.reminders,
     reflection: defaultPrompts.reflection,
-  } };
+  } });
 }
 export function resolveScheduling(settings: Settings, agent: Pick<AgentInput, 'timingOverrides'>) {
   return schedulingSchema.parse({ ...settings.scheduling, ...agent.timingOverrides });
@@ -188,12 +202,14 @@ const configurationFields = z.object({
   rooms: z.array(roomInputSchema.extend({ id: roomIdSchema })),
   agents: z.array(agentInputSchema.and(z.object({ id: z.string().min(1) }))),
 }).strict();
-const importedSettingsSchema = z.union([settingsSchema, version3SettingsSchema.transform(upgradeReflectionSettings), legacySettingsSchema.transform(upgradeLegacySettings)]);
+const importedSettingsSchema = z.union([settingsSchema, version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings), legacySettingsSchema.transform(upgradeLegacySettings)]);
+export function upgradeSavedSettings(value: unknown): Settings { return importedSettingsSchema.parse(value); }
 export const configurationSchema = z.discriminatedUnion('version', [
   configurationFields.extend({ version: z.literal(1), settings: importedSettingsSchema.optional() }),
   configurationFields.extend({ version: z.literal(2), settings: importedSettingsSchema }),
-  configurationFields.extend({ version: z.literal(3), settings: z.union([settingsSchema, version3SettingsSchema.transform(upgradeReflectionSettings)]) }),
-  configurationFields.extend({ version: z.literal(4), settings: settingsSchema }),
+  configurationFields.extend({ version: z.literal(3), settings: z.union([settingsSchema, version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings)]) }),
+  configurationFields.extend({ version: z.literal(4), settings: z.union([settingsSchema, version4SettingsSchema.transform(upgradeRelationshipSettings)]) }),
+  configurationFields.extend({ version: z.literal(5), settings: settingsSchema }),
 ]).superRefine((value, context) => {
   if (value.version >= 2) {
     value.rooms.forEach((room, index) => {
@@ -250,6 +266,37 @@ export const conversationMessageSchema = z.object({
     context.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'Speech must contain 1–8000 characters.' });
 });
 export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
+export const appraisalProposalSchema = z.object({ sourceId: z.string().min(1), reaction: z.enum(['like', 'dislike']), reason: z.string().trim().min(1).max(240) }).strict();
+export type AppraisalProposal = z.infer<typeof appraisalProposalSchema>;
+export type AppraisalRecord = {
+  id: string; sequence: number; observerId: string; observerName: string; targetAgentId: string; targetName: string;
+  source: ConversationMessage; reaction: 'like' | 'dislike'; reason: string; createdAt: string; scoreAfter: number;
+};
+export type RelationshipSummary = {
+  id: string; observerId: string; targetAgentId: string; version: number; summary: string; createdAt: string;
+  throughSequence: number; previousSummaryId: string | null; appraisalIds: string[];
+};
+export type RelationshipState = {
+  observerId: string; observerName: string; targetAgentId: string; targetName: string; score: number; updatedAt: string;
+  latestAppraisalSequence: number; summary: RelationshipSummary | null;
+};
+export type RelationshipContext = Pick<RelationshipState, 'targetAgentId' | 'targetName' | 'score'> & {
+  summary: Pick<RelationshipSummary, 'id' | 'version' | 'summary' | 'createdAt'> | null;
+};
+export type RelationshipSummaryInput = {
+  observerId: string; targetAgentId: string; targetName: string; score: number; previous: RelationshipSummary | null;
+  appraisals: AppraisalRecord[]; throughSequence: number;
+};
+export const relationshipSummaryProposalSchema = z.object({ targetAgentId: z.string().min(1), previousVersion: z.number().int().min(0),
+  throughSequence: z.number().int().positive(), summary: z.string().trim().min(1).max(1000),
+  appraisalIds: z.array(z.string().min(1)).min(1).max(100) }).strict();
+export type RelationshipSummaryProposal = z.infer<typeof relationshipSummaryProposalSchema>;
+export const relationshipFilterSchema = z.object({ observerId: z.string().min(1).optional(), targetAgentId: z.string().min(1).optional(),
+  before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).default(50) }).strict();
+export type RelationshipFilter = z.input<typeof relationshipFilterSchema>;
+export type RelationshipPage = { relationships: RelationshipState[]; hasMore: boolean; next?: number };
+export type AppraisalPage = { appraisals: AppraisalRecord[]; hasMore: boolean; next?: number };
+export type RelationshipSummaryPage = { summaries: RelationshipSummary[]; hasMore: boolean; next?: number };
 export type HistoryPage = { messages: ConversationMessage[]; hasMore: boolean };
 export type ConversationExport = {
   exportedAt: string;
@@ -268,14 +315,14 @@ export type DecisionOpportunity = {
   speechPlan?: { dueAt: number; requestedAt: number; replyToId: string | null; targetAgentId: string | null };
 };
 export type AgentActivity = { agentId: string; state: 'scheduled' | 'running' | 'error'; dueAt?: number; error?: string; turnId?: string;
-  nextReflectionAt?: number; nextSpeechAt?: number; nextEmoteAt?: number; operation?: string };
+  nextReflectionAt?: number; nextSpeechAt?: number; nextEmoteAt?: number; nextRelationshipSummaryAt?: number; operation?: string };
 export type RunState = { state: 'stopped' | 'running' | 'paused'; agents: AgentActivity[]; concurrency: number; error?: string };
 export type AuthState = { connected: boolean; pending: boolean; error?: string };
 export type WorldState = { rooms: Room[]; agents: Agent[]; settings: Settings; settingsVersion: number };
 
 export const diagnosticFilterSchema = z.object({
   agentId: z.string().optional(), roomId: z.string().optional(),
-  action: z.enum(['speak', 'emote', 'move', 'wait', 'eat']).optional(),
+  action: z.enum(['speak', 'emote', 'move', 'wait', 'eat', 'relationship-summary']).optional(),
   outcome: z.string().max(80).optional(), from: z.string().datetime().optional(), to: z.string().datetime().optional(),
   before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).default(50),
 }).strict();
@@ -288,6 +335,7 @@ export type AttemptDetails = {
   eventIds?: string[];
   operation?: string; opportunities?: DecisionOpportunity; requestedAt?: number; schedule?: unknown; rawRequestedDelay?: number;
   reflection?: ReflectionState;
+  acceptedAppraisals?: AppraisalRecord[]; duplicateAppraisalIds?: string[]; relationshipSummary?: RelationshipSummary;
   error?: string; notificationError?: string; truncated?: boolean; captureLimitBytes?: number;
 };
 export type DiagnosticRecord = {

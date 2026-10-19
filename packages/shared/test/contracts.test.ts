@@ -26,7 +26,7 @@ describe('runtime contracts', () => {
     expect(actionJsonSchema(false).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['speak', 'move', 'wait', 'eat']);
   });
   it('upgrades version-2 settings while preserving customization and requires complete version-3 settings', () => {
-    const { activity, scheduling, prompts: { observations, emotes, reflection, ...prompts }, ...settings } = defaultSettings;
+    const { activity, scheduling, relationships, prompts: { observations, emotes, reflection, appraisals, relationshipSummary, ...prompts }, ...settings } = defaultSettings;
     prompts.actionSelection = 'Custom action choices';
     const old = { format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: { ...settings, prompts } };
     const upgraded = configurationSchema.parse(old);
@@ -36,7 +36,7 @@ describe('runtime contracts', () => {
     expect(settingsSchema.safeParse({ ...defaultSettings, activity: { emotesEnabled: true } }).success).toBe(false);
   });
   it('upgrades prior reflection settings without overwriting custom guidance and validates merged scheduling', () => {
-    const { scheduling, prompts: { reflection, ...prompts }, ...settings } = defaultSettings;
+    const { scheduling, relationships, prompts: { reflection, appraisals, relationshipSummary, ...prompts }, ...settings } = defaultSettings;
     const previous = { ...settings, prompts: { ...prompts, actionSelection: 'Custom choices', reminders: 'Custom reminder' } };
     const upgraded = upgradeReflectionSettings(previous);
     expect(upgraded.prompts).toMatchObject({ actionSelection: 'Custom choices', reminders: 'Custom reminder', reflection });

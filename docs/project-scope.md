@@ -50,11 +50,17 @@ The first FLAME-148 branch adds latest private reactions and immediate intention
 
 Defaults are 60-second reflections, requested speech delays of 15–150 seconds with a 15-second cooldown, and emote opportunities 120–300 seconds apart. Version-4 configuration contains authored settings and timing, while runtime reflections and pending work stay separate. Migration 4 preserves existing profiles and observations. No dependencies or authentication changes are added in this stage.
 
-The remaining approved stacked branches implement relationships, diverse web-searched news, then locally suggested movie/TV playback. Those features are planned, not part of the reflection implementation. See the [approved branch plan](development-plan.md#approved-flame-148-stacked-implementation).
+The reflection branch is the first slice of the [approved stacked branch plan](development-plan.md#approved-flame-148-stacked-implementation). The relationship branch below builds on it.
+
+## FLAME-148 relationship stage
+
+The second branch adds optional witnessed appraisals and independent observer→target scores. Appraisals retain reasons and source evidence, enforce one observer/source update across retries/restart and clamp scores immediately to −10…+10. Changed relationships receive bounded evidence-linked summaries with retained versions. Each agent sees only its own relevant impressions; the operator can inspect scores, page through evidence and versions, and preview exact summary requests.
+
+Defaults allow two appraisals per reflection and summary work approximately every ten minutes with batches of twenty new appraisals. Configuration version 5 and migration 5 add settings, prompts and durable relationship records. Conversation clearing explicitly retains this evidence. A confirmed stopped-run relationship reset clears it and dependent private state while preserving separate diagnostics. Diverse web-searched news and locally suggested movie/TV playback remain planned subsequent branches.
 
 ## Deferred scope
 
-Relationship scores and summaries, news selection and movie/TV playback are approved later FLAME-148 stages. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
+News selection and movie/TV playback are approved later FLAME-148 stages. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
 
 ## Release boundaries
 

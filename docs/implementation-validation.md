@@ -1,5 +1,11 @@
 # Implementation validation
 
+## FLAME-148 relationship validation — 19 October 2026
+
+`codex/flame-148-relationships` builds successfully and both Svelte checks report zero errors/warnings. The full test run passes, including 43 persistence, 68 server and 36 UI/socket tests. New cases cover witnessed evidence, durable deduplication, directional clamped scores, atomic rollback, private context limited to eight relationships, evidence-linked summary versions, independent summary scheduling and retention/reset controls. Migration 5 preserves customized settings, profiles, energy, observations, reflection state and diagnostics.
+
+Development startup used a temporary database on port 3138 and separate configuration/terrain servers on 4273/4274. All watchers compiled; health and transformed frontend sources returned HTTP 200. A manual compiled-module check accepted one observed contribution twice, retained exactly one appraisal and score +1, generated summary version 1 and retained its disclosed source evidence after conversation clearing. Socket integration verifies that reset requires Stop and explicit confirmation. Temporary development processes were stopped after validation.
+
 ## FLAME-148 reflection validation — 19 October 2026
 
 Stage 1 is validated on `codex/flame-148-reflection`. `pnpm build` passed for all six packages. `pnpm check` reported zero errors and zero warnings in both Svelte frontends. `pnpm test` passed 159 tests: 22 shared contracts, 35 persistence, 14 provider, 56 server and 32 configuration UI/socket tests. Existing configuration expectations now reflect version 4. These results do not establish validation of later relationship, news or media stages.

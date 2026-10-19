@@ -52,7 +52,7 @@ Invalid IDs, already-deleted agents and failed writes return errors. Deletion is
 
 ## Export and import configuration
 
-Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 4`, `rooms`, `agents`, and `settings`. It exports a consistent snapshot of stable IDs, personality `instructions`, motivations, operator intention, model, shared timing and optional agent timing overrides in milliseconds, retained legacy intervals, memory limits, enabled flags, room assignments, food-source flags, energy policy, activity toggles, shared prompts and diagnostic policy. Personal observations, generated private reactions/intentions, subscriptions, pending requests, conversation history, credentials, current energy, diagnostic records, run state and internal revisions are excluded.
+Use **Export configuration** in **Configuration files** to download `terrarium-config.json`. The readable UTF-8 file contains `format: "terrarium-config"`, `version: 5`, `rooms`, `agents`, and `settings`. It exports a consistent snapshot of stable IDs, personality `instructions`, motivations, operator intention, model, shared timing and optional agent timing overrides in milliseconds, retained legacy intervals, memory limits, enabled flags, room assignments, food-source flags, energy policy, activity toggles, relationship appraisal/summary settings, shared prompts and diagnostic policy. Personal observations, generated private reactions/intentions, relationship evidence/scores/summaries, subscriptions, pending requests, conversation history, credentials, current energy, diagnostic records, run state and internal revisions are excluded.
 
 Choose a JSON file to validate and preview each room/agent addition or update. IDs determine identity: matching IDs are updated, new IDs are created, and saved entries absent from the file remain. Names are editable labels, not matching keys. Every entry needs an ID. Agent room references may point to either a room in the file or an existing saved room. Unknown references, duplicate IDs, unsupported versions, extra fields and invalid settings are rejected with details. Files and their formatted representation must fit within 512 KiB, below the existing socket transport limit.
 
@@ -144,7 +144,7 @@ Additional `/config` commands:
 
 | Command | Input/result |
 | --- | --- |
-| `settings:save` | Complete `{ energy, activity, scheduling, prompts, diagnostics }`; stopped only; returns saved value/version. |
+| `settings:save` | Complete `{ energy, activity, scheduling, relationships, prompts, diagnostics }`; stopped only; returns saved value/version. |
 | `prompt:preview` | `{ agentId, operation?: 'reflection' \| 'speech' \| 'emote' }`; defaults to reflection; returns local context, fixed constraints and provider-body preview. |
 | `reflection:list` | `{}`; returns current private character states for the operator. No corresponding terrain command. |
 | `diagnostics:list` | Optional agentId, roomId, action, outcome, ISO from/to, sequence before, limit 1–100 (default 50); summary page. |
@@ -191,4 +191,33 @@ Diagnostics distinguish reflection, speech and emote operations, requested time,
 
 Migration 4 adds private state, optional timing overrides, reply/exchange identifiers and diagnostic operation/requested timestamps. Existing profiles, models, locations, energy and observed memories are preserved. Version-4 exports include shared timing, overrides and editable reflection guidance; version-1/2/3 files remain importable with disclosed timing defaults. Private state and pending runtime work are excluded from configuration files. Stop/restart preserve the latest private reaction and intention, while pending operations are discarded; restart also clears exchange subscriptions and starts stopped. Conversation clearing removes observed messages and affected subscriptions but retains generated private reactions/intentions and diagnostic copies. Deleting an agent removes its private state.
 
-Relationship appraisals, diverse searched news and movie/TV playback are subsequent approved FLAME-148 stages. They are not implemented by the reflection branch; see the [stacked branch plan](development-plan.md#approved-flame-148-stacked-implementation).
+Relationship appraisals are implemented in stage 2 below. Diverse searched news and movie/TV playback remain subsequent approved FLAME-148 stages; see the [stacked branch plan](development-plan.md#approved-flame-148-stacked-implementation).
+
+## FLAME-148 stage 2: directional relationships
+
+Reflections may return zero to two optional appraisals by default. **Maximum appraisals per reflection** permits 0–5; zero stops new appraisals. Each appraisal identifies an observed speech or authored emote, `like`/`dislike`, and a nonempty reason of at most 240 characters. Eligibility comes from the exact observation snapshot supplied to that reflection. Self-authored items, operator messages, movement and world-generated events are excluded. The server supplies the observer and resolves the source author rather than accepting a model-selected target.
+
+Each accepted appraisal stores its reason and a complete source snapshot, including original actor, room, timestamp, content and identity. An observer can appraise a source only once; retries and restart do not apply a duplicate score change. A directional observer→target score starts at zero, changes by +1/−1, and clamps after every accepted update to −10…+10. A dislike at +10 immediately reduces the score to +9; no overflow balance accumulates. Scores do not force actions or make another agent's reciprocal impression public.
+
+Changed relationships are eligible for summarization approximately every ten minutes by default. **Relationship summary interval** is editable in seconds; **Maximum new appraisals per summary batch** defaults to 20 and permits 1–50. Summary requests use the observer's profile, the previous summary and the next bounded evidence batch. They share the four-request global limit and single-operation-per-agent rule. Each version retains its timestamp, covered appraisal sequence, previous-summary link and validated supporting appraisal IDs. Invalid/stale responses do not overwrite a saved summary. Summary prompts are editable under **Relationship summary guidance**; appraisal guidance is separately editable.
+
+Reflection/action context includes at most eight of the observer's own relationships, prioritizing present residents and people referenced in current observations. Context contains directional scores and the latest concise summaries. It excludes other agents' opinions, their private state and unrelated operator records. An impression is generated character interpretation, not an objective judgment about the target.
+
+The **Relationships and appraisal evidence** panel filters by observer and target ID, including deleted IDs, and shows 25 directional relationships per page. Inspect a pair to page through 25 appraisals or 10 summary versions. Expand a source to see the saved content and provenance. Expand a summary's supporting evidence to retrieve those exact appraisal records even when they are outside the current ledger page. **Preview summary request** displays the current assembled prompt, batch and provider payload without a model call, or reports that no changed evidence needs summarizing. Regular reflection previews also expose the requesting agent's relevant relationships.
+
+Conversation clearing retains appraisals, their copied source evidence, scores and summaries; the confirmation discloses this. **Reset relationship memory** instead requires Stop, finished active/cancelled work and explicit confirmation. It atomically clears all appraisals, scores and summary versions together with generated private reactions, intentions and exchange subscriptions. It preserves conversations, authored profiles, actual last speech/emote timestamps and diagnostics. **Clear diagnostics** remains a separate action, and downloaded copies remain independent. Deleting an agent preserves historical relationship evidence for operator inspection.
+
+Additional operator-only `/config` commands:
+
+| Command | Input/result |
+| --- | --- |
+| `relationships:list` | `{ observerId?, targetAgentId?, before?, limit? }`; paged directional scores/latest summaries. |
+| `relationships:appraisals` | Same filters; paged complete appraisal records. |
+| `relationships:appraisal` | `{ id }`; exact saved appraisal record or null if absent. |
+| `relationships:summaries` | `{ observerId, targetAgentId, beforeVersion?, limit? }`; paged summary versions with supporting IDs. |
+| `relationships:preview` | `{ observerId, targetAgentId }`; current summary request preview or null when no changed evidence remains. |
+| `relationships:reset` | `{ confirm: true }`; stopped and idle only; returns deleted appraisal/relationship/summary counts. |
+
+`relationships:changed` refreshes latest operator pages after appraisal/summary changes or reset; reset also refreshes private state. Older pages remain available until the operator returns to the latest page. Diagnostic operations identify relationship-summary requests and preserve their exact evidence, provider payload, output and application result.
+
+Migration 5 creates the unique appraisal ledger, directional scores and summary versions. Existing private state, authored configuration, observations, energy and archives are preserved. Version-5 exports include relationship settings and editable appraisal/summary prompts; versions 1–4 remain importable with disclosed defaults. Runtime relationship data is never imported or exported as configuration. This stage adds no dependency or authentication change.

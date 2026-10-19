@@ -549,7 +549,7 @@ describe('persisted world', () => {
     });
     expect(
       await db.selectFrom('schema_migrations').selectAll().execute(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     expect(await world.memory('old-agent')).toEqual([]);
     const unchanged = new Database(legacy, { readonly: true });
     expect(unchanged.prepare('PRAGMA table_info(agents)').all()).toHaveLength(

@@ -10,7 +10,7 @@ const input: AgentInput = {
   enabled: true, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 50,
 };
 const opportunity: DecisionOpportunity = { reflection: true, speech: false, emote: false, requestedAt: 1000, reason: 'cadence' };
-const quiet = { reflection: null, speechPlan: null, requestEmote: false, engagement: null, action: { type: 'wait' } };
+const quiet = { reflection: null, speechPlan: null, requestEmote: false, engagement: null, appraisals: [], action: { type: 'wait' } };
 const providerFor = (value: unknown): LmProvider => ({ name: 'fake', complete: async () => ({ content: JSON.stringify(value) }) });
 const decide = (agent: Agent, value: unknown, offered = opportunity) => performDecision(world, agent, providerFor(value),
   new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);

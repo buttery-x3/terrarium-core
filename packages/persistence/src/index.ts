@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Kysely, SqliteDialect, type Generated } from 'kysely';
-import { defaultSettings, settingsSchema, upgradeLegacySettings, upgradeReflectionSettings, type ConversationMessage } from '@terrarium/shared';
+import { defaultSettings, upgradeSavedSettings, type ConversationMessage } from '@terrarium/shared';
 
 export interface DB {
   rooms: {
@@ -44,6 +44,18 @@ export interface DB {
     agent_id: string; reflected_at: string | null; reaction: string | null; intention: string | null;
     last_speech_at: string | null; last_emote_at: string | null;
     engagement_room_id: string | null; engagement_root_message_id: string | null; engagement_target_agent_id: string | null;
+  };
+  appraisals: {
+    sequence: Generated<number>; id: string; observer_id: string; observer_name: string; target_agent_id: string; target_name: string;
+    source_id: string; source: string; reaction: 'like' | 'dislike'; reason: string; created_at: string; score_after: number;
+  };
+  relationships: {
+    observer_id: string; observer_name: string; target_agent_id: string; target_name: string; score: number; updated_at: string;
+    latest_appraisal_sequence: number;
+  };
+  relationship_summaries: {
+    id: string; observer_id: string; target_agent_id: string; version: number; summary: string; created_at: string;
+    through_sequence: number; previous_summary_id: string | null; appraisal_ids: string;
   };
   observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
@@ -158,9 +170,7 @@ export const ensureTables = async (db: Kysely<DB>) => {
     await db.schema.createIndex('observations_agent_order').on('observations').columns(['agent_id', 'sequence']).execute();
     await db.schema.createIndex('observations_message').on('observations').column('message_id').execute();
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
-    const value = JSON.parse(saved.value);
-    const settings = settingsSchema.safeParse(value);
-    await db.updateTable('settings').set({ value: JSON.stringify(settings.success ? settings.data : upgradeLegacySettings(value)), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     // INVARIANT: existing archives do not establish personally witnessed observations.
     await db.insertInto('schema_migrations').values({ version: 3 }).execute();
   }
@@ -176,9 +186,34 @@ export const ensureTables = async (db: Kysely<DB>) => {
       .addColumn('engagement_room_id', 'text').addColumn('engagement_root_message_id', 'text')
       .addColumn('engagement_target_agent_id', 'text').execute();
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
-    const value = JSON.parse(saved.value), settings = settingsSchema.safeParse(value);
-    await db.updateTable('settings').set({ value: JSON.stringify(settings.success ? settings.data : upgradeReflectionSettings(value)), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     await db.insertInto('schema_migrations').values({ version: 4 }).execute();
+  }
+  if (!applied.some(row => row.version === 5)) {
+    await db.schema.createTable('appraisals').addColumn('sequence', 'integer', column => column.primaryKey().autoIncrement())
+      .addColumn('id', 'text', column => column.notNull().unique())
+      .addColumn('observer_id', 'text', column => column.notNull()).addColumn('observer_name', 'text', column => column.notNull())
+      .addColumn('target_agent_id', 'text', column => column.notNull()).addColumn('target_name', 'text', column => column.notNull())
+      .addColumn('source_id', 'text', column => column.notNull()).addColumn('source', 'text', column => column.notNull())
+      .addColumn('reaction', 'text', column => column.notNull()).addColumn('reason', 'text', column => column.notNull())
+      .addColumn('created_at', 'text', column => column.notNull()).addColumn('score_after', 'integer', column => column.notNull())
+      .addUniqueConstraint('appraisal_observer_source', ['observer_id', 'source_id']).execute();
+    await db.schema.createIndex('appraisal_pair_order').on('appraisals').columns(['observer_id', 'target_agent_id', 'sequence']).execute();
+    await db.schema.createTable('relationships')
+      .addColumn('observer_id', 'text', column => column.notNull()).addColumn('observer_name', 'text', column => column.notNull())
+      .addColumn('target_agent_id', 'text', column => column.notNull()).addColumn('target_name', 'text', column => column.notNull())
+      .addColumn('score', 'integer', column => column.notNull()).addColumn('updated_at', 'text', column => column.notNull())
+      .addColumn('latest_appraisal_sequence', 'integer', column => column.notNull())
+      .addPrimaryKeyConstraint('relationship_pair', ['observer_id', 'target_agent_id']).execute();
+    await db.schema.createTable('relationship_summaries').addColumn('id', 'text', column => column.primaryKey())
+      .addColumn('observer_id', 'text', column => column.notNull()).addColumn('target_agent_id', 'text', column => column.notNull())
+      .addColumn('version', 'integer', column => column.notNull()).addColumn('summary', 'text', column => column.notNull())
+      .addColumn('created_at', 'text', column => column.notNull()).addColumn('through_sequence', 'integer', column => column.notNull())
+      .addColumn('previous_summary_id', 'text').addColumn('appraisal_ids', 'text', column => column.notNull())
+      .addUniqueConstraint('relationship_summary_version', ['observer_id', 'target_agent_id', 'version']).execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 5 }).execute();
   }
   });
 };

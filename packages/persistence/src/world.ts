@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema } from '@terrarium/shared';
+import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema,
+  appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
+import { sql } from 'kysely';
 import type {
   Agent,
   AgentAction,
@@ -17,6 +19,8 @@ import type {
   WorldState,
   Settings, AttemptDetails, DiagnosticFilter, DiagnosticRecord, DiagnosticPage, DiagnosticUsage,
   ReflectionState,
+  AppraisalProposal, AppraisalRecord, RelationshipState, RelationshipSummary, RelationshipSummaryInput, RelationshipSummaryProposal,
+  RelationshipContext, RelationshipFilter, RelationshipPage, AppraisalPage, RelationshipSummaryPage,
 } from '@terrarium/shared';
 import type { DB } from './index.js';
 
@@ -59,6 +63,7 @@ export type ReflectionUpdate = { reaction?: string | null; intention?: string | 
 export type DecisionUpdate = {
   sourceIds?: readonly string[]; reflection?: { reaction: string | null; intention: string | null } | null;
   engagement?: ReflectionState['engagement']; targetAgentId?: string | null;
+  appraisals?: AppraisalProposal[];
 };
 const emptyReflection = (agentId: string): ReflectionState => ({ agentId, reflectedAt: null, reaction: null, intention: null,
   lastSpeechAt: null, lastEmoteAt: null, engagement: null });
@@ -69,6 +74,12 @@ const reflectionRecord = (row: Selectable<DB['reflections']>): ReflectionState =
     roomId: row.engagement_room_id, rootMessageId: row.engagement_root_message_id, targetAgentId: row.engagement_target_agent_id,
   } : null,
 });
+const appraisalRecord = (row: Selectable<DB['appraisals']>): AppraisalRecord => ({ id: row.id, sequence: row.sequence,
+  observerId: row.observer_id, observerName: row.observer_name, targetAgentId: row.target_agent_id, targetName: row.target_name,
+  source: JSON.parse(row.source), reaction: row.reaction, reason: row.reason, createdAt: row.created_at, scoreAfter: row.score_after });
+const summaryRecord = (row: Selectable<DB['relationship_summaries']>): RelationshipSummary => ({ id: row.id,
+  observerId: row.observer_id, targetAgentId: row.target_agent_id, version: row.version, summary: row.summary, createdAt: row.created_at,
+  throughSequence: row.through_sequence, previousSummaryId: row.previous_summary_id, appraisalIds: JSON.parse(row.appraisal_ids) });
 
 export class World {
   private energyClock: number | undefined;
@@ -138,7 +149,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 4,
+        version: 5,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -190,6 +201,7 @@ export class World {
     }
     if (configuration.version === 2) defaults.push('Older settings include default observable-event and emote guidance when absent. Personal memories are not imported.');
     if (configuration.version < 4) defaults.push('Older settings use shared reflection, speech and emote timing defaults when absent. Private reflections are not imported.');
+    if (configuration.version < 5) defaults.push('Older settings use default optional appraisal capacity and relationship-summary timing. Runtime appraisals and summaries are not imported.');
     const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
@@ -425,6 +437,166 @@ export class World {
     await query.execute();
   }
 
+  private async latestRelationshipSummary(observerId: string, targetAgentId: string) {
+    const row = await this.db.selectFrom('relationship_summaries').selectAll().where('observer_id', '=', observerId)
+      .where('target_agent_id', '=', targetAgentId).orderBy('version', 'desc').limit(1).executeTakeFirst();
+    return row ? summaryRecord(row) : null;
+  }
+
+  async relationshipPage(input: RelationshipFilter = {}): Promise<RelationshipPage> {
+    const filter = relationshipFilterSchema.parse(input);
+    let query = this.db.selectFrom('relationships').selectAll();
+    if (filter.observerId) query = query.where('observer_id', '=', filter.observerId);
+    if (filter.targetAgentId) query = query.where('target_agent_id', '=', filter.targetAgentId);
+    if (filter.before) query = query.where('latest_appraisal_sequence', '<', filter.before);
+    const rows = await query.orderBy('latest_appraisal_sequence', 'desc').limit(filter.limit + 1).execute();
+    const relationships: RelationshipState[] = [];
+    for (const row of rows.slice(0, filter.limit)) relationships.push({ observerId: row.observer_id, observerName: row.observer_name,
+      targetAgentId: row.target_agent_id, targetName: row.target_name, score: row.score, updatedAt: row.updated_at,
+      latestAppraisalSequence: row.latest_appraisal_sequence, summary: await this.latestRelationshipSummary(row.observer_id, row.target_agent_id) });
+    return { relationships, hasMore: rows.length > filter.limit, next: relationships.at(-1)?.latestAppraisalSequence };
+  }
+
+  async appraisals(input: RelationshipFilter = {}): Promise<AppraisalPage> {
+    const filter = relationshipFilterSchema.parse(input);
+    let query = this.db.selectFrom('appraisals').selectAll();
+    if (filter.observerId) query = query.where('observer_id', '=', filter.observerId);
+    if (filter.targetAgentId) query = query.where('target_agent_id', '=', filter.targetAgentId);
+    if (filter.before) query = query.where('sequence', '<', filter.before);
+    const rows = await query.orderBy('sequence', 'desc').limit(filter.limit + 1).execute();
+    const appraisals = rows.slice(0, filter.limit).map(appraisalRecord);
+    return { appraisals, hasMore: rows.length > filter.limit, next: appraisals.at(-1)?.sequence };
+  }
+
+  async appraisal(id: string): Promise<AppraisalRecord | null> {
+    const row = await this.db.selectFrom('appraisals').selectAll().where('id', '=', id).executeTakeFirst();
+    return row ? appraisalRecord(row) : null;
+  }
+
+  async relationshipSummaries(observerId: string, targetAgentId: string, beforeVersion?: number, limit = 20): Promise<RelationshipSummaryPage> {
+    const filter = relationshipFilterSchema.parse({ observerId, targetAgentId, before: beforeVersion, limit });
+    let query = this.db.selectFrom('relationship_summaries').selectAll().where('observer_id', '=', observerId).where('target_agent_id', '=', targetAgentId);
+    if (filter.before) query = query.where('version', '<', filter.before);
+    const rows = await query.orderBy('version', 'desc').limit(filter.limit + 1).execute();
+    const summaries = rows.slice(0, filter.limit).map(summaryRecord);
+    return { summaries, hasMore: rows.length > filter.limit, next: summaries.at(-1)?.version };
+  }
+
+  async relevantRelationships(agentId: string): Promise<RelationshipContext[]> {
+    const actor = await this.agent(agentId);
+    if (!actor) return [];
+    const localIds = (await this.db.selectFrom('agents').select('id').where('room_id', '=', actor.roomId).execute()).map(row => row.id);
+    const memory = await this.memory(agentId), mentionedIds = memory.map(item => item.agentId), text = memory.map(item => item.content).join('\n').toLowerCase();
+    const rows = await this.db.selectFrom('relationships').selectAll().where('observer_id', '=', agentId)
+      .orderBy(sql<number>`case when target_agent_id in (${sql.join(localIds.length ? localIds : [''])}) then 0
+        when target_agent_id in (${sql.join(mentionedIds.length ? mentionedIds : [''])}) or instr(${text}, lower(target_name)) > 0 then 1 else 2 end`)
+      .orderBy('latest_appraisal_sequence', 'desc').limit(8).execute();
+    const relationships: RelationshipContext[] = [];
+    for (const row of rows) {
+      const summary = await this.latestRelationshipSummary(agentId, row.target_agent_id);
+      relationships.push({ targetAgentId: row.target_agent_id, targetName: row.target_name, score: row.score,
+        summary: summary ? { id: summary.id, version: summary.version, summary: summary.summary, createdAt: summary.createdAt } : null });
+    }
+    return relationships;
+  }
+
+  async summaryCandidates(limit = 20, now = Date.now()): Promise<{ observerId: string; targetAgentId: string }[]> {
+    limit = relationshipFilterSchema.parse({ limit }).limit;
+    const interval = (await this.settings()).value.relationships.summaryIntervalMs;
+    const result = await sql<{ observer_id: string; target_agent_id: string }>`
+      with changed as (
+        select r.observer_id, r.target_agent_id,
+          coalesce((select max(s.created_at) from relationship_summaries s where s.observer_id = r.observer_id and s.target_agent_id = r.target_agent_id),
+            (select min(a.created_at) from appraisals a where a.observer_id = r.observer_id and a.target_agent_id = r.target_agent_id)) as since
+        from relationships r join agents observer on observer.id = r.observer_id and observer.enabled = 1
+        where r.latest_appraisal_sequence > coalesce((select max(s.through_sequence) from relationship_summaries s where s.observer_id = r.observer_id and s.target_agent_id = r.target_agent_id), 0)
+      ) select observer_id, target_agent_id from changed
+        where since <= ${now === Infinity ? '9999-12-31T23:59:59.999Z' : new Date(now - interval).toISOString()}
+        order by since, observer_id, target_agent_id limit ${limit}`.execute(this.db);
+    return result.rows.map(row => ({ observerId: row.observer_id, targetAgentId: row.target_agent_id }));
+  }
+
+  async summaryInput(observerId: string, targetAgentId: string): Promise<RelationshipSummaryInput | null> {
+    const relationship = await this.db.selectFrom('relationships').selectAll().where('observer_id', '=', observerId).where('target_agent_id', '=', targetAgentId).executeTakeFirst();
+    if (!relationship) return null;
+    const previous = await this.latestRelationshipSummary(observerId, targetAgentId);
+    const limit = (await this.settings()).value.relationships.summaryBatchSize;
+    const appraisals = (await this.db.selectFrom('appraisals').selectAll().where('observer_id', '=', observerId).where('target_agent_id', '=', targetAgentId)
+      .where('sequence', '>', previous?.throughSequence ?? 0).orderBy('sequence', 'asc').limit(limit).execute()).map(appraisalRecord);
+    if (!appraisals.length) return null;
+    return { observerId, targetAgentId, targetName: relationship.target_name, score: relationship.score, previous, appraisals, throughSequence: appraisals.at(-1)!.sequence };
+  }
+
+  async saveRelationshipSummary(observerId: string, revision: number, input: RelationshipSummaryProposal, stillCurrent: () => boolean, attemptId?: string): Promise<RelationshipSummary> {
+    const proposal = relationshipSummaryProposalSchema.parse(input);
+    return this.db.transaction().execute(async db => {
+      const world = new World(db), observer = await world.agent(observerId);
+      const check = () => {
+        if (!observer || !observer.enabled || observer.revision !== revision || !stillCurrent()) throw new ActionError('stale', 'This relationship summary is no longer current.');
+      };
+      check();
+      if (attemptId) {
+        const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
+        if (record.ended_at) throw new ActionError('stale', 'This attempt has already ended.');
+      }
+      const previous = await world.latestRelationshipSummary(observerId, proposal.targetAgentId);
+      if ((previous?.version ?? 0) !== proposal.previousVersion) throw new ActionError('stale', 'This relationship summary has been superseded.');
+      const limit = (await world.settings()).value.relationships.summaryBatchSize;
+      const batch = await db.selectFrom('appraisals').selectAll().where('observer_id', '=', observerId).where('target_agent_id', '=', proposal.targetAgentId)
+        .where('sequence', '>', previous?.throughSequence ?? 0).where('sequence', '<=', proposal.throughSequence).orderBy('sequence', 'asc').limit(limit + 1).execute();
+      if (!batch.length || batch.length > limit || batch.at(-1)!.sequence !== proposal.throughSequence)
+        throw new ActionError('world-validation', 'Relationship summary evidence must be the next bounded appraisal batch.');
+      const allowedIds = new Set([...batch.map(item => item.id), ...previous?.appraisalIds ?? []]);
+      if (new Set(proposal.appraisalIds).size !== proposal.appraisalIds.length || proposal.appraisalIds.some(id => !allowedIds.has(id)))
+        throw new ActionError('world-validation', 'Relationship summary cites evidence outside its supplied appraisals.');
+      const summary: RelationshipSummary = { id: randomUUID(), observerId, targetAgentId: proposal.targetAgentId, version: proposal.previousVersion + 1,
+        summary: proposal.summary, createdAt: new Date().toISOString(), throughSequence: proposal.throughSequence, previousSummaryId: previous?.id ?? null, appraisalIds: proposal.appraisalIds };
+      await db.insertInto('relationship_summaries').values({ id: summary.id, observer_id: observerId, target_agent_id: summary.targetAgentId,
+        version: summary.version, summary: summary.summary, created_at: summary.createdAt, through_sequence: summary.throughSequence,
+        previous_summary_id: summary.previousSummaryId, appraisal_ids: JSON.stringify(summary.appraisalIds) }).execute();
+      if (attemptId) await world.updateDiagnostic(attemptId, { relationshipSummary: summary }, 'applied', 'relationship-summary');
+      check();
+      return summary;
+    });
+  }
+
+  async resetRelationshipMemory() {
+    return this.db.transaction().execute(async db => {
+      const appraisals = await db.deleteFrom('appraisals').executeTakeFirstOrThrow();
+      const relationships = await db.deleteFrom('relationships').executeTakeFirstOrThrow();
+      const summaries = await db.deleteFrom('relationship_summaries').executeTakeFirstOrThrow();
+      await db.updateTable('reflections').set({ reflected_at: null, reaction: null, intention: null,
+        engagement_room_id: null, engagement_root_message_id: null, engagement_target_agent_id: null }).execute();
+      return { appraisals: Number(appraisals.numDeletedRows), relationships: Number(relationships.numDeletedRows), summaries: Number(summaries.numDeletedRows) };
+    });
+  }
+
+  private async writeAppraisals(observer: Agent, proposals: AppraisalProposal[], sourceIds?: readonly string[]) {
+    const capacity = (await this.settings()).value.relationships.maxAppraisalsPerReflection;
+    if (proposals.length > capacity) throw new ActionError('world-validation', 'This reflection exceeds its optional appraisal capacity.');
+    const acceptedAppraisals: AppraisalRecord[] = [], duplicateAppraisalIds: string[] = [];
+    const witnessedIds = new Set(sourceIds ?? (await this.memory(observer.id)).map(item => item.id));
+    for (const input of proposals) {
+      const proposal = appraisalProposalSchema.parse(input);
+      const source = await this.db.selectFrom('messages').selectAll().where('id', '=', proposal.sourceId).executeTakeFirst();
+      if (!source || !witnessedIds.has(source.id) || source.agent_id === observer.id || source.agent_id === 'config-ui' || !['speak', 'emote'].includes(source.type))
+        throw new ActionError('world-validation', 'Appraisals require witnessed speech or authored emotes from another resident.');
+      const duplicate = await this.db.selectFrom('appraisals').select('id').where('observer_id', '=', observer.id).where('source_id', '=', source.id).executeTakeFirst();
+      if (duplicate) { duplicateAppraisalIds.push(duplicate.id); continue; }
+      const previous = await this.db.selectFrom('relationships').select('score').where('observer_id', '=', observer.id).where('target_agent_id', '=', source.agent_id).executeTakeFirst();
+      const score = Math.max(-10, Math.min(10, (previous?.score ?? 0) + (proposal.reaction === 'like' ? 1 : -1)));
+      const createdAt = new Date().toISOString(), id = randomUUID();
+      const row = await this.db.insertInto('appraisals').values({ id, observer_id: observer.id, observer_name: observer.name, target_agent_id: source.agent_id,
+        target_name: source.speaker_name, source_id: source.id, source: JSON.stringify(messageRecord(source)), reaction: proposal.reaction,
+        reason: proposal.reason, created_at: createdAt, score_after: score }).returningAll().executeTakeFirstOrThrow();
+      const values = { observer_id: observer.id, observer_name: observer.name, target_agent_id: source.agent_id, target_name: source.speaker_name,
+        score, updated_at: createdAt, latest_appraisal_sequence: row.sequence };
+      await this.db.insertInto('relationships').values(values).onConflict(conflict => conflict.columns(['observer_id', 'target_agent_id']).doUpdateSet(values)).execute();
+      acceptedAppraisals.push(appraisalRecord(row));
+    }
+    return { acceptedAppraisals, duplicateAppraisalIds };
+  }
+
   async validateReply(agentId: string, replyToId: string, sourceIds?: readonly string[]): Promise<ConversationMessage> {
     const actor = await this.agent(agentId);
     const source = await this.db.selectFrom('messages').selectAll().where('id', '=', replyToId).executeTakeFirst();
@@ -650,6 +822,7 @@ export class World {
           throw new ActionError('stale', 'The intended interlocutor is no longer in this room.');
       }
       const reply = action.type === 'speak' && action.replyToId ? await world.validateReply(agentId, action.replyToId, decision?.sourceIds) : undefined;
+      const appraisals = decision?.appraisals?.length ? await world.writeAppraisals(agentRecord(row), decision.appraisals, decision.sourceIds) : { acceptedAppraisals: [], duplicateAppraisalIds: [] };
       if (decision?.reflection || decision?.engagement !== undefined) await world.writeReflection(agentId, {
         ...decision.reflection, ...(decision.engagement !== undefined ? { engagement: decision.engagement } : {}),
       }, decision.sourceIds);
@@ -707,10 +880,11 @@ export class World {
           moved, ...(message ? { messageId: message.id } : {}), eventIds: events.map(event => event.id), energyBefore: row.energy, energyAfter,
           passiveDecay: Math.max(0, (details.energySeen ?? row.energy) - row.energy),
           reflection,
+          ...appraisals,
         }, action.type === 'move' && !moved ? 'applied-noop' : 'applied', action.type);
       }
       check();
-      return { message, events, moved, energyBefore: row.energy, energyAfter, reflection };
+      return { message, events, moved, energyBefore: row.energy, energyAfter, reflection, ...appraisals };
     });
   }
 

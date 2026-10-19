@@ -6,7 +6,10 @@ import type { DecisionResult } from './reflection.js';
 
 type TurnHandler = (agent: Agent, signal: AbortSignal, stillCurrent: () => boolean,
   onApplied: () => void, attemptId?: string, opportunity?: DecisionOpportunity) => Promise<DecisionResult | void>;
-type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity };
+type SummaryHandler = (agent: Agent, targetAgentId: string, signal: AbortSignal, stillCurrent: () => boolean,
+  onApplied: () => void, attemptId?: string) => Promise<void>;
+type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity; summaryTargetId?: string };
+type SummaryJob = { observerId: string; targetAgentId: string; dueAt: number; requestedAt: number; intervalMs: number };
 type Schedule = {
   revision: number; reflectionAt: number; emoteAt: number; emoteCheckedAt: number;
   speechPlan?: NonNullable<DecisionOpportunity['speechPlan']>; engagementAt?: number;
@@ -20,6 +23,7 @@ export class Scheduler {
   private active = new Map<string, ActiveTurn>();
   private activity = new Map<string, AgentActivity>();
   private schedules = new Map<string, Schedule>();
+  private summaries = new Map<string, SummaryJob>();
   private flights = new Map<string, Promise<unknown>>();
   private ticking = false;
   private timer?: ReturnType<typeof setInterval>;
@@ -28,7 +32,8 @@ export class Scheduler {
   private pending = new Set<Promise<void>>();
 
   constructor(private world: World, private handler: TurnHandler, private publish: (state: RunState) => void,
-    private options = { concurrency: 4, timeoutMs: 60000, retries: 2, backoffMs: 1000 }) {}
+    private options = { concurrency: 4, timeoutMs: 60000, retries: 2, backoffMs: 1000 },
+    private summaryHandler?: SummaryHandler) {}
 
   snapshot(): RunState {
     return { state: this.state, agents: [...this.activity.values()].map(activity => {
@@ -36,6 +41,7 @@ export class Scheduler {
       return { ...activity, ...(schedule ? {
         nextReflectionAt: Math.min(schedule.reflectionAt, schedule.engagementAt ?? Infinity),
         nextSpeechAt: schedule.speechPlan?.dueAt, nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
+        nextRelationshipSummaryAt: this.nextSummary(activity.agentId)?.dueAt,
       } : {}) };
     }), concurrency: this.options.concurrency, ...(this.error ? { error: this.error } : {}) };
   }
@@ -47,10 +53,27 @@ export class Scheduler {
   private due(schedule: Schedule) {
     return Math.min(schedule.reflectionAt, schedule.emoteAt, schedule.speechPlan?.dueAt ?? Infinity, schedule.engagementAt ?? Infinity);
   }
+  private nextSummary(observerId: string) {
+    return [...this.summaries.values()].filter(job => job.observerId === observerId).sort((a, b) => a.dueAt - b.dueAt)[0];
+  }
+  private async discoverSummaries() {
+    if (!this.summaryHandler) return;
+    const [candidates, settings] = await Promise.all([this.world.summaryCandidates(20, Infinity), this.world.settings()]);
+    if (this.state === 'stopped') return;
+    for (const candidate of candidates) {
+      const key = JSON.stringify([candidate.observerId, candidate.targetAgentId]);
+      if (this.summaries.has(key) || !this.schedules.has(candidate.observerId)) continue;
+      if (this.summaries.size >= 20) break;
+      this.summaries.set(key, { ...candidate, dueAt: this.now() + settings.value.relationships.summaryIntervalMs,
+        requestedAt: Date.now(), intervalMs: settings.value.relationships.summaryIntervalMs });
+      this.refreshActivity(candidate.observerId);
+    }
+  }
   private refreshActivity(id: string, error?: string) {
     const schedule = this.schedules.get(id);
     if (!schedule || this.active.has(id)) return;
-    this.activity.set(id, { agentId: id, state: error ? 'error' : 'scheduled', dueAt: this.due(schedule), ...(error ? { error } : {}) });
+    this.activity.set(id, { agentId: id, state: error ? 'error' : 'scheduled',
+      dueAt: Math.min(this.due(schedule), this.nextSummary(id)?.dueAt ?? Infinity), ...(error ? { error } : {}) });
   }
   watch() { this.timer ??= setInterval(() => { void this.tick(); }, 500); }
   close() { if (this.timer) clearInterval(this.timer); this.timer = undefined; return this.stop(); }
@@ -68,6 +91,7 @@ export class Scheduler {
         if (schedule.engagementAt !== undefined) schedule.engagementAt += elapsed;
         if (schedule.speechPlan) schedule.speechPlan.dueAt += elapsed;
       }
+      for (const job of this.summaries.values()) job.dueAt += elapsed;
     }
     this.pausedAt = undefined; this.error = undefined; this.state = 'running';
     await this.world.syncEnergy(Date.now(), true);
@@ -83,7 +107,7 @@ export class Scheduler {
   async stop() {
     this.state = 'stopped'; this.pausedAt = undefined; this.epoch += 1; this.error = undefined;
     for (const active of this.active.values()) active.controller.abort();
-    this.schedules.clear(); this.activity.clear(); this.emit();
+    this.schedules.clear(); this.summaries.clear(); this.activity.clear(); this.emit();
     await Promise.allSettled([this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error)), ...this.pending]);
     await this.world.clearEngagements();
   }
@@ -95,6 +119,7 @@ export class Scheduler {
       const enabled = new Map(agents.filter(agent => agent.enabled).map(agent => [agent.id, agent]));
       for (const [id, active] of this.active) if (enabled.get(id)?.revision !== active.revision) active.controller.abort();
       for (const id of this.schedules.keys()) if (!enabled.has(id)) { this.schedules.delete(id); this.activity.delete(id); }
+      for (const [key, job] of this.summaries) if (!enabled.has(job.observerId)) this.summaries.delete(key);
       if (this.state !== 'stopped') for (const agent of enabled.values()) {
         let schedule = this.schedules.get(agent.id);
         if (!schedule || schedule.revision !== agent.revision) {
@@ -156,26 +181,29 @@ export class Scheduler {
     this.ticking = true;
     const epoch = this.epoch;
     try {
-      await this.world.syncEnergy(); await this.changed();
+      await this.world.syncEnergy(); await this.changed(); await this.discoverSummaries();
       const agents = await this.world.agents();
       if (this.state !== 'running' || this.epoch !== epoch) return;
       agents.sort((a, b) => (this.activity.get(a.id)?.dueAt ?? Infinity) - (this.activity.get(b.id)?.dueAt ?? Infinity));
       for (const agent of agents) {
         // INVARIANT: a timed-out handler retains its slot until it actually settles.
         if (new Set([...this.active.keys(), ...this.flights.keys()]).size >= this.options.concurrency) break;
-        const schedule = this.schedules.get(agent.id), now = Date.now();
-        if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || this.due(schedule) > now) continue;
-        const dueAt = this.due(schedule), engagement = (schedule.engagementAt ?? Infinity) <= now;
-        const opportunity: DecisionOpportunity = {
+        const schedule = this.schedules.get(agent.id), now = Date.now(), summary = this.nextSummary(agent.id);
+        const dueAt = Math.min(schedule ? this.due(schedule) : Infinity, summary?.dueAt ?? Infinity);
+        if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || dueAt > now) continue;
+        const summarizing = summary?.dueAt === dueAt, engagement = (schedule.engagementAt ?? Infinity) <= now;
+        const opportunity: DecisionOpportunity = summarizing ? { reflection: false, speech: false, emote: false,
+          requestedAt: summary.requestedAt, reason: 'cadence' } : {
           reflection: schedule.reflectionAt <= now || engagement,
           speech: (schedule.speechPlan?.dueAt ?? Infinity) <= now, emote: schedule.emoteAt <= now,
           requestedAt: schedule.speechPlan?.dueAt === dueAt ? schedule.speechPlan.requestedAt : dueAt,
           reason: engagement ? 'engagement' : (schedule.speechPlan?.dueAt ?? Infinity) <= now ? 'scheduled-speech' : 'cadence',
           ...((schedule.speechPlan?.dueAt ?? Infinity) <= now ? { speechPlan: { ...schedule.speechPlan! } } : {}),
         };
-        const operation = opportunity.reflection ? 'reflection' : opportunity.speech ? 'speech' : 'emote';
+        const operation = summarizing ? 'relationship-summary' : opportunity.reflection ? 'reflection' : opportunity.speech ? 'speech' : 'emote';
         const active: ActiveTurn = { controller: new AbortController(), revision: agent.revision, epoch: this.epoch,
-          turnId: await this.world.scheduleTurn(agent, dueAt, operation, opportunity.requestedAt), opportunity };
+          turnId: await this.world.scheduleTurn(agent, dueAt, operation, opportunity.requestedAt), opportunity,
+          ...(summarizing ? { summaryTargetId: summary.targetAgentId } : {}) };
         if (this.state !== 'running' || this.epoch !== epoch) { await this.world.endTurn(active.turnId, 'cancelled-before-start'); break; }
         if (opportunity.reflection) { schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs; schedule.engagementAt = undefined; }
         if (opportunity.speech) schedule.speechPlan = undefined;
@@ -207,7 +235,9 @@ export class Scheduler {
             cancel = () => reject(signal.reason ?? new Error('Turn cancelled.'));
             signal.addEventListener('abort', cancel, { once: true }); if (signal.aborted) cancel();
           });
-          const handler = this.handler(agent, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId, active.opportunity);
+          const handler = active.summaryTargetId
+            ? this.summaryHandler!(agent, active.summaryTargetId, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId)
+            : this.handler(agent, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId, active.opportunity);
           this.flights.set(agent.id, handler);
           const settledHandler = handler.finally(() => {
             settled = true; if (this.flights.get(agent.id) === handler) this.flights.delete(agent.id);
@@ -236,9 +266,15 @@ export class Scheduler {
       if (this.active.get(agent.id) === active) this.active.delete(agent.id);
       try {
         await this.world.endTurn(active.turnId, outcome);
+        if (active.summaryTargetId && this.epoch === active.epoch) {
+          const key = JSON.stringify([agent.id, active.summaryTargetId]), job = this.summaries.get(key);
+          if (job && failure) job.dueAt = this.now() + job.intervalMs;
+          else this.summaries.delete(key);
+        }
         const schedule = this.schedules.get(agent.id), latest = await this.world.agent(agent.id);
         if (schedule && latest?.enabled && this.state !== 'stopped' && this.epoch === active.epoch && schedule.revision === active.revision) {
-          const now = this.now(); schedule.lastDecisionAt = now;
+          const now = this.now();
+          if (!active.summaryTargetId) schedule.lastDecisionAt = now;
           if (schedule.engagementAt !== undefined)
             schedule.engagementAt = Math.max(schedule.engagementAt, now + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
           if (active.opportunity.reflection) schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs;

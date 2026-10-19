@@ -60,9 +60,34 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('inspects retained relationship evidence and requires an explicit stopped reset', async () => {
+    const url = await setup(), config = connect(url); await ready(config);
+    const input = { instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt' as const, model: 'fake', enabled: true,
+      minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 };
+    const observer = await application.world.saveAgent({ ...input, name: 'Observer' });
+    const author = await application.world.saveAgent({ ...input, name: 'Author' });
+    const source = (await application.world.applyAction(author.id, author.revision, { type: 'speak', message: 'The garden has new flowers.' }, () => true)).message!;
+    await application.world.applyAction(observer.id, observer.revision, { type: 'wait' }, () => true, undefined,
+      { sourceIds: [source.id], appraisals: [{ sourceId: source.id, reaction: 'like', reason: 'I enjoy hearing about the garden.' }] });
+    const page = await request(config, 'relationships:list', { observerId: observer.id });
+    expect(page.value.relationships).toEqual([expect.objectContaining({ targetAgentId: author.id, score: 1 })]);
+    const ledger = (await request(config, 'relationships:appraisals', { observerId: observer.id })).value.appraisals;
+    expect((await request(config, 'relationships:appraisal', { id: ledger[0].id })).value.source.content).toBe(source.content);
+    const preview = await request(config, 'relationships:preview', { observerId: observer.id, targetAgentId: author.id });
+    expect(preview.ok).toBe(true); expect(JSON.stringify(preview.value.payload)).toContain(source.content);
+    await request(config, 'history:clear', { scope: 'all' });
+    expect((await request(config, 'relationships:appraisals', {})).value.appraisals).toHaveLength(1);
+    await request(config, 'run:control', 'start');
+    expect((await request(config, 'relationships:reset', { confirm: true })).error).toContain('Choose Stop');
+    await request(config, 'run:control', 'stop');
+    expect((await request(config, 'relationships:reset', {})).ok).toBe(false);
+    expect(await request(config, 'relationships:reset', { confirm: true })).toMatchObject({ ok: true,
+      value: { appraisals: 1, relationships: 1, summaries: 0 } });
+    expect((await request(config, 'relationships:list', {})).value.relationships).toEqual([]);
+  });
   it('updates private reflection through a running decision without publishing room activity', async () => {
     const complete = vi.fn(async () => ({ content: JSON.stringify({ reflection: { reaction: 'Listening with interest.', intention: null },
-      speechPlan: null, requestEmote: false, engagement: null, action: { type: 'wait' } }) }));
+      speechPlan: null, requestEmote: false, engagement: null, appraisals: [], action: { type: 'wait' } }) }));
     const url = await setup({ name: 'fake', complete }), config = connect(url), terrain = connect(url, 'terrain');
     await Promise.all([ready(config), ready(terrain)]);
     const saved = await request(config, 'agents:save', { name: 'Listener', instructions: 'Observe', roomId: 'room-1',
@@ -106,7 +131,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(4);
+    expect(exported.version).toBe(5);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -375,7 +400,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 4,
+      version: 5,
       agents: [],
     });
     const configuration = {

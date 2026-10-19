@@ -18,6 +18,7 @@
       <dt>Next reflection</dt><dd>{timestamp(activity.nextReflectionAt)}</dd>
       <dt>Next speech opportunity</dt><dd>{timestamp(activity.nextSpeechAt)}</dd>
       <dt>Next emote opportunity</dt><dd>{timestamp(activity.nextEmoteAt)}</dd>
+      <dt>Next relationship summary check</dt><dd>{timestamp(activity.nextRelationshipSummaryAt)}</dd>
     </dl>
     {#if activity.error}<p role="alert">{activity.error}</p>{/if}
   {:else}<p>No operations scheduled.</p>{/if}

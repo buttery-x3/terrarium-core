@@ -16,6 +16,7 @@ import {
   runCommandSchema,
   settingsSchema,
   diagnosticFilterSchema,
+  relationshipFilterSchema,
   type ConversationMessage,
   type ConversationExport,
   type Result,
@@ -27,6 +28,7 @@ import {
 } from '@terrarium/lm-providers';
 import { Scheduler } from './scheduler.js';
 import { performDecision, previewDecision } from './reflection.js';
+import { performRelationshipSummary, previewRelationshipSummary } from './relationships.js';
 
 function conversationMarkdown(snapshot: ConversationExport) {
   const label = (value: string) => value
@@ -124,9 +126,15 @@ export async function createApplication(options: {
         opportunity!,
       );
       config.emit('reflection:changed');
+      config.emit('relationships:changed');
       return result;
     },
     (state) => { config.emit('run:state', state); config.emit('diagnostics:changed'); },
+    undefined,
+    async (agent, targetAgentId, signal, current, applied, attemptId) => {
+      await performRelationshipSummary(world, agent, targetAgentId, options.provider, signal, current, applied, attemptId);
+      config.emit('relationships:changed');
+    },
   );
   scheduler.watch();
   const energyUpdates = setInterval(() => {
@@ -234,6 +242,28 @@ export async function createApplication(options: {
       finally { importingConfiguration = false; }
     });
     command('reflection:list', z.object({}).strict(), () => world.reflections());
+    command('relationships:list', relationshipFilterSchema, input => world.relationshipPage(input));
+    command('relationships:appraisals', relationshipFilterSchema, input => world.appraisals(input));
+    command('relationships:appraisal', z.object({ id: z.string().min(1) }).strict(), input => world.appraisal(input.id));
+    command('relationships:summaries', z.object({ observerId: z.string().min(1), targetAgentId: z.string().min(1),
+      beforeVersion: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
+      input => world.relationshipSummaries(input.observerId, input.targetAgentId, input.beforeVersion, input.limit));
+    command('relationships:preview', z.object({ observerId: z.string().min(1), targetAgentId: z.string().min(1) }).strict(), async input => {
+      const agent = await world.agent(input.observerId);
+      if (!agent) throw new Error('Agent does not exist.');
+      return previewRelationshipSummary(world, agent, input.targetAgentId);
+    });
+    command('relationships:reset', z.object({ confirm: z.literal(true) }).strict(), async () => {
+      checkConfigurationWrite(); checkHistoryWrite();
+      if (scheduler.snapshot().state !== 'stopped') throw new Error('Configuration relationship reset requires a stopped run. Choose Stop first.');
+      if (scheduler.hasActiveWork()) throw new Error('Configuration relationship reset must wait for cancelled requests to finish.');
+      importingConfiguration = true;
+      try {
+        const result = await world.resetRelationshipMemory();
+        config.emit('relationships:changed'); config.emit('reflection:changed');
+        return result;
+      } finally { importingConfiguration = false; }
+    });
     command('prompt:preview', z.object({ agentId: z.string().min(1), operation: z.enum(['reflection', 'speech', 'emote']).optional() }).strict(), async input => {
       const agent = await world.agent(input.agentId);
       if (!agent) throw new Error('Agent does not exist.');
