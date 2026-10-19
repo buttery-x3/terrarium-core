@@ -87,7 +87,7 @@ describe('persisted world', () => {
     now = 60000;
     await world.syncEnergy();
     await world.syncEnergy();
-    await world.applyAction(fast.id, fast.revision, { type: 'wait' }, () => true);
+    await world.applyAction(fast.id, fast.revision, { type: 'emote', message: 'Test agent watches quietly.' }, () => true);
     expect((await world.agent(fast.id))?.energy).toBe(95);
     expect((await world.agent(slow.id))?.energy).toBe(95);
     expect((await world.agent(disabled.id))?.energy).toBe(100);
@@ -124,7 +124,7 @@ describe('persisted world', () => {
     const eat = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
     await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true, eat);
     expect((await world.diagnostic(eat)).details).toMatchObject({ energyBefore: 10, energyAfter: 100 });
-    expect((await world.history({ roomId: food.id })).messages).toHaveLength(0);
+    expect((await world.history({ roomId: food.id })).messages.map(item => item.type)).toEqual(['arrival']);
     await world.applyAction(agent.id, agent.revision, { type: 'move', roomId: 'room-2' }, () => true);
     agent = (await world.agent(agent.id))!;
     await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true);
@@ -549,7 +549,8 @@ describe('persisted world', () => {
     });
     expect(
       await db.selectFrom('schema_migrations').selectAll().execute(),
-    ).toEqual([{ version: 1 }, { version: 2 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect(await world.memory('old-agent')).toEqual([]);
     const unchanged = new Database(legacy, { readonly: true });
     expect(unchanged.prepare('PRAGMA table_info(agents)').all()).toHaveLength(
       4,
@@ -614,6 +615,7 @@ describe('persisted world', () => {
     ).rejects.toThrow('no longer current');
     expect((await world.history({ roomId: 'room-1' })).messages).toEqual([]);
     const current = await world.agent(agent.id);
+    await world.saveSettings({ ...defaultSettings, activity: { ...defaultSettings.activity, emotesEnabled: false } });
     await world.applyAction(
       agent.id,
       current!.revision,

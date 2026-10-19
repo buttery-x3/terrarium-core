@@ -2,12 +2,14 @@
   import { Application, Graphics, Text } from "pixi.js";
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
-  import type { ConversationMessage, HistoryCleared } from "@terrarium/shared";
+  import type { ConversationMessage, HistoryCleared, HistoryPage, Result } from "@terrarium/shared";
 
   let container: HTMLDivElement | null = null;
   let app: Application | null = null;
   const socket = io("/terrain", { transports: ["websocket"] });
   const rooms: string[] = [];
+  const latest = new Map<string, ConversationMessage>();
+  const historyRequests = new Map<string, symbol>();
   const roomStates = new Map<
     string,
     {
@@ -21,7 +23,7 @@
   const baseColor = 0x0ea5e9;
   const highlightColor = 0xf97316;
   const size = 50;
-  const spacing = 100;
+  const spacing = 220;
   const columns = 3;
   const startX = 100;
   const startY = 100;
@@ -59,6 +61,9 @@
         style: {
           fill: 0xfbbf24,
           fontSize: 12,
+          wordWrap: true,
+          wordWrapWidth: 180,
+          breakWords: true,
         },
       });
       message.position.set(x, y + size + 8);
@@ -70,6 +75,8 @@
         message,
         highlightUntil: 0,
       });
+      const saved = latest.get(roomId);
+      if (saved) showMessage(saved);
     });
   };
 
@@ -92,11 +99,37 @@
 
   const clearMessages = (roomIds: string[]) => {
     roomIds.forEach((id) => {
+      latest.delete(id);
+      historyRequests.delete(id);
       const room = roomStates.get(id);
       if (!room) return;
       room.message.text = "";
       room.highlightUntil = 0;
       drawRoom(room.graphics, baseColor);
+    });
+  };
+
+  const showMessage = (payload: ConversationMessage) => {
+    const previous = latest.get(payload.roomId);
+    if (previous && (previous.createdAt > payload.createdAt || (previous.createdAt === payload.createdAt && previous.id > payload.id))) return;
+    latest.set(payload.roomId, payload);
+    const room = roomStates.get(payload.roomId);
+    if (!room) return;
+    room.highlightUntil = Date.now() + 1000;
+    room.message.style.fontStyle = payload.type === "speak" ? "normal" : "italic";
+    const text = payload.type === "speak" ? `${payload.speaker}: ${payload.content}` : `${payload.speaker} · ${payload.type}: ${payload.content}`;
+    room.message.text = text.length > 240 ? `${text.slice(0, 239)}…` : text;
+  };
+
+  const loadLatest = (roomId: string) => {
+    const token = Symbol();
+    historyRequests.set(roomId, token);
+    socket.timeout(30000).emit("history:get", { roomId }, (error: Error | null, result: Result<HistoryPage>) => {
+      if (historyRequests.get(roomId) !== token) return;
+      historyRequests.delete(roomId);
+      if (error || !result.ok) return;
+      const message = result.value.messages[result.value.messages.length - 1];
+      if (message) showMessage(message);
     });
   };
 
@@ -135,7 +168,7 @@
       });
 
     socket.on("connect", () => {
-      clearMessages([...roomStates.keys()]);
+      clearMessages([...new Set([...rooms, ...latest.keys()])]);
       console.info("terrain connected", socket.id);
     });
 
@@ -144,6 +177,7 @@
     });
 
     socket.on("disconnect", (reason) => {
+      historyRequests.clear();
       console.warn("terrain disconnected", reason);
     });
 
@@ -159,13 +193,11 @@
       console.info("terrain rooms list received", payload);
       rooms.splice(0, rooms.length, ...payload);
       renderRooms();
+      rooms.forEach(loadLatest);
     });
 
     socket.on("conversation:message", (payload: ConversationMessage) => {
-      const room = roomStates.get(payload.roomId);
-      if (!room) return;
-      room.highlightUntil = Date.now() + 1000;
-      room.message.text = payload.content;
+      showMessage(payload);
     });
 
     socket.on("conversation:cleared", (payload: HistoryCleared) => {
@@ -181,6 +213,7 @@
 
 <main>
   <h1>Terrarium Terrain</h1>
+  <p>Latest room activity previews. Full records are available in the configuration view.</p>
   <div bind:this={container} class="viewport"></div>
 </main>
 

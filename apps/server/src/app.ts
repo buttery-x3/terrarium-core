@@ -38,6 +38,10 @@ function conversationMarkdown(snapshot: ConversationExport) {
     lines.push(`## ${label(room.name)}`, '');
     if (!room.messages.length) lines.push('_No messages._', '');
     for (const message of room.messages) {
+      if (message.type !== 'speak') {
+        lines.push(`*${label(message.content)}* — ${label(message.speaker)} · ${message.type} · ${label(message.createdAt)} · ${label(message.id)}`, '');
+        continue;
+      }
       lines.push(`**${label(message.speaker)}** — ${label(message.createdAt)}`, '');
       lines.push(message.content.replace(/\r\n?/g, '\n').split('\n').map(line => `> ${line}`).join('\n'), '');
     }
@@ -286,6 +290,11 @@ export async function createApplication(options: {
     });
   });
   terrain.on('connection', (socket) => {
+    socket.on('history:get', async (input: unknown, acknowledge: unknown) => {
+      if (typeof acknowledge !== 'function') return;
+      try { acknowledge({ ok: true, value: await world.history(historyInputSchema.parse(input)) }); }
+      catch { acknowledge({ ok: false, error: 'Could not load room activity.' }); }
+    });
     void world
       .rooms()
       .then((rooms) =>

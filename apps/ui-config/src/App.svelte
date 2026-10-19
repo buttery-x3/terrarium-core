@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
+  import ActivityItem from "./ActivityItem.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
@@ -50,7 +51,7 @@
   let enabled = false;
   let minimumSeconds = 10;
   let maximumSeconds = 30;
-  let contextMessages = 50;
+  let contextMessages = 30;
   let importConfiguration: Configuration | undefined;
   let importPreview: ConfigurationPreview | undefined;
   let importFileName = "";
@@ -118,7 +119,7 @@
     motivations = agent?.motivations ?? ""; intention = agent?.intention ?? "";
     agentRoom = agent?.roomId ?? selectedRoom; agentModel = agent?.model ?? "gpt-6-luna"; enabled = agent?.enabled ?? false;
     minimumSeconds = (agent?.minIntervalMs ?? 10000) / 1000; maximumSeconds = (agent?.maxIntervalMs ?? 30000) / 1000;
-    contextMessages = agent?.contextMessageLimit ?? 50;
+    contextMessages = agent?.contextMessageLimit ?? 30;
   }
   async function deleteAgent() {
     if (!deleteAgentConfirmation) return;
@@ -324,7 +325,7 @@
     {#if older[selectedRoom]}<button disabled={!connected} on:click={() => loadHistory(selectedRoom, true)}>Load older messages</button>{/if}
     <ol class="conversation" aria-label="Conversation history">
       {#each histories[selectedRoom] ?? [] as item (item.id)}
-        <li><strong>{item.speaker}</strong> <time datetime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time><p>{item.content}</p></li>
+        <ActivityItem {item} />
       {:else}<li>No saved messages in this room yet.</li>{/each}
     </ol>
     <form on:submit|preventDefault={() => perform(async () => {
@@ -391,8 +392,8 @@
       <button type="button" disabled={!auth.connected || busy} on:click={discoverModels}>Refresh available models</button>
       <label>Minimum seconds between turns <input type="number" min="0.001" step="0.001" bind:value={minimumSeconds} required /></label>
       <label>Maximum seconds between turns <input type="number" min={minimumSeconds} step="0.001" bind:value={maximumSeconds} required /></label>
-      <label>Recent room messages in context <input type="number" min="1" max="50" bind:value={contextMessages} required /></label>
-      <p>Context includes recent messages from the current room, including messages from before arrival.</p>
+      <label>Personal memory limit <input type="number" min="1" max="50" bind:value={contextMessages} required /></label>
+      <p>Keep this many personally observed speech and activity items across rooms. New agents start with empty memory; earlier room history is not included. Reducing the limit discards older observations.</p>
       <label><input type="checkbox" bind:checked={enabled} /> Enabled</label>
       <button disabled={!connected || busy}>Save agent</button>
     </form>
@@ -402,6 +403,10 @@
     <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
     <p>Active energy rules: {activeSettings.energy.enabled ? "enabled" : "disabled"}; initial {activeSettings.energy.initial}; maximum {activeSettings.energy.maximum}; depletion {activeSettings.energy.depletionPerMinute} per running minute; low at {activeSettings.energy.lowThreshold} or below; meals fill to maximum.</p>
     <form on:submit|preventDefault={() => perform(async () => { await request("settings:save", settings); notice = "Shared settings saved."; })}>
+      <h3>Observable activity</h3>
+      <label><input type="checkbox" bind:checked={settings.activity.roomEventsEnabled} /> Record automatic room arrival and departure events</label>
+      <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Use observable emotes instead of silent waits</label>
+      <p>Movement events are observed only by residents present at the time, including the moving agent. Turning them off prevents new movement records. Other speech and emote observations continue.</p>
       <h3>Energy</h3>
       <label><input type="checkbox" bind:checked={settings.energy.enabled} /> Enable energy and eating</label>
       <label>Initial energy for new agents <input type="number" min="0" max={settings.energy.maximum} step="any" bind:value={settings.energy.initial} required /></label>
@@ -413,7 +418,7 @@
       <p>These sections are assembled in the order below, followed by resolved local context and enforced protocol constraints. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}
         {@const key = name as keyof typeof defaultPrompts}
-        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders" })[key]}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance" })[key]}
           <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
         </label>
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>
@@ -433,7 +438,7 @@
       <p>Model: {promptPreview.payload.model}</p>
       <h3>Instructions in request order</h3>
       <pre class="configuration-json">{promptPreview.payload.instructions}</pre>
-      <h3>Observed room history</h3>
+      <h3>Personal memory with observation metadata</h3>
       <pre class="configuration-json">{JSON.stringify(promptPreview.payload.input, null, 2)}</pre>
       <details><summary>Enforced protocol and output schema</summary><pre class="configuration-json">{promptPreview.constraints}\n\n{JSON.stringify(promptPreview.payload.text, null, 2)}</pre></details>
       <details><summary>Complete preview snapshot and provider payload</summary><pre class="configuration-json">{JSON.stringify(promptPreview, null, 2)}</pre></details>
@@ -447,7 +452,7 @@
       <label>Agent ID (empty for all; deleted IDs supported) <input bind:value={diagnosticAgent} list="diagnostic-agents" /></label>
       <datalist id="diagnostic-agents">{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</datalist>
       <label>Decision room <select bind:value={diagnosticRoom}><option value="">All rooms</option>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
-      <label>Action <select bind:value={diagnosticAction}><option value="">All actions</option>{#each ["speak", "move", "wait", "eat"] as action}<option value={action}>{action}</option>{/each}</select></label>
+      <label>Action <select bind:value={diagnosticAction}><option value="">All actions</option>{#each ["speak", "emote", "move", "wait", "eat"] as action}<option value={action}>{action}</option>{/each}</select></label>
       <label>Outcome <select bind:value={diagnosticOutcome}><option value="">All outcomes</option>{#each ["scheduled", "running", "completed", "applied", "applied-noop", "applied-notification-failure", "provider", "timeout", "parse", "schema", "world-validation", "persistence", "stale", "cancelled", "cancelled-before-start", "interrupted", "diagnostic-failure"] as outcome}<option value={outcome}>{outcome}</option>{/each}</select></label>
       <label>Scheduled from <input type="datetime-local" bind:value={diagnosticFrom} /></label>
       <label>Scheduled through <input type="datetime-local" bind:value={diagnosticTo} /></label>
@@ -492,8 +497,6 @@
   button { width: fit-content; }
   textarea { width: 100%; box-sizing: border-box; }
   .conversation { max-height: 28rem; overflow-y: auto; padding-left: 1.5rem; }
-  .conversation p { white-space: pre-wrap; overflow-wrap: anywhere; }
   .configuration-json { max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-  time { font-size: 0.85rem; }
   [role="alert"] { color: #a21919; }
 </style>

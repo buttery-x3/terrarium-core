@@ -8,9 +8,32 @@ import {
   clearHistorySchema,
   deleteAgentSchema,
   defaultSettings, settingsSchema, actionResponseSchema,
+  conversationMessageSchema, actionJsonSchema,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('validates bounded emotes and typed activity, excluding fabricated arrival actions and extra state mutations', () => {
+    expect(actionSchema.parse({ type: 'emote', message: '  A watches.  ' })).toEqual({ type: 'emote', message: 'A watches.' });
+    for (const action of [{ type: 'emote', message: 'x'.repeat(241) }, { type: 'emote', message: ' ' },
+      { type: 'emote', message: 'A watches.', roomId: 'elsewhere' }, { type: 'arrival', message: 'A enters.' }])
+      expect(actionSchema.safeParse(action).success).toBe(false);
+    const record = { id: 'event', roomId: 'room-1', agentId: 'a', speaker: 'A', createdAt: '2026-10-19T00:00:00.000Z', content: 'A watches.' };
+    for (const type of ['speak', 'emote', 'arrival', 'departure']) expect(conversationMessageSchema.safeParse({ ...record, type }).success).toBe(true);
+    for (const item of [record, { ...record, type: 'wait' }, { ...record, type: 'emote', content: 'x'.repeat(241) }, { ...record, type: 'emote', energy: 100 }])
+      expect(conversationMessageSchema.safeParse(item).success).toBe(false);
+    expect(actionJsonSchema(true).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['emote', 'speak', 'move', 'eat']);
+    expect(actionJsonSchema(false).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['speak', 'move', 'wait', 'eat']);
+  });
+  it('upgrades version-2 settings while preserving customization and requires complete version-3 settings', () => {
+    const { activity, prompts: { observations, emotes, ...prompts }, ...settings } = defaultSettings;
+    prompts.actionSelection = 'Custom action choices';
+    const old = { format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: { ...settings, prompts } };
+    const upgraded = configurationSchema.parse(old);
+    expect(upgraded.settings).toMatchObject({ activity: { roomEventsEnabled: true, emotesEnabled: true }, prompts: { actionSelection: 'Custom action choices', observations, emotes } });
+    expect(configurationSchema.safeParse({ ...old, version: 3 }).success).toBe(false);
+    expect(configurationSchema.parse({ ...upgraded, version: 3 }).settings).toEqual(upgraded.settings);
+    expect(settingsSchema.safeParse({ ...defaultSettings, activity: { emotesEnabled: true } }).success).toBe(false);
+  });
   it('requires complete version-2 prompt settings without restoring missing defaults', () => {
     expect(configurationSchema.parse({ format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: defaultSettings }).settings).toEqual(defaultSettings);
     for (const prompts of [{}, { ...defaultSettings.prompts, framing: '' }, { ...defaultSettings.prompts, energy: undefined }])

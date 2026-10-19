@@ -1,6 +1,6 @@
 # Terrarium Core project scope
 
-Terrarium Core is a local AI conversation toy in which configurable agents inhabit rooms, observe conversation history, and take turns interacting. It extends this repository with a controllable web interface, durable history, and ChatGPT-authenticated agents. The same configuration supports a small population and sixteen or more agents.
+Terrarium Core is a local AI conversation toy in which configurable agents inhabit rooms, remember personally observed activity, and take turns interacting. It extends this repository with a controllable web interface, durable history, and ChatGPT-authenticated agents. The same configuration supports a small population and sixteen or more agents.
 
 The original implementation was merged into `main` at `b1eea79`. The user approved the FLAME-146 plan and defaults on 18 October 2026; the extension is implemented on `codex/flame-146`.
 
@@ -21,9 +21,9 @@ Personality retains the existing editable `instructions` field. Motivations and 
 | Conversation clearing | Confirm permanent deletion for the current room or all rooms while stopped. Preserve room/agent settings; reset both views and agent context, reject stale history responses and late turns. |
 | World configuration | Versioned migration preserves messages. Five initial rooms; no automatic agents. Create/edit rooms and create/edit/disable/delete agents; persisted membership. Agent deletion requires confirmation, cancels its turn and preserves past messages. |
 | Configuration files | Export all room/agent settings as versioned JSON; validate and preview imports; merge by ID in one transaction while stopped. Preserve omitted records and history. |
-| Agents              | Editable name, instructions, model, cadence, context limit, room, enabled state. Context includes latest 1–50 current-room messages, including before arrival.                           |
+| Agents              | Editable name, instructions, model, cadence, personal memory limit, room, enabled state. Persistent FIFO of 1–50 personally observed items across rooms; new-agent form defaults to 30. |
 | Model integration   | ChatGPT OAuth with PKCE and verified identity, Windows protected storage, model discovery, completed Responses streams. Initial model: `gpt-6-luna`. Other adapters remain unused mocks. |
-| Actions             | `speak`, `move`, `wait`, `eat`. Destinations and agent/run revisions are validated before mutation. Technical failures remain operational errors.                                               |
+| Actions             | `speak`, `move`, `eat`, and `emote` (or `wait` when emotes are disabled). Successful moves produce local departure/arrival activity when enabled. Technical failures remain operational errors. |
 | Scheduling          | One active turn per agent, four concurrent requests, 60-second attempts, two retries. Pause finishes active work; stop/disable/edits/movement discard stale results.                     |
 | Web interface       | Timeline, older messages, reconnect recovery, room/agent forms, ChatGPT connection, run controls, activity/error feedback.                                                               |
 | Terrain             | Optional existing Pixi view consumes the shared conversation event. Further graphical development remains deferred.                                                                      |
@@ -34,11 +34,15 @@ Implementation: [server](../apps/server/src/app.ts), [scheduler](../apps/server/
 
 Rooms have an explicit food-source capability. The authoritative action vocabulary includes `eat`; movement and eating are separate turns. Energy starts disabled, uses elapsed running time independently of turn cadence, and preserves current values across Stop/restart. The approved defaults are 100 initial/maximum, 5 points per running minute, low at 25 or below, and meals filling to maximum. Zero energy does not restrict actions. There is no food inventory or automatic movement/eating.
 
-Model context contains own profile/energy, local identities and recent room history, plus a static room directory with food capabilities. Other agents' profiles, remote occupancy/activity/transcripts and operator diagnostics are excluded. The existing pre-arrival recent-message policy remains.
+Model context contains own profile/energy, current local identities and personal observations, plus a static room directory with food capabilities. Other agents' profiles, remote occupancy, unobserved transcripts and operator diagnostics are excluded. FLAME-147 replaces the original pre-arrival room-history policy.
 
-The operator can edit five shared behavioural sections and preview the assembled request without consuming a turn. Immutable attempt snapshots contain the exact submitted provider body, final action output and application result. Diagnostics persist in SQLite, distinguish successful actions from failures and interruptions, retain deleted-agent names, support bounded filtering/detail views and JSON export, and never become agent memory. Conversation clearing explicitly retains diagnostic copies until separately cleared.
+The operator can edit shared behavioural sections and preview the assembled request without consuming a turn. Immutable attempt snapshots contain the exact submitted provider body, final action output and application result. Diagnostics persist in SQLite, distinguish successful actions from failures and interruptions, retain deleted-agent names, support bounded filtering/detail views and JSON export, and never become agent memory. Conversation clearing explicitly retains diagnostic copies until separately cleared.
 
 Version-2 configuration includes these authored settings; version-1 imports preserve existing newer values and disclose defaults for new records. Runtime energy and diagnostic history are excluded from configuration files. No dependencies, authentication changes or terrain expansion were added.
+
+## FLAME-147 extension
+
+FLAME-147 adds typed emotes, automatic arrival/departure events and individual bounded observation buffers. Observation delivery occurs transactionally at commit time, even between an agent's turns. Memories survive movement and restart; new and migrated agents receive no archive backfill. Full operator archives remain separate. Version-3 configuration includes the activity toggles and editable observation/emote guidance, with version-1/2 import compatibility. No dependencies or authentication changes are required.
 
 ## Deferred scope
 

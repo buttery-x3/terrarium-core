@@ -12,6 +12,7 @@ export const agentTurnSchema = z.object({
 export type AgentTurnConfig = z.infer<typeof agentTurnSchema>;
 
 export const messageTextSchema = z.string().trim().min(1).max(8000);
+export const emoteTextSchema = z.string().trim().min(1).max(240);
 export const messageInputSchema = z.object({ roomId: roomIdSchema, message: messageTextSchema }).strict();
 export const roomInputSchema = z.object({
   id: roomIdSchema.optional(), name: messageTextSchema, description: z.string().max(8000).default(''),
@@ -29,6 +30,7 @@ export const agentInputSchema = z.object({
 export const deleteAgentSchema = z.object({ id: z.string().min(1) }).strict();
 export const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('speak'), message: messageTextSchema }).strict(),
+  z.object({ type: z.literal('emote'), message: emoteTextSchema }).strict(),
   z.object({ type: z.literal('move'), roomId: roomIdSchema }).strict(),
   z.object({ type: z.literal('wait') }).strict(),
   z.object({ type: z.literal('eat') }).strict(),
@@ -40,6 +42,15 @@ export const actionResponseJsonSchema = {
     intention: { type: ['string', 'null'], maxLength: 240 },
     action: {
       anyOf: [
+        {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['emote'] },
+            message: { type: 'string', minLength: 1, maxLength: 240, pattern: '\\S' },
+          },
+          required: ['type', 'message'],
+          additionalProperties: false,
+        },
         {
           type: 'object',
           properties: {
@@ -76,6 +87,12 @@ export const actionResponseJsonSchema = {
   required: ['action', 'intention'],
   additionalProperties: false,
 };
+export function actionJsonSchema(emotesEnabled: boolean) {
+  return { ...actionResponseJsonSchema, properties: { ...actionResponseJsonSchema.properties,
+    action: { anyOf: actionResponseJsonSchema.properties.action.anyOf.filter(option =>
+      option.properties.type.enum[0] !== (emotesEnabled ? 'wait' : 'emote')) },
+  } };
+}
 export const cursorSchema = z.object({ createdAt: z.string().datetime(), id: z.string().min(1) }).strict();
 export const historyInputSchema = z.object({
   roomId: roomIdSchema, before: cursorSchema.optional(), after: cursorSchema.optional(),
@@ -89,9 +106,11 @@ export const configurationFileLimitBytes = 512 * 1024;
 export const defaultPrompts = {
   framing: 'You inhabit a simulated terrarium. Choose how to spend this turn according to your own preferences and current circumstances.',
   profiles: 'Personality describes your manner and temperament. Motivations describe what you seek or avoid, including company, solitude, interests and tolerance for repetition. Current intention is an optional immediate aim, not memory or an obligation.',
-  actionSelection: 'Choose one action first. Formulate speech only if you choose speak. Moving, eating, waiting, changing subject and remaining quietly content are valid choices. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.',
+  actionSelection: 'Choose one available action first. Formulate speech only if you choose speak. Moving, eating, changing subject and remaining quietly content are valid choices. When emotes are enabled, choose emote instead of wait for a quiet turn; otherwise wait silently. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.',
   energy: 'When energy is enabled and low, prioritise obtaining food. Choose a food-source destination yourself, move there, then eat on a later turn. After eating, reconsider your next action; you may stay. Zero energy imposes no additional action restriction.',
   reminders: 'Describe only actions the world supports as completed actions. Imaginary construction or saying you ate does not change the world. An optional brief intention is a self-report for this decision, not private reasoning or future memory.',
+  observations: 'Your personal memory contains only events you observed when present, including your own visible contributions. It travels with you between rooms. Read each item\'s timestamp, room and type: remembered activity is not necessarily happening now or here. Arriving gives you no earlier room transcript. You may listen, ask questions or mention experiences from elsewhere without any required greeting or topic change.',
+  emotes: 'An emote is one short externally observable behaviour, at most 240 characters. Write in third person, identifying yourself. Quiet, mundane behaviour is enough, such as folding your arms and watching the doorway. Do not include inner thoughts, hidden intentions, monologues or quoted dialogue. Emotes cannot move you, feed you, create items, build machines or grant capabilities. Do not combine an emote with another action.',
 };
 export const promptSettingsSchema = z.object({
   framing: z.string().trim().min(1).max(8000),
@@ -99,6 +118,8 @@ export const promptSettingsSchema = z.object({
   actionSelection: z.string().trim().min(1).max(8000),
   energy: z.string().trim().min(1).max(8000),
   reminders: z.string().max(8000),
+  observations: z.string().trim().min(1).max(8000),
+  emotes: z.string().trim().min(1).max(8000),
 }).strict();
 export const settingsSchema = z.object({
   energy: z.object({
@@ -108,23 +129,38 @@ export const settingsSchema = z.object({
   }).strict().refine(value => value.initial <= value.maximum && value.lowThreshold <= value.maximum,
     'Initial energy and low threshold must not exceed maximum energy.'),
   prompts: promptSettingsSchema,
+  activity: z.object({ roomEventsEnabled: z.boolean(), emotesEnabled: z.boolean() }).strict(),
   diagnostics: z.object({ maxPayloadMiB: z.number().int().min(32).max(16384), retention: z.literal('manual') }).strict(),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
 export const defaultSettings: Settings = {
   energy: { enabled: false, initial: 100, maximum: 100, depletionPerMinute: 5, lowThreshold: 25, replenishment: 'fill' },
   prompts: defaultPrompts,
+  activity: { roomEventsEnabled: true, emotesEnabled: true },
   diagnostics: { maxPayloadMiB: 256, retention: 'manual' },
 };
-export const configurationSchema = z.object({
+const legacySettingsSchema = settingsSchema.omit({ activity: true }).extend({
+  prompts: promptSettingsSchema.omit({ observations: true, emotes: true }),
+});
+export function upgradeLegacySettings(value: z.infer<typeof legacySettingsSchema>): Settings {
+  const previousActionSelection = 'Choose one action first. Formulate speech only if you choose speak. Moving, eating, waiting, changing subject and remaining quietly content are valid choices. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.';
+  return { ...value, activity: { ...defaultSettings.activity }, prompts: { ...value.prompts,
+    actionSelection: value.prompts.actionSelection === previousActionSelection ? defaultPrompts.actionSelection : value.prompts.actionSelection,
+    observations: defaultPrompts.observations, emotes: defaultPrompts.emotes,
+  } };
+}
+const configurationFields = z.object({
   format: z.literal('terrarium-config'),
-  version: z.union([z.literal(1), z.literal(2)]),
-  settings: settingsSchema.optional(),
   rooms: z.array(roomInputSchema.extend({ id: roomIdSchema })),
   agents: z.array(agentInputSchema.and(z.object({ id: z.string().min(1) }))),
-}).strict().superRefine((value, context) => {
-  if (value.version === 2) {
-    if (!value.settings) context.addIssue({ code: z.ZodIssueCode.custom, path: ['settings'], message: 'Version 2 requires complete shared settings.' });
+}).strict();
+const importedSettingsSchema = z.union([settingsSchema, legacySettingsSchema.transform(upgradeLegacySettings)]);
+export const configurationSchema = z.discriminatedUnion('version', [
+  configurationFields.extend({ version: z.literal(1), settings: importedSettingsSchema.optional() }),
+  configurationFields.extend({ version: z.literal(2), settings: importedSettingsSchema }),
+  configurationFields.extend({ version: z.literal(3), settings: settingsSchema }),
+]).superRefine((value, context) => {
+  if (value.version >= 2) {
     value.rooms.forEach((room, index) => {
       if (room.isFoodSource === undefined) context.addIssue({ code: z.ZodIssueCode.custom, path: ['rooms', index, 'isFoodSource'], message: 'Version 2 requires a food-source flag.' });
     });
@@ -165,9 +201,17 @@ export type HistoryCleared = { roomIds: string[]; deletedMessages: number };
 export type HistoryCursor = z.infer<typeof cursorSchema>;
 export type Room = { id: string; name: string; description: string; isFoodSource: boolean };
 export type Agent = Omit<AgentInput, 'id'> & { id: string; revision: number; energy: number; motivations: string; intention: string };
-export type ConversationMessage = {
-  id: string; roomId: string; agentId: string; speaker: string; createdAt: string; content: string;
-};
+export const conversationMessageSchema = z.object({
+  id: z.string().min(1), roomId: roomIdSchema, agentId: z.string().min(1), speaker: z.string(),
+  createdAt: z.string().datetime(), content: z.string().min(1),
+  type: z.enum(['speak', 'emote', 'arrival', 'departure']),
+}).strict().superRefine((value, context) => {
+  if (value.type === 'emote' && !emoteTextSchema.safeParse(value.content).success)
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'Emotes must contain 1–240 characters.' });
+  if (value.type === 'speak' && !messageTextSchema.safeParse(value.content).success)
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'Speech must contain 1–8000 characters.' });
+});
+export type ConversationMessage = z.infer<typeof conversationMessageSchema>;
 export type HistoryPage = { messages: ConversationMessage[]; hasMore: boolean };
 export type ConversationExport = {
   exportedAt: string;
@@ -181,7 +225,7 @@ export type WorldState = { rooms: Room[]; agents: Agent[]; settings: Settings; s
 
 export const diagnosticFilterSchema = z.object({
   agentId: z.string().optional(), roomId: z.string().optional(),
-  action: z.enum(['speak', 'move', 'wait', 'eat']).optional(),
+  action: z.enum(['speak', 'emote', 'move', 'wait', 'eat']).optional(),
   outcome: z.string().max(80).optional(), from: z.string().datetime().optional(), to: z.string().datetime().optional(),
   before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).default(50),
 }).strict();
@@ -191,6 +235,7 @@ export type AttemptDetails = {
   requestId?: string; responseId?: string; settingsVersion?: number; agentRevision?: number;
   context?: unknown; energySeen?: number; energyBefore?: number; energyAfter?: number; passiveDecay?: number;
   sourceRoomId?: string; destinationRoomId?: string; moved?: boolean; messageId?: string;
+  eventIds?: string[];
   error?: string; notificationError?: string; truncated?: boolean; captureLimitBytes?: number;
 };
 export type DiagnosticRecord = {

@@ -1,5 +1,19 @@
 # Implementation validation
 
+## FLAME-147 validation — 19 October 2026
+
+`pnpm build` succeeds for all six packages. `pnpm check` reports zero errors and zero warnings in both frontends. `pnpm test` passes 126 tests: 21 shared contracts, 29 persistence, 14 provider/auth, 33 turn/scheduler, 25 UI/socket integration and 4 Svelte activity-rendering cases.
+
+New deterministic coverage verifies event-time fan-out (including multiple messages between turns and disabled residents), different co-located memories, no pre-arrival or remote transcript access, cross-room FIFO eviction, immediate trimming on edits/imports, migration without backfill, restart persistence, custom prompt preservation, configured emote/wait schemas, bounded emotes and world-action isolation. Movement rollback includes observation insertion failure, diagnostic failure, stale completion and cancellation; neither archive records nor eviction survive a failed transaction. Typed events retain identity through sockets, reconnect reads, Markdown export, prompt previews and diagnostic payloads. Svelte rendering tests verify italic activity, actor/metadata attribution and escaped text.
+
+An existing app occupied ports 3000/4173. Development validation therefore used `DATABASE_PATH=data/flame-147-manual.db`, `PORT=3100`, and `pnpm dev --filter=!@terrarium/ui-config`; the server and package watchers started with zero compilation errors. Both frontends ran through their existing Vite configurations on isolated ports 4273/4274, with test-process proxy overrides to the isolated server. Health and both transformed frontend sources returned HTTP 200. No repository build configuration was changed.
+
+Manual browser validation used two disabled test agents and synthetic activity. The Commons archive showed ordinary speech plus italic arrival/emote records. Alice's preview included an exchange she witnessed before Barry arrived; Barry's preview excluded it and included his own departure/arrival plus subsequent shared activity, with original room IDs and timestamps. The form showed memory default 30 and both activity toggles enabled. Terrain loaded saved speech/departure previews, displayed activity in italics, and restored them after reload. A visual overlap found during this check was corrected with wrapped, bounded previews; the full records remain in the configuration view and export. The manual fixture did not start real model turns.
+
+The emote schema enforces length and supported fields; editable prompt guidance governs whether prose describes externally observable behaviour. Text cannot itself move agents, replenish energy or create world objects. No live-model behaviour assessment was performed for this change.
+
+## Earlier validation
+
 Validated on Windows with Node 24.15.0 and pnpm 10.26.2, 18 October 2026. Implementation is submitted on `codex/terrarium-implementation` for review before merging.
 
 | Check                    | Result                                                                                                                                                                                                                  |

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema } from '@terrarium/shared';
+import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import type {
   Agent,
@@ -49,6 +49,7 @@ const messageRecord = (
   speaker: row.speaker_name,
   createdAt: row.created_at,
   content: row.content,
+  type: row.type,
 });
 
 export class World {
@@ -117,7 +118,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 2,
+        version: 3,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -167,7 +168,8 @@ export class World {
       for (const agent of configuration.agents)
         if (!agents.has(agent.id)) defaults.push(`Agent ${agent.id}: empty motivations/intention; initial energy ${state.settings.energy.initial}.`);
     }
-    const settings = configuration.version === 2 ? configuration.settings! : state.settings;
+    if (configuration.version === 2) defaults.push('Older settings include default observable-event and emote guidance when absent. Personal memories are not imported.');
+    const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
     if (settings.energy.enabled && ![...mergedRooms.values()].some(room => room.isFoodSource))
@@ -256,7 +258,7 @@ export class World {
           revision: (revisions.get(agent.id) ?? -1) + 1,
           motivations: agent.motivations ?? previous?.motivations ?? '',
           intention: agent.intention ?? previous?.intention ?? '',
-          energy: previous?.energy ?? (configuration.version === 2 ? configuration.settings! : state.settings).energy.initial,
+          energy: previous?.energy ?? (configuration.version >= 2 ? configuration.settings! : state.settings).energy.initial,
         };
         await db
           .insertInto('agents')
@@ -265,8 +267,9 @@ export class World {
             conflict.column('id').doUpdateSet(values),
           )
           .execute();
+        await new World(db).trimMemory(agent.id, agent.contextMessageLimit);
       }
-      if (configuration.version === 2) await db.updateTable('settings').set(({ eb }) => ({
+      if (configuration.version >= 2) await db.updateTable('settings').set(({ eb }) => ({
         value: JSON.stringify(configuration.settings), version: eb('version', '+', 1),
       })).where('id', '=', 1).execute();
       return preview;
@@ -337,6 +340,7 @@ export class World {
           .values({ ...values, id, revision: 0, energy: (await new World(db).settings()).value.energy.initial })
           .execute();
       }
+      await new World(db).trimMemory(id, input.contextMessageLimit);
       return agentRecord(
         await db
           .selectFrom('agents')
@@ -348,12 +352,27 @@ export class World {
   }
 
   async deleteAgent(id: string) {
-    const result = await this.db
-      .deleteFrom('agents')
-      .where('id', '=', id)
-      .executeTakeFirstOrThrow();
-    if (!result.numDeletedRows) throw new Error('Agent does not exist.');
-    return { id };
+    return this.db.transaction().execute(async db => {
+      const result = await db
+        .deleteFrom('agents')
+        .where('id', '=', id)
+        .executeTakeFirstOrThrow();
+      if (!result.numDeletedRows) throw new Error('Agent does not exist.');
+      await db.deleteFrom('observations').where('agent_id', '=', id).execute();
+      return { id };
+    });
+  }
+
+  private async trimMemory(agentId: string, limit: number) {
+    await this.db.deleteFrom('observations').where('agent_id', '=', agentId)
+      .where('sequence', 'not in', this.db.selectFrom('observations').select('sequence')
+        .where('agent_id', '=', agentId).orderBy('sequence', 'desc').limit(limit)).execute();
+  }
+
+  async memory(agentId: string): Promise<ConversationMessage[]> {
+    return (await this.db.selectFrom('observations').innerJoin('messages', 'messages.id', 'observations.message_id')
+      .selectAll('messages').where('observations.agent_id', '=', agentId)
+      .orderBy('observations.sequence', 'asc').execute()).map(messageRecord);
   }
 
   private async insertMessage(
@@ -362,6 +381,7 @@ export class World {
     agentId: string,
     speaker: string,
     content: string,
+    type: ConversationMessage['type'] = 'speak',
   ) {
     if (
       !(await db
@@ -392,6 +412,7 @@ export class World {
       speaker,
       content,
       createdAt,
+      type,
     };
     await db
       .insertInto('messages')
@@ -402,8 +423,14 @@ export class World {
         speaker_name: speaker,
         content,
         created_at: createdAt,
+        type,
       })
       .execute();
+    const observers = await db.selectFrom('agents').select(['id', 'context_message_limit']).where('room_id', '=', roomId).execute();
+    for (const observer of observers) {
+      await db.insertInto('observations').values({ agent_id: observer.id, message_id: message.id }).execute();
+      await new World(db).trimMemory(observer.id, observer.context_message_limit);
+    }
     return message;
   }
 
@@ -424,6 +451,9 @@ export class World {
       const roomIds = (await rooms.execute()).map((room) => room.id);
       if (selection.scope === 'room' && !roomIds.length)
         throw new Error('Room does not exist.');
+      let observedMessages = db.selectFrom('messages').select('id');
+      if (selection.scope === 'room') observedMessages = observedMessages.where('room_id', '=', selection.roomId);
+      await db.deleteFrom('observations').where('message_id', 'in', observedMessages).execute();
       let query = db.deleteFrom('messages');
       if (selection.scope === 'room')
         query = query.where('room_id', '=', selection.roomId);
@@ -478,6 +508,7 @@ export class World {
     stillCurrent: () => boolean,
     attemptId?: string,
   ) {
+    action = actionSchema.parse(action);
     await this.syncEnergy();
     return this.db.transaction().execute(async (db) => {
       const row = await db
@@ -491,29 +522,42 @@ export class World {
           throw new ActionError('stale', 'This turn is no longer current.');
       };
       check();
+      const settings = (await new World(db).settings()).value;
+      if (action.type === 'wait' && settings.activity.emotesEnabled)
+        throw new ActionError('world-validation', 'Emotes are enabled; use emote for a quiet turn.');
+      if (action.type === 'emote' && !settings.activity.emotesEnabled)
+        throw new ActionError('world-validation', 'Emotes are disabled; use wait for a quiet turn.');
       let message: ConversationMessage | undefined;
-      if (action.type === 'speak')
+      const events: ConversationMessage[] = [];
+      if (action.type === 'speak' || action.type === 'emote')
         message = await this.insertMessage(
           db,
           row.room_id,
           row.id,
           row.name,
           action.message,
+          action.type,
         );
       if (action.type === 'move') {
-        if (
-          !(await db
-            .selectFrom('rooms')
-            .select('id')
-            .where('id', '=', action.roomId)
-            .executeTakeFirst())
-        )
+        const destination = await db
+          .selectFrom('rooms')
+          .selectAll()
+          .where('id', '=', action.roomId)
+          .executeTakeFirst();
+        if (!destination)
           throw new ActionError('world-validation', 'Destination room does not exist.');
+        const observableMove = action.roomId !== row.room_id && settings.activity.roomEventsEnabled;
+        if (observableMove) {
+          const origin = await db.selectFrom('rooms').selectAll().where('id', '=', row.room_id).executeTakeFirstOrThrow();
+          events.push(await this.insertMessage(db, row.room_id, row.id, row.name, `${row.name} leaves ${origin.name}.`, 'departure'));
+        }
         await db
           .updateTable('agents')
           .set({ room_id: action.roomId, revision: row.revision + 1 })
           .where('id', '=', row.id)
           .execute();
+        if (observableMove)
+          events.push(await this.insertMessage(db, action.roomId, row.id, row.name, `${row.name} enters ${destination.name}.`, 'arrival'));
       }
       let energyAfter = row.energy;
       if (action.type === 'eat') {
@@ -531,12 +575,12 @@ export class World {
         const details: AttemptDetails = JSON.parse(record.details);
         await new World(db).updateDiagnostic(attemptId, {
           sourceRoomId: row.room_id, destinationRoomId: action.type === 'move' ? action.roomId : row.room_id,
-          moved, ...(message ? { messageId: message.id } : {}), energyBefore: row.energy, energyAfter,
+          moved, ...(message ? { messageId: message.id } : {}), eventIds: events.map(event => event.id), energyBefore: row.energy, energyAfter,
           passiveDecay: Math.max(0, (details.energySeen ?? row.energy) - row.energy),
         }, action.type === 'move' && !moved ? 'applied-noop' : 'applied', action.type);
       }
       check();
-      return { message, moved, energyBefore: row.energy, energyAfter };
+      return { message, events, moved, energyBefore: row.energy, energyAfter };
     });
   }
 

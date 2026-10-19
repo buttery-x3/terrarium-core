@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Kysely, SqliteDialect, type Generated } from 'kysely';
-import { defaultSettings } from '@terrarium/shared';
+import { defaultSettings, settingsSchema, upgradeLegacySettings, type ConversationMessage } from '@terrarium/shared';
 
 export interface DB {
   rooms: {
@@ -35,7 +35,9 @@ export interface DB {
     created_at: string;
     content: string;
     speaker_name: string;
+    type: Generated<ConversationMessage['type']>;
   };
+  observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
   settings: { id: number; version: number; value: string };
   decisions: {
@@ -136,6 +138,22 @@ export const ensureTables = async (db: Kysely<DB>) => {
     await db.schema.createIndex('decisions_turn').on('decisions').columns(['turn_id', 'attempt']).execute();
     await db.schema.createIndex('decisions_filter').on('decisions').columns(['agent_id', 'room_id', 'sequence']).execute();
     await db.insertInto('schema_migrations').values({ version: 2 }).execute();
+  }
+  if (!applied.some(row => row.version === 3)) {
+    await db.schema.alterTable('messages').addColumn('type', 'text', column => column.notNull().defaultTo('speak')).execute();
+    await db.schema.createTable('observations')
+      .addColumn('sequence', 'integer', column => column.primaryKey().autoIncrement())
+      .addColumn('agent_id', 'text', column => column.notNull())
+      .addColumn('message_id', 'text', column => column.notNull())
+      .addUniqueConstraint('observations_agent_message', ['agent_id', 'message_id']).execute();
+    await db.schema.createIndex('observations_agent_order').on('observations').columns(['agent_id', 'sequence']).execute();
+    await db.schema.createIndex('observations_message').on('observations').column('message_id').execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const value = JSON.parse(saved.value);
+    const settings = settingsSchema.safeParse(value);
+    await db.updateTable('settings').set({ value: JSON.stringify(settings.success ? settings.data : upgradeLegacySettings(value)), version: saved.version + 1 }).where('id', '=', 1).execute();
+    // INVARIANT: existing archives do not establish personally witnessed observations.
+    await db.insertInto('schema_migrations').values({ version: 3 }).execute();
   }
   });
 };

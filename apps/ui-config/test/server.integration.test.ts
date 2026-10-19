@@ -60,6 +60,40 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('broadcasts typed movement and emotes once, recovers both views, and exports distinct activity with personal previews', async () => {
+    const url = await setup(), config = connect(url), terrain = connect(url, 'terrain');
+    await Promise.all([ready(config), ready(terrain)]);
+    const a = await application.world.saveAgent({ name: 'A', instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt', model: 'fake', enabled: true, minIntervalMs: 1000, maxIntervalMs: 1000, contextMessageLimit: 30 });
+    await application.world.speak('room-2', 'Before A arrived');
+    const configRecords: any[] = [], terrainRecords: any[] = [];
+    config.on('conversation:message', item => configRecords.push(item));
+    terrain.on('conversation:message', item => terrainRecords.push(item));
+    const { performTurn } = await import('../../server/src/turns.js');
+    const move = { name: 'fake', complete: async () => ({ content: '{"action":{"type":"move","roomId":"room-2"}}' }) };
+    await performTurn(application.world, a, move, new AbortController().signal, () => true, application.publishMessage, async () => {});
+    const current = (await application.world.agent(a.id))!;
+    await performTurn(application.world, current, { name: 'fake', complete: async () => ({ content: '{"action":{"type":"emote","message":"A watches the doorway."}}' }) },
+      new AbortController().signal, () => true, application.publishMessage, async () => {});
+    await vi.waitFor(() => { expect(configRecords).toHaveLength(3); expect(terrainRecords).toEqual(configRecords); });
+    expect(configRecords.map(item => item.type)).toEqual(['departure', 'arrival', 'emote']);
+    const preview = (await request(config, 'prompt:preview', { agentId: a.id })).value;
+    expect(JSON.stringify(preview)).not.toContain('Before A arrived');
+    expect(preview.context.memory.map((item: any) => item.type)).toEqual(['departure', 'arrival', 'emote']);
+    const markdown = (await request(config, 'history:export', {})).value;
+    expect(markdown).toContain('*A watches the doorway.*');
+    expect(markdown).not.toContain('> A watches the doorway.');
+    expect(markdown).toContain('Before A arrived');
+    terrain.disconnect();
+    const reconnected = connect(url, 'terrain'); await ready(reconnected);
+    expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
+    expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
+    const exported = (await request(config, 'config:export', {})).value;
+    expect(exported.version).toBe(3);
+    expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
+    const imported = await request(config, 'config:preview', exported);
+    expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
+    expect((await application.world.memory(a.id)).map(item => item.type)).toEqual(['departure', 'arrival', 'emote']);
+  });
   it('previews saved settings without a model request and enforces stopped settings edits', async () => {
     const complete = vi.fn(async () => ({ content: '{"action":{"type":"wait"}}' }));
     const url = await setup({ name: 'fake', complete }), socket = connect(url);
@@ -323,7 +357,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 2,
+      version: 3,
       agents: [],
     });
     const configuration = {
@@ -409,7 +443,7 @@ describe('web conversation contract', () => {
     config.on('world:state', worldChanged);
     for (const configuration of [
       null,
-      { ...original, version: 3 },
+      { ...original, version: 4 },
       { ...original, rooms: [{ name: 'Missing ID' }] },
     ]) {
       expect(
