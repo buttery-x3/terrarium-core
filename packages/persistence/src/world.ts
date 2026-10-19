@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema,
-  appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema } from '@terrarium/shared';
+  appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema, newsProposalSchema, newsHistoryFilterSchema, canonicalNewsUrl } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import { sql } from 'kysely';
 import type {
@@ -21,6 +21,7 @@ import type {
   ReflectionState,
   AppraisalProposal, AppraisalRecord, RelationshipState, RelationshipSummary, RelationshipSummaryInput, RelationshipSummaryProposal,
   RelationshipContext, RelationshipFilter, RelationshipPage, AppraisalPage, RelationshipSummaryPage,
+  NewsProposal, NewsItem, NewsState, NewsHistoryFilter, NewsHistoryPage,
 } from '@terrarium/shared';
 import type { DB } from './index.js';
 
@@ -80,6 +81,8 @@ const appraisalRecord = (row: Selectable<DB['appraisals']>): AppraisalRecord => 
 const summaryRecord = (row: Selectable<DB['relationship_summaries']>): RelationshipSummary => ({ id: row.id,
   observerId: row.observer_id, targetAgentId: row.target_agent_id, version: row.version, summary: row.summary, createdAt: row.created_at,
   throughSequence: row.through_sequence, previousSummaryId: row.previous_summary_id, appraisalIds: JSON.parse(row.appraisal_ids) });
+const newsRecord = (row: Selectable<DB['news_items']>): NewsItem => ({ id: row.id, sequence: row.sequence, headline: row.headline,
+  description: row.description, category: row.category, publishedAt: row.published_at, retrievedAt: row.retrieved_at, sourceUrls: JSON.parse(row.source_urls) });
 
 export class World {
   private energyClock: number | undefined;
@@ -114,6 +117,8 @@ export class World {
 
   async validateSettings(value: Settings) {
     const settings = settingsSchema.parse(value);
+    if (settings.news.enabled && !(await this.rooms()).some(room => room.id === settings.news.roomId))
+      throw new Error('News requires an existing assigned room before it can be enabled.');
     for (const agent of await this.agents()) resolveScheduling(settings, agent);
     if (settings.energy.enabled && !(await this.rooms()).some(room => room.isFoodSource))
       throw new Error('Configuration requires at least one food-source room before energy can be enabled.');
@@ -149,7 +154,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 5,
+        version: 6,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -202,9 +207,11 @@ export class World {
     if (configuration.version === 2) defaults.push('Older settings include default observable-event and emote guidance when absent. Personal memories are not imported.');
     if (configuration.version < 4) defaults.push('Older settings use shared reflection, speech and emote timing defaults when absent. Private reflections are not imported.');
     if (configuration.version < 5) defaults.push('Older settings use default optional appraisal capacity and relationship-summary timing. Runtime appraisals and summaries are not imported.');
+    if (configuration.version < 6) defaults.push('News is disabled by default for older settings. Existing room names, archives and runtime news history are preserved.');
     const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
+    if (settings.news.enabled && !mergedRooms.has(settings.news.roomId)) throw new Error('News requires an existing assigned room before it can be enabled.');
     if (settings.energy.enabled && ![...mergedRooms.values()].some(room => room.isFoodSource))
       throw new Error('Configuration requires at least one food-source room while energy is enabled.');
     if (state.agents.some(agent => agent.energy > settings.energy.maximum))
@@ -435,6 +442,92 @@ export class World {
     let query = this.db.updateTable('reflections').set({ engagement_room_id: null, engagement_root_message_id: null, engagement_target_agent_id: null });
     if (agentId) query = query.where(eb => eb.or([eb('agent_id', '=', agentId), eb('engagement_target_agent_id', '=', agentId)]));
     await query.execute();
+  }
+
+  async newsState(): Promise<NewsState> {
+    const state = await this.db.selectFrom('news_state').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const current = state.current_item_id ? await this.db.selectFrom('news_items').selectAll().where('id', '=', state.current_item_id).executeTakeFirst() : undefined;
+    return { current: current ? newsRecord(current) : null, lastAttemptAt: state.last_attempt_at, lastSuccessAt: state.last_success_at, error: state.error };
+  }
+
+  async newsHistory(input: NewsHistoryFilter = {}): Promise<NewsHistoryPage> {
+    const filter = newsHistoryFilterSchema.parse(input);
+    let query = this.db.selectFrom('news_items').selectAll();
+    if (filter.before) query = query.where('sequence', '<', filter.before);
+    const rows = await query.orderBy('sequence', 'desc').limit(filter.limit + 1).execute();
+    const items = rows.slice(0, filter.limit).map(newsRecord);
+    return { items, hasMore: rows.length > filter.limit, next: items.at(-1)?.sequence };
+  }
+
+  async newsDisplay(roomId: string): Promise<NewsItem | null> {
+    const { news } = (await this.settings()).value;
+    return news.enabled && news.roomId === roomId ? (await this.newsState()).current : null;
+  }
+
+  private async checkNewsCurrent(settingsVersion: number, stillCurrent: () => boolean) {
+    const settings = await this.settings();
+    if (!stillCurrent() || settings.version !== settingsVersion || !settings.value.news.enabled)
+      throw new ActionError('stale', 'This news request is no longer current.');
+    return settings.value.news;
+  }
+
+  async publishNews(input: NewsProposal, validatedSearchSources: string[], settingsVersion: number, stillCurrent: () => boolean, attemptId?: string) {
+    const proposal = newsProposalSchema.parse(input);
+    const sourceUrls = [...new Set(proposal.sourceUrls.map(canonicalNewsUrl))];
+    const retrievedUrls = new Set(validatedSearchSources.map(canonicalNewsUrl));
+    if (!sourceUrls.every(url => retrievedUrls.has(url))) throw new ActionError('world-validation', 'News attribution must use URLs returned by the completed web search.');
+    const normalizedHeadline = proposal.headline.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (!normalizedHeadline) throw new ActionError('world-validation', 'A news headline must contain words or numbers.');
+    const headlineKey = createHash('sha256').update(normalizedHeadline).digest('hex');
+    return this.db.transaction().execute(async db => {
+      const world = new World(db), news = await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      if (!news.topics.includes(proposal.category)) throw new ActionError('world-validation', 'News category must be one of the configured topics.');
+      if (attemptId) {
+        const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
+        if (record.ended_at) throw new ActionError('stale', 'This news attempt has already ended.');
+      }
+      if (await db.selectFrom('news_items').select('id').where('headline_key', '=', headlineKey).executeTakeFirst() ||
+        await db.selectFrom('news_sources').select('canonical_url').where('canonical_url', 'in', sourceUrls).executeTakeFirst())
+        throw new ActionError('world-validation', 'News selection repeats a known headline or source article; the current display was retained.');
+      const retrievedAt = new Date().toISOString(), id = headlineKey;
+      const row = await db.insertInto('news_items').values({ id, headline_key: headlineKey, headline: proposal.headline,
+        description: proposal.description, category: proposal.category, published_at: proposal.publishedAt, retrieved_at: retrievedAt,
+        source_urls: JSON.stringify(sourceUrls) }).returningAll().executeTakeFirstOrThrow();
+      await db.insertInto('news_sources').values(sourceUrls.map(url => ({ canonical_url: url, news_item_id: id }))).execute();
+      await db.updateTable('news_state').set({ current_item_id: id, last_attempt_at: retrievedAt, last_success_at: retrievedAt, error: null }).where('id', '=', 1).execute();
+      const item = newsRecord(row);
+      const content = `${item.headline}\n${item.description}\nCategory: ${item.category}\n${item.publishedAt ? `Published: ${item.publishedAt}\n` : ''}Retrieved: ${item.retrievedAt}\nSources: ${item.sourceUrls.join(' ')}`;
+      const event = await this.insertMessage(db, news.roomId, 'world-news', 'News display', content, 'news');
+      if (attemptId) await world.updateDiagnostic(attemptId, { news: item, eventIds: [event.id], sourceRoomId: news.roomId, destinationRoomId: news.roomId }, 'applied', 'news');
+      await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      return { item, event, state: await world.newsState() };
+    });
+  }
+
+  async recordNewsCheck(settingsVersion: number, stillCurrent: () => boolean, attemptId?: string): Promise<NewsState> {
+    return this.db.transaction().execute(async db => {
+      const world = new World(db);
+      await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      if (attemptId) {
+        const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
+        if (record.ended_at) throw new ActionError('stale', 'This news attempt has already ended.');
+      }
+      const now = new Date().toISOString();
+      await db.updateTable('news_state').set({ last_attempt_at: now, last_success_at: now, error: null }).where('id', '=', 1).execute();
+      if (attemptId) await world.updateDiagnostic(attemptId, { eventIds: [] }, 'applied-noop', 'news');
+      await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      return world.newsState();
+    });
+  }
+
+  async recordNewsFailure(error: string, settingsVersion: number, stillCurrent: () => boolean): Promise<NewsState> {
+    return this.db.transaction().execute(async db => {
+      const world = new World(db);
+      await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      await db.updateTable('news_state').set({ last_attempt_at: new Date().toISOString(), error: error.slice(0, 1000) }).where('id', '=', 1).execute();
+      await world.checkNewsCurrent(settingsVersion, stillCurrent);
+      return world.newsState();
+    });
   }
 
   private async latestRelationshipSummary(observerId: string, targetAgentId: string) {

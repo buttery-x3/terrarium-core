@@ -1,5 +1,13 @@
 # Implementation validation
 
+## FLAME-148 news validation — 19 October 2026
+
+Stage 3 is validated on `codex/flame-148-news`. All six packages build and both Svelte checks report zero errors/warnings. The full suite passes 208 tests: 22 shared, 48 persistence, 17 provider, 80 server and 41 UI/socket tests. Coverage includes source attribution, durable headline/article deduplication, failed/missing search, successful no-change checks, local observation/arrival rules, cancellation, shared concurrency and escaped untrusted source text. Migration 6 preserves existing data and leaves capability activation to the stopped configuration preview.
+
+Root development startup with a temporary database on port 3138 and separate frontend development servers on 4273/4274 succeeded. Health and both transformed Svelte modules returned HTTP 200; package watchers compiled without errors. Temporary development processes were stopped after checking.
+
+A live `performNews` request through the existing authenticated ChatGPT account completed web search and selected a sports story about the 2026 World Series with an MLB source. This checks actual provider search support and source-grounded publication through the news pipeline. It does not establish a long-run topic distribution or complete the approved two-run behavioural comparison.
+
 ## FLAME-148 relationship validation — 19 October 2026
 
 `codex/flame-148-relationships` builds successfully and both Svelte checks report zero errors/warnings. The full test run passes, including 43 persistence, 68 server and 36 UI/socket tests. New cases cover witnessed evidence, durable deduplication, directional clamped scores, atomic rollback, private context limited to eight relationships, evidence-linked summary versions, independent summary scheduling and retention/reset controls. Migration 5 preserves customized settings, profiles, energy, observations, reflection state and diagnostics.

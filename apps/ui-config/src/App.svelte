@@ -4,6 +4,7 @@
   import ActivityItem from "./ActivityItem.svelte";
   import AgentInspector from "./AgentInspector.svelte";
   import RelationshipPanel from "./RelationshipPanel.svelte";
+  import NewsPanel from "./NewsPanel.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
@@ -45,6 +46,7 @@
   let reflections: ReflectionState[] = [];
   let reflectionRequest = 0;
   let relationshipVersion = 0;
+  let newsVersion = 0;
   let diagnosticAgent = "", diagnosticRoom = "", diagnosticAction = "", diagnosticOutcome = "", diagnosticFrom = "", diagnosticTo = "";
   let diagnosticPage: DiagnosticPage = { records: [], hasMore: false };
   let diagnosticBefore: number | undefined;
@@ -182,6 +184,19 @@
     importPreview = undefined;
     if (importConfiguration) importPreview = await request<ConfigurationPreview>("config:preview", importConfiguration);
   }
+  async function previewNewsRoomSetup() {
+    const configuration = await request<Configuration>("config:export", {});
+    if (!configuration.rooms.some(room => room.id === "room-1")) throw new Error("Room room-1 does not exist. Choose a news room in shared settings instead.");
+    const savedSettings = configuration.settings ?? activeSettings;
+    importConfiguration = configurationSchema.parse({ ...configuration,
+      rooms: configuration.rooms.map(room => room.id === "room-1" ? { ...room, name: "News Room",
+        description: "A shared news display shows one current, sourced headline from varied topics. Residents can discuss what is on screen." } : room),
+      settings: { ...savedSettings, news: { ...savedSettings.news, enabled: true, roomId: "room-1" } },
+    });
+    importFileName = "News Room setup";
+    await previewConfiguration();
+    notice = "News Room setup is ready under Configuration files. Review the preview, then choose Apply import to save it.";
+  }
   async function readConfigurationFile(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
@@ -273,6 +288,7 @@
     socket.on("diagnostics:changed", () => { if (!diagnosticBefore) void loadDiagnostics(); });
     socket.on("reflection:changed", () => { void loadReflections(); });
     socket.on("relationships:changed", () => { relationshipVersion++; });
+    socket.on("news:changed", () => { newsVersion++; });
     socket.on("conversation:cleared", (result: HistoryCleared) => {
       resetHistory(result.roomIds); clearConfirmation = undefined;
       void loadHistory(selectedRoom);
@@ -346,7 +362,7 @@
     {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
     {#if clearConfirmation}
       <div role="group" aria-label="Confirm conversation clearing">
-        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions, intentions, appraisal evidence and relationship summaries are retained and may still reflect this conversation. Affected exchange subscriptions are cleared. Use Reset relationship memory separately to clear relationship evidence and dependent private state. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions, intentions, appraisal evidence and relationship summaries are retained and may still reflect this conversation. The current news display and selected-news history are retained. Affected exchange subscriptions are cleared. Use Reset relationship memory separately to clear relationship evidence and dependent private state. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
         <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
       </div>
@@ -434,6 +450,7 @@
     </form>
   </section>
   <RelationshipPanel {agents} {connected} stopped={runState.state === "stopped"} refreshVersion={relationshipVersion} {request} />
+  <NewsPanel {connected} enabled={activeSettings.news.enabled} roomName={rooms.find(room => room.id === activeSettings.news.roomId)?.name ?? activeSettings.news.roomId} nextDueAt={runState.nextNewsAt} schedulerError={runState.newsError} refreshVersion={newsVersion} {request} />
   <section aria-label="Shared settings">
     <h2>Shared behaviour and energy</h2>
     <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
@@ -453,6 +470,16 @@
       <label>Relationship summary interval (seconds) <input type="number" min="0.001" step="0.001" value={settings.relationships.summaryIntervalMs / 1000} required on:input={event => { settings.relationships.summaryIntervalMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
       <label>Maximum new appraisals per summary batch <input type="number" min="1" max="50" step="1" bind:value={settings.relationships.summaryBatchSize} required /></label>
       <p>Appraisals use witnessed speech or authored emotes from other agents. Zero disables new appraisals. Changed relationships are summarized from bounded evidence batches. An observer's score and summary remain private to that observer and the operator.</p>
+      <h3>News selection</h3>
+      <label><input type="checkbox" bind:checked={settings.news.enabled} /> Enable shared news selection</label>
+      <label>News display room <select bind:value={settings.news.roomId}>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
+      <label>News selection interval (seconds) <input type="number" min="0.001" step="0.001" value={settings.news.intervalMs / 1000} required on:input={event => { settings.news.intervalMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
+      <label>News selection model <input bind:value={settings.news.model} list="chatgpt-models" required /></label>
+      <label>News topics (one per line, up to 12) <textarea rows="6" value={settings.news.topics.join("\n")} required on:change={event => { settings.news.topics = event.currentTarget.value.split(/\r?\n/).map(topic => topic.trim()).filter(Boolean); }}></textarea></label>
+      <label>Recent headlines supplied for variety <input type="number" min="1" max="30" step="1" bind:value={settings.news.recentHeadlineLimit} required /></label>
+      <p>One shared request selects a sourced headline for the assigned room. Topics and the editable news prompt guide variety; web search must be supported by the selected model and account. A failure retains the existing display.</p>
+      <button type="button" disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(previewNewsRoomSetup)}>Preview News Room setup</button>
+      <p>Previews renaming room-1 to News Room, updating its description and enabling news there using the existing configuration import. Saved profiles, IDs and room history are retained. The preview uses saved configuration; save other edits first.</p>
       <h3>Observable activity</h3>
       <label><input type="checkbox" bind:checked={settings.activity.roomEventsEnabled} /> Record automatic room arrival and departure events</label>
       <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Allow observable emote opportunities</label>
@@ -468,7 +495,7 @@
       <p>Each operation uses its applicable sections below, followed by resolved context and enforced protocol constraints. Preview the operation to inspect the exact request order. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}
         {@const key = name as keyof typeof defaultPrompts}
-        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance", appraisals: "Relationship appraisal guidance", relationshipSummary: "Relationship summary guidance" })[key]}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance", appraisals: "Relationship appraisal guidance", relationshipSummary: "Relationship summary guidance", newsSelection: "News selection guidance" })[key]}
           <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
         </label>
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>

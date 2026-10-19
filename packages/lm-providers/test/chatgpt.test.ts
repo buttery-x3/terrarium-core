@@ -18,6 +18,32 @@ const stream = (...events: unknown[]) =>
   );
 const auth = { token: async () => 'synthetic-token' } as ChatGptAuth;
 describe('ChatGPT integration', () => {
+  it('enables search only for an explicit shared-news request', () => {
+    const request = { provider: 'chatgpt', model: 'test', messages: [] };
+    expect(createChatGptPayload(request)).not.toHaveProperty('tools');
+    expect(createChatGptPayload({ ...request, webSearch: true })).toMatchObject({ tools: [{ type: 'web_search' }],
+      tool_choice: 'required', include: ['web_search_call.action.sources'] });
+  });
+  it('returns actual completed search sources and rejects search in ordinary requests', async () => {
+    const search = { type: 'web_search_call', status: 'completed', action: { sources: [
+      { url: 'https://example.org/story', title: 'Source' }, { url: 'https://example.org/story' },
+      { url: 'javascript:alert(1)' }, { url: 'https://user:password@example.org/' },
+    ] } };
+    const events = [{ type: 'response.output_item.done', output_index: 0, item: search },
+      { type: 'response.output_item.done', output_index: 1, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '{"headline":"News"}' }] } },
+      { type: 'response.completed', response: { status: 'completed', output: [] } }];
+    await expect(readResponse(stream(...events))).rejects.toThrow('unsupported tool');
+    expect(await readResponse(stream(...events), { webSearch: true })).toMatchObject({ content: '{"headline":"News"}',
+      search: { sources: [{ url: 'https://example.org/story' }] } });
+  });
+  it('rejects missing or unfinished search and unrelated tools even when search is requested', async () => {
+    const message = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '{}' }] };
+    for (const output of [[message], [{ type: 'web_search_call', status: 'in_progress' }, message]])
+      await expect(readResponse(stream({ type: 'response.completed', response: { status: 'completed', output } }), { webSearch: true }))
+        .rejects.toThrow('no completed web search');
+    await expect(readResponse(stream({ type: 'response.output_item.added', item: { type: 'function_call' } }), { webSearch: true }))
+      .rejects.toThrow('unsupported tool');
+  });
   it('captures the exact body before sending and refuses to send when capture fails', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
       expect(captured).toEqual(JSON.parse(options!.body as string));

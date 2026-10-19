@@ -18,6 +18,7 @@ function errorDetails(value: unknown): string {
 
 export async function readResponse(
   response: Response,
+  options: { webSearch?: boolean } = {},
 ): Promise<LmCompletionResponse> {
   const requestId =
     response.headers.get('x-request-id') ??
@@ -48,6 +49,9 @@ export async function readResponse(
     decoder = new TextDecoder();
   const finishedItems = new Map<number, any>();
   const textParts = new Map<string, string>();
+  let search: LmCompletionResponse['search'];
+  const unsupported = (item: any) => !item || (/call|computer|search/.test(item.type) &&
+    !(options.webSearch && item.type === 'web_search_call'));
   let pending = '',
     text = '',
     size = 0,
@@ -93,7 +97,7 @@ export async function readResponse(
           );
         if (
           event.item?.type &&
-          /call|computer|search/.test(event.item.type)
+          unsupported(event.item)
         )
           throw failure(
             `ChatGPT proposed an unsupported tool call (${event.item.type}).`,
@@ -145,12 +149,27 @@ export async function readResponse(
           if (
             items.some(
               (item: any) =>
-                !item || /call|computer|search/.test(item.type),
+                unsupported(item),
             )
           )
             throw failure(
               'ChatGPT returned an invalid output item or unsupported tool call.',
             );
+          if (options.webSearch) {
+            const searches = items.filter((item: any) => item.type === 'web_search_call' && item.status === 'completed');
+            if (!searches.length) throw failure('ChatGPT returned no completed web search.');
+            const sources = new Map<string, { url: string; title?: string }>();
+            for (const item of searches) for (const source of Array.isArray(item.action?.sources) ? item.action.sources : []) {
+              if (typeof source?.url !== 'string' || source.url.length > 2048) continue;
+              try {
+                const url = new URL(source.url);
+                if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+                if (sources.size < 100) sources.set(url.href, { url: url.href,
+                  ...(typeof source.title === 'string' ? { title: source.title.slice(0, 240) } : {}) });
+              } catch {}
+            }
+            search = { sources: [...sources.values()] };
+          }
           if (
             items.some(
               (item: any) =>
@@ -201,6 +220,7 @@ export async function readResponse(
       finishReason: 'completed',
       requestId,
       responseId,
+      ...(search ? { search } : {}),
     };
   } finally {
     await reader.cancel().catch(() => {});
@@ -227,7 +247,7 @@ export function createChatGptProvider(auth: ChatGptAuth): LmProvider {
         },
         body: JSON.stringify(payload),
       });
-      const result = await readResponse(response).catch(
+      const result = await readResponse(response, { webSearch: request.webSearch }).catch(
         (error: unknown) => {
           throw new ProviderError(
             `${error instanceof Error ? error.message : 'ChatGPT response failed.'} Model: ${request.model}.`,
@@ -246,6 +266,7 @@ export function createChatGptPayload(request: LmCompletionRequest): Record<strin
     model: request.model, stream: true, store: false,
     instructions: request.messages.filter(message => message.role === 'system').map(message => message.content).join('\n'),
     input: request.messages.filter(message => message.role !== 'system'),
+    ...(request.webSearch ? { tools: [{ type: 'web_search' }], tool_choice: 'required', include: ['web_search_call.action.sources'] } : {}),
     ...(request.responseFormat ? { text: { format: { type: 'json_schema', name: request.responseFormat.name,
       strict: true, schema: request.responseFormat.schema } } } : {}),
   };

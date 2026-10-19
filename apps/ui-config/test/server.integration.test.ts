@@ -60,6 +60,23 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('previews searched news without calling the model and refreshes the saved feed through sockets', async () => {
+    const complete = vi.fn(async () => ({ content: '{}' }));
+    const url = await setup({ name: 'fake', complete }), config = connect(url); await ready(config);
+    const initial = await request(config, 'news:state', {}); expect(initial.value.current).toBeNull();
+    const preview = await request(config, 'news:preview', {});
+    expect(preview.value.payload).toMatchObject({ tools: [{ type: 'web_search' }], tool_choice: 'required' });
+    expect(complete).not.toHaveBeenCalled();
+    const settings = (await application.world.settings()).value;
+    await request(config, 'settings:save', { ...settings, news: { ...settings.news, enabled: true } });
+    const version = (await application.world.settings()).version;
+    const saved = await application.world.publishNews({ headline: 'Garden news', description: 'A new butterfly garden opened.',
+      category: 'nature', publishedAt: null, sourceUrls: ['https://example.org/garden'] }, ['https://example.org/garden'], version, () => true);
+    application.publishMessage(saved.event);
+    expect((await request(config, 'news:state', {})).value.current.headline).toBe('Garden news');
+    expect((await request(config, 'news:history', { limit: 1 })).value.items).toHaveLength(1);
+    expect((await request(config, 'news:history', { limit: 1000 })).ok).toBe(false);
+  });
   it('inspects retained relationship evidence and requires an explicit stopped reset', async () => {
     const url = await setup(), config = connect(url); await ready(config);
     const input = { instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt' as const, model: 'fake', enabled: true,
@@ -131,7 +148,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(5);
+    expect(exported.version).toBe(6);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -400,7 +417,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 5,
+      version: 6,
       agents: [],
     });
     const configuration = {

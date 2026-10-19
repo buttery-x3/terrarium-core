@@ -205,8 +205,8 @@ On 19 October 2026 the user approved the FLAME-148 plan, including the revised n
 | Branch | Scope and status |
 | --- | --- |
 | `codex/flame-148-reflection` | Implemented and validated as `b3501a2`: latest private reflection, independent speech/emote opportunities, inactivity, local exchange engagement, settings, previews and diagnostics. |
-| `codex/flame-148-relationships` | Implemented for integration and validation: witnessed appraisals, directional capped scores, durable evidence and periodic evidence-linked summaries. |
-| `codex/flame-148-news` | Planned: shared web-search-based news selection, varied topics, recent-headline deduplication, sources and local room observations. |
+| `codex/flame-148-relationships` | Implemented and validated as `77369c2`: witnessed appraisals, directional capped scores, durable evidence and periodic evidence-linked summaries. |
+| `codex/flame-148-news` | Implemented for integration and validation: shared web-search-based news selection, varied topics, recent-headline deduplication, sources and local room observations. |
 | `codex/flame-148-media` | Planned: agent-proposed movie/TV title and description, ten-minute playback, immediate starts when idle and votes for replacements. |
 
 The reflection stage uses 60-second reflections, 15–150-second requested speech delays, a 15-second speech cooldown and 120–300-second emote intervals. Optional per-agent overrides inherit shared defaults when blank. True inactivity produces no outward event. Delayed speech requests retain intent/targets rather than prepared dialogue; execution rereads current context and validates location, targets and cancellation. Each agent has at most one active model operation; the global bound remains four. Coincident opportunities coalesce. Generated private state is available to its agent and the operator, never to other agents. Existing authored profiles, event-time observations, energy rules and provider credentials are preserved.

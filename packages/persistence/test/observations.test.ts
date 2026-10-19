@@ -122,7 +122,7 @@ describe('private reflection and local exchanges', () => {
     const a = await world.saveAgent({ ...input, intention: 'Authored', motivations: 'Stay curious' });
     const b = await world.saveAgent({ ...input, name: 'B' });
     const source = (await act(b.id, { type: 'speak', message: 'Preserved evidence' })).message!;
-    const { scheduling, relationships, prompts: { reflection, appraisals, relationshipSummary, ...prompts }, ...settings } = defaultSettings;
+    const { scheduling, relationships, news, prompts: { reflection, appraisals, relationshipSummary, newsSelection, ...prompts }, ...settings } = defaultSettings;
     await db.updateTable('settings').set({ value: JSON.stringify({ ...settings, prompts: { ...prompts, actionSelection: 'Custom action guidance' } }) }).execute();
     await db.updateTable('agents').set({ energy: 42 }).where('id', '=', a.id).execute();
     await db.schema.dropTable('reflections').execute();
@@ -141,7 +141,7 @@ describe('private reflection and local exchanges', () => {
     const restarted = new World(db);
     await restarted.interruptUnfinished();
     expect(await restarted.reflection(a.id)).toEqual({ ...saved, engagement: null });
-    expect((await world.exportConfiguration()).version).toBe(5);
+    expect((await world.exportConfiguration()).version).toBe(6);
   });
 });
 const act = async (id: string, action: AgentAction) => {
@@ -256,7 +256,7 @@ describe('personal observations', () => {
     const b = await world.saveAgent({ ...input, roomId: 'room-2' });
     await world.speak('room-1', 'Historical archive');
     const turn = await world.scheduleTurn(a, Date.now());
-    const { activity, scheduling, relationships, prompts: { observations, emotes, reflection, appraisals, relationshipSummary, ...prompts }, ...settings } = defaultSettings;
+    const { activity, scheduling, relationships, news, prompts: { observations, emotes, reflection, appraisals, relationshipSummary, newsSelection, ...prompts }, ...settings } = defaultSettings;
     prompts.actionSelection = 'CUSTOM ACTION RULE';
     await db.updateTable('settings').set({ value: JSON.stringify({ ...settings, prompts }) }).execute();
     await db.schema.dropTable('observations').execute();
@@ -272,7 +272,7 @@ describe('personal observations', () => {
     await world.speak('room-2', 'After migration');
     const memories = [await world.memory(a.id), await world.memory(b.id)];
     const configuration = await world.exportConfiguration();
-    expect(configuration.version).toBe(5);
+    expect(configuration.version).toBe(6);
     expect(JSON.stringify(configuration)).not.toContain('After migration');
     await db.destroy(); db = createDb(path); await ensureTables(db); world = new World(db);
     expect([await world.memory(a.id), await world.memory(b.id)]).toEqual(memories);

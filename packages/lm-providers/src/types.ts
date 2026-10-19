@@ -12,6 +12,7 @@ export interface LmCompletionRequest {
   temperature?: number;
   maxTokens?: number;
   responseFormat?: { name: string; schema: Record<string, unknown> };
+  webSearch?: boolean;
   signal?: AbortSignal;
   onRequest?: (payload: Record<string, unknown>) => Promise<void>;
 }
@@ -25,6 +26,7 @@ export interface LmCompletionResponse {
   finishReason?: string;
   requestId?: string;
   responseId?: string;
+  search?: { sources: { url: string; title?: string }[] };
 }
 
 export interface LmProvider {

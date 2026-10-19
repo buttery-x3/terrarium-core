@@ -57,6 +57,12 @@ export interface DB {
     id: string; observer_id: string; target_agent_id: string; version: number; summary: string; created_at: string;
     through_sequence: number; previous_summary_id: string | null; appraisal_ids: string;
   };
+  news_items: {
+    sequence: Generated<number>; id: string; headline_key: string; headline: string; description: string; category: string;
+    published_at: string | null; retrieved_at: string; source_urls: string;
+  };
+  news_sources: { canonical_url: string; news_item_id: string };
+  news_state: { id: number; current_item_id: string | null; last_attempt_at: string | null; last_success_at: string | null; error: string | null };
   observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
   settings: { id: number; version: number; value: string };
@@ -214,6 +220,21 @@ export const ensureTables = async (db: Kysely<DB>) => {
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
     await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     await db.insertInto('schema_migrations').values({ version: 5 }).execute();
+  }
+  if (!applied.some(row => row.version === 6)) {
+    await db.schema.createTable('news_items').addColumn('sequence', 'integer', column => column.primaryKey().autoIncrement())
+      .addColumn('id', 'text', column => column.notNull().unique()).addColumn('headline_key', 'text', column => column.notNull().unique())
+      .addColumn('headline', 'text', column => column.notNull()).addColumn('description', 'text', column => column.notNull())
+      .addColumn('category', 'text', column => column.notNull()).addColumn('published_at', 'text')
+      .addColumn('retrieved_at', 'text', column => column.notNull()).addColumn('source_urls', 'text', column => column.notNull()).execute();
+    await db.schema.createTable('news_sources').addColumn('canonical_url', 'text', column => column.primaryKey())
+      .addColumn('news_item_id', 'text', column => column.notNull()).execute();
+    await db.schema.createTable('news_state').addColumn('id', 'integer', column => column.primaryKey())
+      .addColumn('current_item_id', 'text').addColumn('last_attempt_at', 'text').addColumn('last_success_at', 'text').addColumn('error', 'text').execute();
+    await db.insertInto('news_state').values({ id: 1, current_item_id: null, last_attempt_at: null, last_success_at: null, error: null }).execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 6 }).execute();
   }
   });
 };

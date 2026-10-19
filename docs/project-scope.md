@@ -56,11 +56,17 @@ The reflection branch is the first slice of the [approved stacked branch plan](d
 
 The second branch adds optional witnessed appraisals and independent observer→target scores. Appraisals retain reasons and source evidence, enforce one observer/source update across retries/restart and clamp scores immediately to −10…+10. Changed relationships receive bounded evidence-linked summaries with retained versions. Each agent sees only its own relevant impressions; the operator can inspect scores, page through evidence and versions, and preview exact summary requests.
 
-Defaults allow two appraisals per reflection and summary work approximately every ten minutes with batches of twenty new appraisals. Configuration version 5 and migration 5 add settings, prompts and durable relationship records. Conversation clearing explicitly retains this evidence. A confirmed stopped-run relationship reset clears it and dependent private state while preserving separate diagnostics. Diverse web-searched news and locally suggested movie/TV playback remain planned subsequent branches.
+Defaults allow two appraisals per reflection and summary work approximately every ten minutes with batches of twenty new appraisals. Configuration version 5 and migration 5 add settings, prompts and durable relationship records. Conversation clearing explicitly retains this evidence. A confirmed stopped-run relationship reset clears it and dependent private state while preserving separate diagnostics.
+
+## FLAME-148 news stage
+
+The third branch adds a configurable shared news display backed by real web-search requests through the existing ChatGPT provider. A ten-minute default interval, configurable topic mix and recent-headline context seek varied stories, including sport, discoveries and lighter material. Published items retain source URLs and dates. Search evidence validation and persistent deduplication prevent accepting unverified URLs or repeating known headlines/articles; failed or empty selections retain the current display.
+
+New headlines are local world events. Residents see the current display on arrival without receiving earlier conversations. The operator can inspect state, errors, timing, selected-item history and exact request previews. Migration 6 leaves news disabled and room names intact; the approved room-1 rename/enabling is available through a stopped configuration preview. Version-6 configuration stores settings, not runtime headlines. No dependency or additional credential is added. Movie/TV playback remains the final planned branch.
 
 ## Deferred scope
 
-News selection and movie/TV playback are approved later FLAME-148 stages. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
+Movie/TV playback is the final approved FLAME-148 stage. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
 
 ## Release boundaries
 

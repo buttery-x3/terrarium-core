@@ -29,6 +29,7 @@ import {
 import { Scheduler } from './scheduler.js';
 import { performDecision, previewDecision } from './reflection.js';
 import { performRelationshipSummary, previewRelationshipSummary } from './relationships.js';
+import { performNews, previewNews } from './news.js';
 
 function conversationMarkdown(snapshot: ConversationExport) {
   const label = (value: string) => value
@@ -100,11 +101,13 @@ export async function createApplication(options: {
     config.emit('conversation:message', message);
     terrain.emit('conversation:message', message);
     config.emit('reflection:changed');
+    config.emit('news:changed');
   };
   const publishWorld = async () => {
     const state = await world.state();
     config.emit('world:state', state);
     config.emit('reflection:changed');
+    config.emit('news:changed');
     terrain.emit(
       'rooms:list',
       state.rooms.map((room) => room.id),
@@ -134,6 +137,10 @@ export async function createApplication(options: {
     async (agent, targetAgentId, signal, current, applied, attemptId) => {
       await performRelationshipSummary(world, agent, targetAgentId, options.provider, signal, current, applied, attemptId);
       config.emit('relationships:changed');
+    },
+    async (signal, current, applied, dueAt, requestedAt) => {
+      try { await performNews(world, options.provider, signal, current, applied, publishMessage, dueAt, requestedAt); }
+      finally { config.emit('news:changed'); }
     },
   );
   scheduler.watch();
@@ -242,6 +249,10 @@ export async function createApplication(options: {
       finally { importingConfiguration = false; }
     });
     command('reflection:list', z.object({}).strict(), () => world.reflections());
+    command('news:state', z.object({}).strict(), () => world.newsState());
+    command('news:history', z.object({ before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
+      input => world.newsHistory(input));
+    command('news:preview', z.object({}).strict(), () => previewNews(world));
     command('relationships:list', relationshipFilterSchema, input => world.relationshipPage(input));
     command('relationships:appraisals', relationshipFilterSchema, input => world.appraisals(input));
     command('relationships:appraisal', z.object({ id: z.string().min(1) }).strict(), input => world.appraisal(input.id));

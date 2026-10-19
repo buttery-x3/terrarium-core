@@ -8,8 +8,11 @@ type TurnHandler = (agent: Agent, signal: AbortSignal, stillCurrent: () => boole
   onApplied: () => void, attemptId?: string, opportunity?: DecisionOpportunity) => Promise<DecisionResult | void>;
 type SummaryHandler = (agent: Agent, targetAgentId: string, signal: AbortSignal, stillCurrent: () => boolean,
   onApplied: () => void, attemptId?: string) => Promise<void>;
+type NewsHandler = (signal: AbortSignal, stillCurrent: () => boolean, onApplied: () => void, dueAt: number, requestedAt: number) => Promise<void>;
 type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity; summaryTargetId?: string };
+type ActiveNews = { controller: AbortController; epoch: number; dueAt: number; requestedAt: number };
 type SummaryJob = { observerId: string; targetAgentId: string; dueAt: number; requestedAt: number; intervalMs: number };
+const newsFlightKey = Symbol('system-news');
 type Schedule = {
   revision: number; reflectionAt: number; emoteAt: number; emoteCheckedAt: number;
   speechPlan?: NonNullable<DecisionOpportunity['speechPlan']>; engagementAt?: number;
@@ -24,7 +27,13 @@ export class Scheduler {
   private activity = new Map<string, AgentActivity>();
   private schedules = new Map<string, Schedule>();
   private summaries = new Map<string, SummaryJob>();
-  private flights = new Map<string, Promise<unknown>>();
+  private flights = new Map<string | symbol, Promise<unknown>>();
+  private newsActive?: ActiveNews;
+  private newsDueAt?: number;
+  private newsRequestedAt?: number;
+  private newsIntervalMs = 600000;
+  private newsEnabled = false;
+  private newsError?: string;
   private ticking = false;
   private timer?: ReturnType<typeof setInterval>;
   private error?: string;
@@ -33,7 +42,8 @@ export class Scheduler {
 
   constructor(private world: World, private handler: TurnHandler, private publish: (state: RunState) => void,
     private options = { concurrency: 4, timeoutMs: 60000, retries: 2, backoffMs: 1000 },
-    private summaryHandler?: SummaryHandler) {}
+    private summaryHandler?: SummaryHandler,
+    private newsHandler?: NewsHandler) {}
 
   snapshot(): RunState {
     return { state: this.state, agents: [...this.activity.values()].map(activity => {
@@ -43,7 +53,8 @@ export class Scheduler {
         nextSpeechAt: schedule.speechPlan?.dueAt, nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
         nextRelationshipSummaryAt: this.nextSummary(activity.agentId)?.dueAt,
       } : {}) };
-    }), concurrency: this.options.concurrency, ...(this.error ? { error: this.error } : {}) };
+    }), concurrency: this.options.concurrency, ...(this.error ? { error: this.error } : {}),
+      ...(this.newsDueAt !== undefined ? { nextNewsAt: this.newsDueAt } : {}), ...(this.newsError ? { newsError: this.newsError } : {}) };
   }
   private emit() { this.publish(this.snapshot()); }
   private now() { return this.pausedAt ?? Date.now(); }
@@ -52,6 +63,9 @@ export class Scheduler {
   }
   private due(schedule: Schedule) {
     return Math.min(schedule.reflectionAt, schedule.emoteAt, schedule.speechPlan?.dueAt ?? Infinity, schedule.engagementAt ?? Infinity);
+  }
+  private occupiedSlots() {
+    return new Set([...this.active.keys(), ...this.flights.keys(), ...(this.newsActive ? [newsFlightKey] : [])]).size;
   }
   private nextSummary(observerId: string) {
     return [...this.summaries.values()].filter(job => job.observerId === observerId).sort((a, b) => a.dueAt - b.dueAt)[0];
@@ -92,6 +106,7 @@ export class Scheduler {
         if (schedule.speechPlan) schedule.speechPlan.dueAt += elapsed;
       }
       for (const job of this.summaries.values()) job.dueAt += elapsed;
+      if (this.newsDueAt !== undefined) this.newsDueAt += elapsed;
     }
     this.pausedAt = undefined; this.error = undefined; this.state = 'running';
     await this.world.syncEnergy(Date.now(), true);
@@ -107,15 +122,26 @@ export class Scheduler {
   async stop() {
     this.state = 'stopped'; this.pausedAt = undefined; this.epoch += 1; this.error = undefined;
     for (const active of this.active.values()) active.controller.abort();
+    this.newsActive?.controller.abort(); this.newsDueAt = undefined; this.newsRequestedAt = undefined; this.newsError = undefined;
     this.schedules.clear(); this.summaries.clear(); this.activity.clear(); this.emit();
     await Promise.allSettled([this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error)), ...this.pending]);
     await this.world.clearEngagements();
   }
-  hasActiveWork() { return this.active.size > 0 || this.pending.size > 0 || this.flights.size > 0; }
+  hasActiveWork() { return this.active.size > 0 || Boolean(this.newsActive) || this.pending.size > 0 || this.flights.size > 0; }
 
   async changed() {
     try {
       const [agents, settings, reflections] = await Promise.all([this.world.agents(), this.world.settings(), this.world.reflections()]);
+      this.newsEnabled = Boolean(this.newsHandler && settings.value.news.enabled);
+      this.newsIntervalMs = settings.value.news.intervalMs;
+      if (!this.newsEnabled) {
+        this.newsActive?.controller.abort(); this.newsDueAt = undefined; this.newsError = undefined;
+      } else if (this.state !== 'stopped' && this.newsDueAt === undefined && !this.newsActive) {
+        const epoch = this.epoch, display = await this.world.newsDisplay(settings.value.news.roomId);
+        if (this.epoch === epoch && this.snapshot().state !== 'stopped') {
+          this.newsDueAt = this.now() + (display ? this.newsIntervalMs : 0); this.newsRequestedAt = Date.now();
+        }
+      }
       const enabled = new Map(agents.filter(agent => agent.enabled).map(agent => [agent.id, agent]));
       for (const [id, active] of this.active) if (enabled.get(id)?.revision !== active.revision) active.controller.abort();
       for (const id of this.schedules.keys()) if (!enabled.has(id)) { this.schedules.delete(id); this.activity.delete(id); }
@@ -168,6 +194,7 @@ export class Scheduler {
       if (this.state !== 'stopped') { this.state = 'paused'; this.pausedAt ??= Date.now(); }
       this.error = error.message + ' The run cannot continue without durable diagnostics. Choose Stop, resolve the problem, then Start.';
       for (const active of this.active.values()) active.controller.abort();
+      this.newsActive?.controller.abort();
     } else if (this.state !== 'stopped') {
       this.state = 'paused'; this.pausedAt ??= Date.now();
       this.error = 'Could not read saved agent state. Check the database, then resume.';
@@ -185,9 +212,10 @@ export class Scheduler {
       const agents = await this.world.agents();
       if (this.state !== 'running' || this.epoch !== epoch) return;
       agents.sort((a, b) => (this.activity.get(a.id)?.dueAt ?? Infinity) - (this.activity.get(b.id)?.dueAt ?? Infinity));
+      if ((this.newsDueAt ?? Infinity) <= (agents[0] ? this.activity.get(agents[0].id)?.dueAt ?? Infinity : Infinity)) this.startNews();
       for (const agent of agents) {
         // INVARIANT: a timed-out handler retains its slot until it actually settles.
-        if (new Set([...this.active.keys(), ...this.flights.keys()]).size >= this.options.concurrency) break;
+        if (this.occupiedSlots() >= this.options.concurrency) break;
         const schedule = this.schedules.get(agent.id), now = Date.now(), summary = this.nextSummary(agent.id);
         const dueAt = Math.min(schedule ? this.due(schedule) : Infinity, summary?.dueAt ?? Infinity);
         if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || dueAt > now) continue;
@@ -213,8 +241,47 @@ export class Scheduler {
         const task = this.run(agent, active);
         this.pending.add(task); void task.finally(() => this.pending.delete(task));
       }
+      this.startNews();
     } catch (error) { this.fail(error); }
     finally { this.ticking = false; }
+  }
+
+  private startNews() {
+    if (!this.newsHandler || !this.newsEnabled || this.state !== 'running' || this.newsActive || this.flights.has(newsFlightKey) ||
+      this.newsDueAt === undefined || this.newsDueAt > Date.now() || this.occupiedSlots() >= this.options.concurrency) return;
+    const active: ActiveNews = { controller: new AbortController(), epoch: this.epoch,
+      dueAt: this.newsDueAt, requestedAt: this.newsRequestedAt ?? this.newsDueAt };
+    this.newsActive = active; this.newsDueAt = undefined; this.newsError = undefined; this.emit();
+    const task = this.runNews(active);
+    this.pending.add(task); void task.finally(() => this.pending.delete(task));
+  }
+
+  private async runNews(active: ActiveNews) {
+    const controller = new AbortController(), signal = AbortSignal.any([active.controller.signal, controller.signal]);
+    const current = () => this.epoch === active.epoch && !signal.aborted && this.state !== 'stopped' && this.newsEnabled;
+    const timeout = setTimeout(() => controller.abort(new Error('The model request timed out.')), this.options.timeoutMs);
+    let cancel: (() => void) | undefined;
+    try {
+      const aborted = new Promise<never>((_, reject) => {
+        cancel = () => reject(signal.reason ?? new Error('News request cancelled.'));
+        signal.addEventListener('abort', cancel, { once: true }); if (signal.aborted) cancel();
+      });
+      const handler = this.newsHandler!(signal, current, () => {}, active.dueAt, active.requestedAt);
+      this.flights.set(newsFlightKey, handler);
+      const settledHandler = handler.finally(() => { if (this.flights.get(newsFlightKey) === handler) this.flights.delete(newsFlightKey); });
+      await Promise.race([settledHandler, aborted]);
+    } catch (error) {
+      if (error instanceof DiagnosticError) this.fail(error);
+      if (this.epoch === active.epoch && this.state !== 'stopped' && this.newsEnabled)
+        this.newsError = error instanceof Error ? error.message : 'The news request failed.';
+    } finally {
+      clearTimeout(timeout); if (cancel) signal.removeEventListener('abort', cancel);
+      if (this.newsActive === active) this.newsActive = undefined;
+      if (this.epoch === active.epoch && this.state !== 'stopped' && this.newsEnabled) {
+        this.newsDueAt = this.now() + this.newsIntervalMs; this.newsRequestedAt = Date.now();
+      }
+      this.emit();
+    }
   }
 
   private async run(agent: Agent, active: ActiveTurn) {
