@@ -483,14 +483,14 @@
     <p>Active energy rules: {activeSettings.energy.enabled ? "enabled" : "disabled"}; initial {activeSettings.energy.initial}; maximum {activeSettings.energy.maximum}; depletion {activeSettings.energy.depletionPerMinute} per running minute; low at {activeSettings.energy.lowThreshold} or below; meals fill to maximum.</p>
     <form on:submit|preventDefault={() => perform(async () => { await request("settings:save", settings); notice = "Shared settings saved."; })}>
       <h3>Reflection and action timing</h3>
-      <p>Reflection updates private character state and may schedule speech or emotes. Due speech and emote opportunities use fresh local context. Remaining inactive is valid; movement and eating do not wait for speech eligibility.</p>
+      <p>Reflection updates private character state and may schedule speech or emotes. Due speech and emote opportunities use fresh local context. Remaining inactive is valid. Movement does not wait for speech eligibility; eating follows the energy and food-source rules below.</p>
       {#each timingFields as field}
         <label>{field.label} (seconds)
           <input type="number" min="0.001" step="0.001" value={settings.scheduling[field.key] / 1000} required on:input={event => { settings.scheduling[field.key] = Math.round(event.currentTarget.valueAsNumber * 1000); }} />
         </label>
       {/each}
       <label><input type="checkbox" bind:checked={settings.scheduling.engagementEnabled} /> Allow subscriptions to one local exchange per agent</label>
-      <p>A reply in a subscribed exchange can advance one speech opportunity within the cooldown. Repeated triggers combine; leaving the exchange removes the subscription.</p>
+      <p>A reply in a subscribed exchange creates a speech opportunity subject to the speech cooldown. The agent may remain silent. Repeated triggers combine; reflection keeps its regular cadence. Leaving the exchange removes the subscription.</p>
       <h3>Relationship appraisals and summaries</h3>
       <label>Maximum appraisals per reflection <input type="number" min="0" max="5" step="1" bind:value={settings.relationships.maxAppraisalsPerReflection} required /></label>
       <label>Relationship summary interval (seconds) <input type="number" min="0.001" step="0.001" value={settings.relationships.summaryIntervalMs / 1000} required on:input={event => { settings.relationships.summaryIntervalMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
@@ -528,7 +528,7 @@
       <label>Maximum energy <input type="number" min="0.01" step="any" bind:value={settings.energy.maximum} required /></label>
       <label>Depletion per running minute <input type="number" min="0" step="any" bind:value={settings.energy.depletionPerMinute} required /></label>
       <label>Low energy at or below <input type="number" min="0" max={settings.energy.maximum} step="any" bind:value={settings.energy.lowThreshold} required /></label>
-      <p>Meals fill to maximum. Decay freezes while paused, stopped, individually disabled or offline. Stop/restart preserves energy. Zero energy does not restrict actions. At least one food-source room is required when enabled.</p>
+      <p>Eating requires enabled energy, a food-source current room, energy at or below the low threshold and energy below maximum. Meals fill to maximum. Decay freezes while paused, stopped, individually disabled or offline. Stop/restart preserves energy. Zero energy does not restrict movement or speech. At least one food-source room is required when enabled.</p>
       <h3>Shared prompt text</h3>
       <p>Each operation uses its applicable sections below, followed by resolved context and enforced protocol constraints. Preview the operation to inspect the exact request order. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}

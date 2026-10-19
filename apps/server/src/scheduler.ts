@@ -21,6 +21,7 @@ const newsFlightKey = Symbol('system-news');
 type Schedule = {
   revision: number; reflectionAt: number; emoteAt: number; emoteCheckedAt: number;
   speechPlan?: NonNullable<DecisionOpportunity['speechPlan']>; engagementAt?: number;
+  engagementTrigger?: DecisionOpportunity['engagementTrigger'];
   engagement?: { roomId: string; rootMessageId: string; targetAgentId: string } | null;
   lastDecisionAt: number; lastSpeechAt: number; timing: Settings['scheduling'];
 };
@@ -56,8 +57,9 @@ export class Scheduler {
     return { state: this.state, agents: [...this.activity.values()].map(activity => {
       const schedule = this.schedules.get(activity.agentId);
       return { ...activity, ...(schedule ? {
-        nextReflectionAt: Math.min(schedule.reflectionAt, schedule.engagementAt ?? Infinity),
-        nextSpeechAt: schedule.speechPlan?.dueAt, nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
+        nextReflectionAt: schedule.reflectionAt,
+        nextSpeechAt: schedule.engagementAt === undefined ? schedule.speechPlan?.dueAt : Math.min(schedule.speechPlan?.dueAt ?? Infinity, schedule.engagementAt),
+        nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
         nextRelationshipSummaryAt: this.nextSummary(activity.agentId)?.dueAt,
         nextVoteAt: this.votes.get(activity.agentId)?.requestedAt,
       } : {}) };
@@ -183,11 +185,20 @@ export class Scheduler {
           this.schedules.set(agent.id, schedule);
         }
         if (!settings.value.activity.emotesEnabled) schedule.emoteAt = Infinity;
-        const engagement = schedule.engagement;
+        const engagement = schedule.engagement, savedEngagement = reflections.find(item => item.agentId === agent.id)?.engagement;
         if (engagement && (!settings.value.scheduling.engagementEnabled || agent.roomId !== engagement.roomId ||
-          !agents.some(other => other.id === engagement.targetAgentId && other.enabled && other.roomId === agent.roomId))) {
-          schedule.engagement = null; schedule.engagementAt = undefined;
+          !agents.some(other => other.id === engagement.targetAgentId && other.enabled && other.roomId === agent.roomId) ||
+          savedEngagement?.roomId !== engagement.roomId || savedEngagement?.rootMessageId !== engagement.rootMessageId ||
+          savedEngagement?.targetAgentId !== engagement.targetAgentId)) {
+          schedule.engagement = null; schedule.engagementAt = undefined; schedule.engagementTrigger = undefined;
         }
+        if (schedule.engagementTrigger && !agents.some(other => other.id === schedule!.engagementTrigger!.sourceAgentId && other.enabled && other.roomId === agent.roomId)) {
+          schedule.engagementAt = undefined; schedule.engagementTrigger = undefined;
+        }
+        const active = this.active.get(agent.id), trigger = active?.opportunity.engagementTrigger;
+        if (trigger && !active?.applied && (!schedule.engagement || schedule.engagement.rootMessageId !== trigger.rootMessageId ||
+          schedule.engagement.targetAgentId !== trigger.targetAgentId ||
+          !agents.some(other => other.id === trigger.sourceAgentId && other.enabled && other.roomId === agent.roomId))) active!.controller.abort();
         if (schedule.speechPlan?.targetAgentId && !agents.some(other => other.id === schedule!.speechPlan!.targetAgentId && other.enabled && other.roomId === agent.roomId))
           schedule.speechPlan = undefined;
         this.refreshActivity(agent.id, this.activity.get(agent.id)?.error);
@@ -201,7 +212,13 @@ export class Scheduler {
     for (const [id, schedule] of this.schedules) {
       const engagement = schedule.engagement;
       if (message.type === 'departure' && message.agentId === engagement?.targetAgentId && message.roomId === engagement.roomId) {
-        schedule.engagement = null; schedule.engagementAt = undefined;
+        schedule.engagement = null; schedule.engagementAt = undefined; schedule.engagementTrigger = undefined;
+      }
+      if (message.type === 'departure') {
+        if (message.agentId === schedule.engagementTrigger?.sourceAgentId) { schedule.engagementAt = undefined; schedule.engagementTrigger = undefined; }
+        const active = this.active.get(id), trigger = active?.opportunity.engagementTrigger;
+        if (trigger && !active?.applied && (message.agentId === trigger.targetAgentId || message.agentId === trigger.sourceAgentId)) active!.controller.abort();
+        this.refreshActivity(id);
       }
       if (message.type === 'departure' && message.agentId === schedule.speechPlan?.targetAgentId) {
         schedule.speechPlan = undefined; this.refreshActivity(id);
@@ -210,6 +227,8 @@ export class Scheduler {
         engagement.roomId !== message.roomId || engagement.rootMessageId !== (message.conversationId ?? message.id)) continue;
       const dueAt = Math.max(this.now(), schedule.lastDecisionAt + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
       schedule.engagementAt = Math.min(schedule.engagementAt ?? Infinity, dueAt);
+      schedule.engagementTrigger = { rootMessageId: engagement.rootMessageId, targetAgentId: engagement.targetAgentId,
+        replyToId: message.id, sourceAgentId: message.agentId, requestedAt: Date.now() };
       this.refreshActivity(id);
     }
     this.emit();
@@ -246,14 +265,17 @@ export class Scheduler {
         const schedule = this.schedules.get(agent.id), now = Date.now(), summary = this.nextSummary(agent.id), vote = this.votes.get(agent.id);
         const dueAt = Math.min(schedule ? this.due(schedule) : Infinity, summary?.dueAt ?? Infinity, vote?.requestedAt ?? Infinity);
         if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || dueAt > now) continue;
-        const voting = vote?.requestedAt === dueAt, summarizing = !voting && summary?.dueAt === dueAt, engagement = (schedule.engagementAt ?? Infinity) <= now;
+        const voting = vote?.requestedAt === dueAt, summarizing = !voting && summary?.dueAt === dueAt,
+          engagement = Boolean(schedule.engagementTrigger && (schedule.engagementAt ?? Infinity) <= now),
+          plannedSpeech = (schedule.speechPlan?.dueAt ?? Infinity) <= now;
         const opportunity: DecisionOpportunity = voting || summarizing ? { reflection: false, speech: false, emote: false,
           requestedAt: voting ? vote.requestedAt : summary!.requestedAt, reason: 'cadence' } : {
-          reflection: schedule.reflectionAt <= now || engagement,
-          speech: (schedule.speechPlan?.dueAt ?? Infinity) <= now, emote: schedule.emoteAt <= now,
-          requestedAt: schedule.speechPlan?.dueAt === dueAt ? schedule.speechPlan.requestedAt : dueAt,
-          reason: engagement ? 'engagement' : (schedule.speechPlan?.dueAt ?? Infinity) <= now ? 'scheduled-speech' : 'cadence',
-          ...((schedule.speechPlan?.dueAt ?? Infinity) <= now ? { speechPlan: { ...schedule.speechPlan! } } : {}),
+          reflection: schedule.reflectionAt <= now,
+          speech: plannedSpeech || engagement, emote: schedule.emoteAt <= now,
+          requestedAt: schedule.speechPlan?.dueAt === dueAt ? schedule.speechPlan.requestedAt : engagement ? schedule.engagementTrigger!.requestedAt : dueAt,
+          reason: engagement ? 'engagement' : plannedSpeech ? 'scheduled-speech' : 'cadence',
+          ...(plannedSpeech ? { speechPlan: { ...schedule.speechPlan! } } : {}),
+          ...(engagement ? { engagementTrigger: { ...schedule.engagementTrigger! } } : {}),
           ...(schedule.speechPlan && schedule.speechPlan.dueAt > now ? {
             pendingSpeechPlan: { ...schedule.speechPlan, remainingMs: schedule.speechPlan.dueAt - now },
           } : {}),
@@ -263,8 +285,9 @@ export class Scheduler {
           turnId: await this.world.scheduleTurn(agent, dueAt, operation, opportunity.requestedAt), opportunity,
           ...(summarizing ? { summaryTargetId: summary!.targetAgentId } : {}), ...(voting ? { ballotId: vote!.ballotId } : {}) };
         if (this.state !== 'running' || this.epoch !== epoch) { await this.world.endTurn(active.turnId, 'cancelled-before-start'); break; }
-        if (opportunity.reflection) { schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs; schedule.engagementAt = undefined; }
-        if (opportunity.speech) schedule.speechPlan = undefined;
+        if (opportunity.reflection) schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs;
+        if (opportunity.engagementTrigger) { schedule.engagementAt = undefined; schedule.engagementTrigger = undefined; }
+        if (opportunity.speechPlan) schedule.speechPlan = undefined;
         if (opportunity.emote) { schedule.emoteCheckedAt = now; schedule.emoteAt = now + this.emoteDelay(schedule.timing); }
         this.active.set(agent.id, active);
         this.activity.set(agent.id, { agentId: agent.id, state: 'running', operation, turnId: active.turnId }); this.emit();
@@ -392,7 +415,7 @@ export class Scheduler {
             schedule.emoteAt = now + (requestedEmote ? schedule.timing.emoteMinIntervalMs : this.emoteDelay(schedule.timing));
           }
           if (latest.revision !== agent.revision && schedule.revision === agent.revision) {
-            schedule.revision = latest.revision; schedule.speechPlan = undefined; schedule.engagement = null; schedule.engagementAt = undefined;
+            schedule.revision = latest.revision; schedule.speechPlan = undefined; schedule.engagement = null; schedule.engagementAt = undefined; schedule.engagementTrigger = undefined;
           }
           this.refreshActivity(agent.id, failure);
         } else if (schedule && latest?.enabled && this.state !== 'stopped') this.refreshActivity(agent.id);
@@ -406,15 +429,21 @@ export class Scheduler {
     const schedule = this.schedules.get(agent.id);
     if (!schedule || schedule.revision !== active.revision) return;
     const now = this.now();
-    if (result.action?.type === 'speak') schedule.lastSpeechAt = now;
+    if (result.action?.type === 'speak') {
+      schedule.lastSpeechAt = now;
+      if (schedule.speechPlan) schedule.speechPlan.dueAt = Math.max(schedule.speechPlan.dueAt, now + schedule.timing.speechCooldownMs);
+    }
     if (!result.reflectionProcessed) return;
     if (result.speechPlan) {
       const delayMs = Math.max(schedule.timing.speechMinDelayMs, Math.min(schedule.timing.speechMaxDelayMs, result.speechPlan.delayMs));
       schedule.speechPlan = { dueAt: Math.max(now + delayMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs),
         requestedAt: Date.now(), replyToId: result.speechPlan.replyToId, targetAgentId: result.speechPlan.targetAgentId };
     } else schedule.speechPlan = undefined;
+    const previous = schedule.engagement;
     schedule.engagement = result.engagement ? { ...result.engagement, roomId: agent.roomId } : null;
-    if (!schedule.engagement) schedule.engagementAt = undefined;
+    if (!schedule.engagement || previous?.rootMessageId !== schedule.engagement.rootMessageId || previous?.targetAgentId !== schedule.engagement.targetAgentId) {
+      schedule.engagementAt = undefined; schedule.engagementTrigger = undefined;
+    }
     if (result.requestEmote && Number.isFinite(schedule.emoteAt))
       schedule.emoteAt = Math.min(schedule.emoteAt, Math.max(now, schedule.emoteCheckedAt + schedule.timing.emoteMinIntervalMs));
   }

@@ -127,9 +127,72 @@ describe('persisted world', () => {
     expect((await world.history({ roomId: food.id })).messages.map(item => item.type)).toEqual(['arrival']);
     await world.applyAction(agent.id, agent.revision, { type: 'move', roomId: 'room-2' }, () => true);
     agent = (await world.agent(agent.id))!;
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true)).rejects.toThrow('already at maximum');
+    await world.db.updateTable('agents').set({ energy: 25 }).where('id', '=', agent.id).execute();
     await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true);
     expect((await world.agent(agent.id))?.energy).toBe(100);
     await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => false)).rejects.toThrow('no longer current');
+  });
+
+  it.each([25.001, 97, 98, 99, 100])('rejects a meal at %s energy without changing state', async initial => {
+    const world = await fixture();
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial } });
+    const agent = await world.saveAgent(agentInput);
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true)).rejects.toMatchObject({ category: 'world-validation' });
+    expect((await world.agent(agent.id))?.energy).toBe(initial);
+    expect((await world.history({ roomId: agent.roomId })).messages).toEqual([]);
+  });
+
+  it('uses the configured low threshold inclusively and rejects full energy even when the threshold equals maximum', async () => {
+    const world = await fixture();
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 0, lowThreshold: 0 } });
+    const agent = await world.saveAgent(agentInput);
+    await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true);
+    expect((await world.agent(agent.id))?.energy).toBe(100);
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, lowThreshold: 100 } });
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true)).rejects.toThrow('already at maximum');
+    await world.db.updateTable('agents').set({ energy: 99 }).where('id', '=', agent.id).execute();
+    await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true);
+    expect((await world.agent(agent.id))?.energy).toBe(100);
+  });
+
+  it('checks fresh elapsed energy at application and records the actual meal boundary', async () => {
+    const world = await fixture();
+    let now = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 30 } });
+    const agent = await world.saveAgent(agentInput);
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, now), 1, agent);
+    await world.updateDiagnostic(attempt, { energySeen: 30 });
+    await world.syncEnergy(now, true);
+    now = 60000;
+    await world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true, attempt);
+    expect((await world.diagnostic(attempt)).details).toMatchObject({ energySeen: 30, energyBefore: 25, energyAfter: 100, passiveDecay: 5 });
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true)).rejects.toThrow('already at maximum');
+  });
+
+  it('rolls back reflection and appraisals when a high-energy meal is denied', async () => {
+    const world = await fixture();
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 97 },
+      prompts: { ...defaultSettings.prompts, energy: 'Authored energy guidance is preserved.' } });
+    const agent = await world.saveAgent(agentInput), author = await world.saveAgent({ ...agentInput, name: 'Author' });
+    const source = (await world.applyAction(author.id, author.revision, { type: 'speak', message: 'An observed contribution.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { reaction: 'Existing reaction', intention: 'Existing intention' }, () => true);
+    const reflection = await world.reflection(agent.id), attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await expect(world.applyAction(agent.id, agent.revision, { type: 'eat' }, () => true, attempt, {
+      sourceIds: [source.id], reflection: { reaction: 'Uncommitted reaction', intention: 'Eat now' },
+      appraisals: [{ sourceId: source.id, reaction: 'like', reason: 'A useful contribution.' }],
+    })).rejects.toThrow('configured low-energy threshold');
+    expect(await world.reflection(agent.id)).toEqual(reflection);
+    expect((await world.appraisals()).appraisals).toEqual([]);
+    expect((await world.relationshipPage()).relationships).toEqual([]);
+    expect((await world.agent(agent.id))?.energy).toBe(97);
+    expect((await world.diagnostic(attempt)).outcome).toBe('running');
+    expect((await world.settings()).value.prompts.energy).toBe('Authored energy guidance is preserved.');
   });
 
   it('rolls back a world mutation if its diagnostic evidence cannot be saved', async () => {

@@ -194,4 +194,101 @@ describe('private reflection decisions', () => {
     expect((await world.reflection(agent.id)).reaction).toBe('Moving on.');
     expect((await world.diagnostic(attempt)).outcome).toBe('applied-notification-failure');
   });
+
+  it.each(['speak', 'wait'] as const)('allows an engagement %s immediately without another reflection or speech plan', async type => {
+    const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'A fresh question.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { reaction: 'Interested.', intention: 'Hear them out.',
+      engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
+    const before = await world.reflection(agent.id), offered: DecisionOpportunity = { ...opportunity, reflection: false, speech: true, reason: 'engagement',
+      engagementTrigger: { rootMessageId: source.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: companion.id, requestedAt: 1000 } };
+    const preview = await previewDecision(world, agent, offered);
+    const action = type === 'speak' ? { type, message: 'Yes, that interests me.' } : { type };
+    const result = await performDecision(world, agent, { name: 'fake', complete: async request => {
+      expect(request.responseFormat?.schema).toEqual(decisionJsonSchema(offered, true));
+      expect(request.messages[1].content).toContain('A fresh question.');
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      return { content: JSON.stringify({ action }) };
+    } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);
+    expect(result.reflectionProcessed).toBe(false); expect(result.speechPlan).toBeUndefined();
+    expect(await world.reflection(agent.id)).toMatchObject({ reaction: before.reaction, intention: before.intention, reflectedAt: before.reflectedAt, engagement: before.engagement });
+    const memory = await world.memory(agent.id);
+    if (type === 'speak') expect(memory.at(-1)).toMatchObject({ content: action.message, replyToId: source.id, conversationId: source.id });
+    else expect(memory).toEqual([source]);
+  });
+
+  it.each(['partner-departure', 'partner-disable', 'disengage', 'feature-disable', 'source-departure'] as const)
+    ('cancels an engagement response when %s happens during generation', async change => {
+      const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' }),
+        participant = await world.saveAgent({ ...input, name: 'Participant' });
+      const root = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Start an exchange.' }, () => true)).message!;
+      const source = (await world.applyAction(participant.id, participant.revision, { type: 'speak', message: 'Another contribution.', replyToId: root.id }, () => true)).message!;
+      await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: root.id, targetAgentId: companion.id } }, () => true);
+      const offered: DecisionOpportunity = { ...opportunity, reflection: false, speech: true, reason: 'engagement',
+        engagementTrigger: { rootMessageId: root.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: participant.id, requestedAt: 1000 } };
+      await expect(performDecision(world, agent, { name: 'fake', complete: async () => {
+        if (change === 'partner-departure' || change === 'source-departure') {
+          const actor = change === 'partner-departure' ? companion : participant;
+          await world.applyAction(actor.id, actor.revision, { type: 'move', roomId: 'room-2' }, () => true);
+        } else if (change === 'partner-disable') await world.saveAgent({ ...input, id: companion.id, name: companion.name, enabled: false });
+        else if (change === 'disengage') await world.saveReflection(agent.id, agent.revision, { engagement: null }, () => true);
+        else await world.saveSettings({ ...defaultSettings, scheduling: { ...defaultSettings.scheduling, engagementEnabled: false } });
+        return { content: '{"action":{"type":"speak","message":"A stale reply."}}' };
+      } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered)).rejects.toMatchObject({ category: 'stale' });
+      expect((await world.memory(agent.id)).some(message => message.content === 'A stale reply.')).toBe(false);
+    });
+
+  it('does not request an engagement response when its source is outside the fresh observation snapshot', async () => {
+    const agent = await world.saveAgent({ ...input, contextMessageLimit: 1 }), companion = await world.saveAgent({ ...input, name: 'Companion' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Earlier question.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
+    await world.speak(agent.roomId, 'Newer observation.');
+    const complete = vi.fn(async () => ({ content: '{"action":{"type":"wait"}}' }));
+    await expect(performDecision(world, agent, { name: 'fake', complete }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined,
+      { ...opportunity, reflection: false, speech: true, reason: 'engagement', engagementTrigger: {
+        rootMessageId: source.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: companion.id, requestedAt: 1000,
+      } })).rejects.toMatchObject({ category: 'stale' });
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit scheduled reply target when a different subscribed exchange is also due', async () => {
+    const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' }),
+      other = await world.saveAgent({ ...input, name: 'Other' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Subscribed exchange.' }, () => true)).message!;
+    const planned = (await world.applyAction(other.id, other.revision, { type: 'speak', message: 'Planned reply thread.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
+    await performDecision(world, agent, providerFor({ action: { type: 'speak', message: 'My scheduled answer.' } }), new AbortController().signal,
+      () => true, () => {}, async () => {}, () => {}, undefined, { ...opportunity, reflection: false, speech: true, reason: 'engagement',
+        speechPlan: { dueAt: 1000, requestedAt: 0, replyToId: planned.id, targetAgentId: other.id },
+        engagementTrigger: { rootMessageId: source.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: companion.id, requestedAt: 1000 } });
+    expect((await world.memory(agent.id)).at(-1)).toMatchObject({ content: 'My scheduled answer.', replyToId: planned.id, conversationId: planned.id });
+  });
+
+  it('cancels the entire coalesced response when its engagement becomes stale during generation', async () => {
+    const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' }),
+      other = await world.saveAgent({ ...input, name: 'Other' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Subscribed exchange.' }, () => true)).message!;
+    const planned = (await world.applyAction(other.id, other.revision, { type: 'speak', message: 'Separate planned thread.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
+    await expect(performDecision(world, agent, { name: 'fake', complete: async () => {
+      await world.applyAction(companion.id, companion.revision, { type: 'move', roomId: 'room-2' }, () => true);
+      return { content: JSON.stringify({ action: { type: 'speak', message: 'Do not publish this mixed stale response.', replyToId: planned.id } }) };
+    } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined,
+    { ...opportunity, reflection: false, speech: true, reason: 'engagement',
+      speechPlan: { dueAt: 1000, requestedAt: 0, replyToId: planned.id, targetAgentId: other.id },
+      engagementTrigger: { rootMessageId: source.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: companion.id, requestedAt: 1000 } }))
+      .rejects.toMatchObject({ category: 'stale' });
+    expect((await world.memory(agent.id)).some(message => message.content === 'Do not publish this mixed stale response.')).toBe(false);
+  });
+
+  it.each([25, 97, 99, 100])('exposes and enforces low-energy eating consistently at energy %s', async energy => {
+    await world.saveRoom({ id: 'room-1', name: 'Kitchen', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: energy } });
+    const agent = await world.saveAgent(input), before = await world.reflection(agent.id), preview = await previewDecision(world, agent, opportunity);
+    const schema = (preview.payload.text as { format: { schema: { properties: { action: unknown } } } }).format.schema.properties.action;
+    expect(JSON.stringify(schema).includes('"eat"')).toBe(energy <= 25);
+    const attempt = decide(agent, { ...quiet, reflection: { reaction: 'Eat then leave.', intention: null }, action: { type: 'eat' } });
+    if (energy <= 25) { await attempt; expect((await world.agent(agent.id))?.energy).toBe(100); }
+    else { await expect(attempt).rejects.toMatchObject({ category: 'world-validation' }); expect(await world.reflection(agent.id)).toEqual(before); }
+  });
 });

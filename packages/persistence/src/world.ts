@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema,
+import { actionSchema, canEat, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema,
   appraisalProposalSchema, relationshipFilterSchema, relationshipSummaryProposalSchema, newsProposalSchema, newsHistoryFilterSchema, canonicalNewsUrl, mediaVoteChoiceSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import { sql } from 'kysely';
@@ -65,6 +65,7 @@ export type ReflectionUpdate = { reaction?: string | null; intention?: string | 
 export type DecisionUpdate = {
   sourceIds?: readonly string[]; reflection?: { reaction: string | null; intention: string | null } | null;
   engagement?: ReflectionState['engagement']; targetAgentId?: string | null;
+  engagementGuard?: NonNullable<ReflectionState['engagement']> & { replyToId: string; sourceAgentId: string };
   appraisals?: AppraisalProposal[];
 };
 const emptyReflection = (agentId: string): ReflectionState => ({ agentId, reflectedAt: null, reaction: null, intention: null,
@@ -1114,6 +1115,20 @@ export class World {
       const settings = (await world.settings()).value;
       if (action.type === 'emote' && !settings.activity.emotesEnabled)
         throw new ActionError('world-validation', 'Emotes are disabled; use wait for a quiet turn.');
+      if (decision?.engagementGuard) {
+        const guard = decision.engagementGuard, saved = (await world.reflection(agentId)).engagement;
+        const partner = await world.agent(guard.targetAgentId);
+        if (!settings.scheduling.engagementEnabled || !saved || saved.roomId !== guard.roomId || saved.rootMessageId !== guard.rootMessageId ||
+          saved.targetAgentId !== guard.targetAgentId || row.room_id !== guard.roomId || !partner || !partner.enabled ||
+          partner.id === agentId || partner.roomId !== row.room_id)
+          throw new ActionError('stale', 'This conversation engagement is no longer current.');
+        const source = await world.validateReply(agentId, guard.replyToId, decision.sourceIds).catch(error => {
+          if (error instanceof ActionError) throw new ActionError('stale', 'The triggering conversation contribution is no longer current.');
+          throw error;
+        });
+        if (source.conversationId !== guard.rootMessageId || source.agentId !== guard.sourceAgentId)
+          throw new ActionError('stale', 'The triggering contribution does not belong to this conversation engagement.');
+      }
       if (decision?.targetAgentId) {
         const target = await world.agent(decision.targetAgentId);
         if (!target || !target.enabled || target.id === agentId || target.roomId !== row.room_id)
@@ -1166,6 +1181,8 @@ export class World {
         const room = await db.selectFrom('rooms').selectAll().where('id', '=', row.room_id).executeTakeFirst();
         if (!energy.enabled) throw new ActionError('world-validation', 'Energy is disabled; eating is unavailable.');
         if (!room?.is_food_source) throw new ActionError('world-validation', 'Eating requires a food-source room.');
+        if (!canEat(energy, row.energy, Boolean(room.is_food_source))) throw new ActionError('world-validation',
+          row.energy >= energy.maximum ? 'Energy is already at maximum; eating is unavailable.' : 'Eating requires energy at or below the configured low-energy threshold.');
         energyAfter = energy.maximum;
         await db.updateTable('agents').set({ energy: energyAfter }).where('id', '=', row.id).execute();
       }

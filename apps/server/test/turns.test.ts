@@ -163,6 +163,46 @@ describe('agent turns and scheduling', () => {
     expect((await world.history({ roomId: agent.roomId })).messages).toHaveLength(0);
   });
 
+  it.each([
+    { energy: 0, enabled: true, food: true, eligible: true },
+    { energy: 25, enabled: true, food: true, eligible: true },
+    { energy: 25.001, enabled: true, food: true, eligible: false },
+    { energy: 97, enabled: true, food: true, eligible: false },
+    { energy: 100, enabled: true, food: true, eligible: false },
+    { energy: 10, enabled: false, food: true, eligible: false },
+    { energy: 10, enabled: true, food: false, eligible: false },
+  ])('offers eating consistently in preview and request for $energy energy, enabled=$enabled, food=$food', async ({ energy, enabled, food, eligible }) => {
+    await world.saveRoom({ id: 'room-1', name: 'Current room', description: '', isFoodSource: food });
+    await world.saveRoom({ id: 'room-2', name: 'Other food source', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled, initial: energy, lowThreshold: 25 },
+      prompts: { ...defaultSettings.prompts, energy: 'AUTHORED ENERGY GUIDANCE' } });
+    const agent = await world.saveAgent(input), preview = await previewPrompt(world, agent);
+    const complete = vi.fn(async (request: LmCompletionRequest) => {
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      const schema = request.responseFormat!.schema as ReturnType<typeof actionJsonSchema>;
+      expect(schema.properties.action.anyOf.some(option => option.properties.type.enum[0] === 'eat')).toBe(eligible);
+      expect(request.messages[0].content).toContain('AUTHORED ENERGY GUIDANCE');
+      expect(request.messages[0].content).toContain('energy at or below energyRules.lowThreshold');
+      return { content: '{"action":{"type":"wait"}}' };
+    });
+    await performTurn(world, agent, { name: 'fake', complete }, new AbortController().signal, () => true, () => {}, async () => {});
+    expect(complete).toHaveBeenCalledOnce();
+    expect((await world.settings()).value.prompts.energy).toBe('AUTHORED ENERGY GUIDANCE');
+  });
+
+  it('rejects a high-energy meal returned outside the offered actions and records the rejection', async () => {
+    await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 99 } });
+    const agent = await world.saveAgent(input), notify = vi.fn();
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await expect(performTurn(world, agent, { name: 'fake', complete: async () => ({ content: '{"action":{"type":"eat"}}' }) },
+      new AbortController().signal, () => true, notify, async () => {}, () => {}, attempt)).rejects.toThrow('low-energy threshold');
+    expect((await world.agent(agent.id))?.energy).toBe(99);
+    expect((await world.diagnostic(attempt)).outcome).toBe('world-validation');
+    expect(notify).not.toHaveBeenCalled();
+    expect((await world.history({ roomId: agent.roomId })).messages).toHaveLength(0);
+  });
+
   it('keeps accepted speech applied after notification failure and correlates retries', async () => {
     await world.saveAgent(input);
     const complete = vi.fn().mockRejectedValueOnce(new Error('Provider failed')).mockResolvedValue({ content: '{"action":{"type":"speak","message":"Saved once"}}' });
@@ -194,19 +234,19 @@ describe('agent turns and scheduling', () => {
     let now = 0;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
     await world.saveRoom({ id: 'room-1', name: 'Food', description: '', isFoodSource: true });
-    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 30 } });
+    await world.saveSettings({ ...defaultSettings, energy: { ...defaultSettings.energy, enabled: true, initial: 25 } });
     const agent = await world.saveAgent(input), result = deferred();
     const complete = vi.fn(() => result.promise);
     const scheduler = makeScheduler((value, signal, current, applied, attempt) => performTurn(world, value, { name: 'fake', complete }, signal, current, () => {}, async () => {}, applied, attempt));
     await scheduler.start(); await scheduler.tick();
     await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
     now = 60000; scheduler.pause();
-    await vi.waitFor(async () => expect((await world.agent(agent.id))?.energy).toBe(25));
+    await vi.waitFor(async () => expect((await world.agent(agent.id))?.energy).toBe(20));
     now = 600000;
     result.resolve({ content: '{"action":{"type":"eat"}}' });
     await vi.waitFor(async () => expect((await world.agent(agent.id))?.energy).toBe(100));
     const records = (await world.diagnostics({ action: 'eat' }, true)).records;
-    expect(records[0].details).toMatchObject({ energySeen: 30, energyBefore: 25, energyAfter: 100, passiveDecay: 5 });
+    expect(records[0].details).toMatchObject({ energySeen: 25, energyBefore: 20, energyAfter: 100, passiveDecay: 5 });
     scheduler.stop();
     await scheduler.start(); scheduler.pause();
     expect((await world.agent(agent.id))?.energy).toBe(100);
@@ -716,24 +756,29 @@ describe('independent decision scheduling', () => {
       if (value.id !== agent.id) return { reflectionProcessed: true, action: { type: 'wait' } };
       decisions += 1; seen.push(opportunity!);
       if (decisions === 2) return pending.promise;
+      if (!opportunity!.reflection) return { reflectionProcessed: false, action: { type: 'wait' } };
+      await world.saveReflection(agent.id, agent.revision, { engagement: { ...engagement, roomId: agent.roomId } }, () => true);
       return { reflectionProcessed: true, engagement, action: { type: 'wait' } };
     });
     await scheduler.start(); await scheduler.tick(); await finished(scheduler);
     now = 1001000;
     for (let index = 0; index < 5; index++) scheduler.observe({ ...source, id: `reply-${index}`, conversationId: source.id });
-    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextReflectionAt).toBe(1015000);
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)).toMatchObject({ nextReflectionAt: 1060000, nextSpeechAt: 1015000 });
     now = 1014999; await scheduler.tick(); expect(decisions).toBe(1);
     now = 1015000; await scheduler.tick();
     await vi.waitFor(() => expect(decisions).toBe(2));
     now = 1016000;
     for (let index = 0; index < 5; index++) scheduler.observe({ ...source, id: `active-reply-${index}`, conversationId: source.id });
-    now = 1017000; pending.resolve({ reflectionProcessed: true, engagement, action: { type: 'wait' } });
+    now = 1017000; pending.resolve({ reflectionProcessed: false, action: { type: 'wait' } });
     await finished(scheduler);
-    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextReflectionAt).toBe(1032000);
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)).toMatchObject({ nextReflectionAt: 1060000, nextSpeechAt: 1032000 });
     now = 1031999; await scheduler.tick(); expect(decisions).toBe(2);
     now = 1032000; await scheduler.tick(); await finished(scheduler);
     expect(decisions).toBe(3);
-    expect(seen.slice(1).every(value => value.reason === 'engagement')).toBe(true);
+    expect(seen.slice(1).every(value => value.reason === 'engagement' && value.speech && !value.reflection)).toBe(true);
+    expect(seen[1].engagementTrigger).toMatchObject({ replyToId: 'reply-4', sourceAgentId: companion.id, requestedAt: 1001000 });
+    expect(seen[2].engagementTrigger?.replyToId).toBe('active-reply-4');
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextSpeechAt).toBeUndefined();
   });
 
   it('preserves the remaining exchange cooldown across Pause', async () => {
@@ -742,13 +787,95 @@ describe('independent decision scheduling', () => {
     const agent = await world.saveAgent({ ...input, timingOverrides });
     const companion = await world.saveAgent({ ...input, name: 'Companion', timingOverrides });
     const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'An exchange.' }, () => true)).message!;
-    const scheduler = makeScheduler(async value => ({ reflectionProcessed: true, action: { type: 'wait' },
-      ...(value.id === agent.id ? { engagement: { rootMessageId: source.id, targetAgentId: companion.id } } : {}) }));
+    const scheduler = makeScheduler(async value => {
+      const engagement = { rootMessageId: source.id, targetAgentId: companion.id };
+      if (value.id === agent.id) await world.saveReflection(agent.id, agent.revision, { engagement: { ...engagement, roomId: agent.roomId } }, () => true);
+      return { reflectionProcessed: true, action: { type: 'wait' }, ...(value.id === agent.id ? { engagement } : {}) };
+    });
     await scheduler.start(); await scheduler.tick(); await finished(scheduler);
     now = 1005000; scheduler.pause();
     now = 1105000; await scheduler.start();
     scheduler.observe({ ...source, id: 'new-reply', conversationId: source.id });
-    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextReflectionAt).toBe(1115000);
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)).toMatchObject({ nextReflectionAt: 1160000, nextSpeechAt: 1115000 });
+  });
+
+  it.each(['speak', 'wait'] as const)('preserves a future speech plan after engagement %s and clamps only actual speech', async type => {
+    let now = 1000000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const agent = await world.saveAgent({ ...input, timingOverrides }), companion = await world.saveAgent({ ...input, name: 'Companion', timingOverrides });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'An exchange.' }, () => true)).message!;
+    const engagement = { rootMessageId: source.id, targetAgentId: companion.id }, seen: DecisionOpportunity[] = [];
+    const scheduler = makeScheduler(async (value, _signal, _current, _applied, _attempt, offered) => {
+      if (value.id !== agent.id) return { reflectionProcessed: offered!.reflection, action: { type: 'wait' } };
+      seen.push(offered!);
+      if (!offered!.reflection) return { reflectionProcessed: false, action: type === 'speak' ? { type, message: 'A reply.' } : { type } };
+      await world.saveReflection(agent.id, agent.revision, { engagement: { ...engagement, roomId: agent.roomId } }, () => true);
+      return { reflectionProcessed: true, engagement, speechPlan: { delayMs: 20000, replyToId: source.id, targetAgentId: companion.id }, action: { type: 'wait' } };
+    });
+    await scheduler.start(); await scheduler.tick(); await finished(scheduler);
+    now = 1001000; scheduler.observe({ ...source, id: 'fresh-reply', conversationId: source.id });
+    now = 1015000; await scheduler.tick(); await finished(scheduler);
+    expect(seen[1]).toMatchObject({ reflection: false, speech: true, reason: 'engagement', pendingSpeechPlan: { dueAt: 1020000, remainingMs: 5000 } });
+    expect(seen[1].speechPlan).toBeUndefined();
+    const expected = type === 'speak' ? 1030000 : 1020000;
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)).toMatchObject({ nextReflectionAt: 1060000, nextSpeechAt: expected });
+    now = expected - 1; await scheduler.tick(); expect(seen).toHaveLength(2);
+    now = expected; await scheduler.tick(); await finished(scheduler);
+    expect(seen[2]).toMatchObject({ reflection: false, speech: true, reason: 'scheduled-speech', speechPlan: { replyToId: source.id } });
+  });
+
+  it('coalesces engagement, an independent due speech plan and a naturally due reflection into one request', async () => {
+    let now = 1000000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const agent = await world.saveAgent({ ...input, timingOverrides }), companion = await world.saveAgent({ ...input, name: 'Companion', timingOverrides });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Subscribed thread.' }, () => true)).message!;
+    const planned = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Separate planned thread.' }, () => true)).message!;
+    const engagement = { rootMessageId: source.id, targetAgentId: companion.id }, seen: DecisionOpportunity[] = [];
+    const scheduler = makeScheduler(async (value, _signal, _current, _applied, _attempt, offered) => {
+      if (value.id !== agent.id) return { reflectionProcessed: offered!.reflection, action: { type: 'wait' } };
+      seen.push(offered!);
+      await world.saveReflection(agent.id, agent.revision, { engagement: { ...engagement, roomId: agent.roomId } }, () => true);
+      return { reflectionProcessed: offered!.reflection, engagement, action: { type: 'wait' },
+        speechPlan: seen.length === 1 ? { delayMs: 60000, replyToId: planned.id, targetAgentId: companion.id } : null };
+    });
+    await scheduler.start(); await scheduler.tick(); await finished(scheduler);
+    now = 1055000; scheduler.observe({ ...source, id: 'latest-subscribed-reply', conversationId: source.id });
+    now = 1060000; await scheduler.tick(); await finished(scheduler);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({ reflection: true, speech: true, reason: 'engagement', speechPlan: { replyToId: planned.id },
+      engagementTrigger: { rootMessageId: source.id, replyToId: 'latest-subscribed-reply' } });
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextReflectionAt).toBe(1120000);
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextSpeechAt).toBeUndefined();
+  });
+
+  it.each(['departure', 'disable', 'disengage'] as const)('cancels an active engagement request after %s', async change => {
+    let now = 1000000, signal: AbortSignal | undefined;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const agent = await world.saveAgent({ ...input, timingOverrides }), companion = await world.saveAgent({ ...input, name: 'Companion', timingOverrides }),
+      other = await world.saveAgent({ ...input, name: 'Other', timingOverrides });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'An exchange.' }, () => true)).message!;
+    const future = (await world.applyAction(other.id, other.revision, { type: 'speak', message: 'Independent future reply.' }, () => true)).message!;
+    const engagement = { rootMessageId: source.id, targetAgentId: companion.id }, pending = deferred();
+    const scheduler = makeScheduler(async (value, requestSignal, _current, _applied, _attempt, offered) => {
+      if (value.id !== agent.id) return { reflectionProcessed: offered!.reflection, action: { type: 'wait' } };
+      if (offered!.engagementTrigger) { signal = requestSignal; return pending.promise; }
+      await world.saveReflection(agent.id, agent.revision, { engagement: { ...engagement, roomId: agent.roomId } }, () => true);
+      return { reflectionProcessed: true, engagement, action: { type: 'wait' },
+        speechPlan: { delayMs: 30000, replyToId: future.id, targetAgentId: other.id } };
+    });
+    await scheduler.start(); await scheduler.tick(); await finished(scheduler);
+    now = 1001000; scheduler.observe({ ...source, id: 'fresh-reply', conversationId: source.id });
+    now = 1015000; await scheduler.tick(); await vi.waitFor(() => expect(signal).toBeDefined());
+    if (change === 'departure') {
+      const movement = await world.applyAction(companion.id, companion.revision, { type: 'move', roomId: 'room-2' }, () => true);
+      movement.events.forEach(event => scheduler.observe(event));
+    } else if (change === 'disable') await world.saveAgent({ ...input, id: companion.id, name: companion.name, enabled: false, timingOverrides });
+    else await world.saveReflection(agent.id, agent.revision, { engagement: null }, () => true);
+    await scheduler.changed(); expect(signal!.aborted).toBe(true);
+    pending.resolve({ reflectionProcessed: false, action: { type: 'speak', message: 'Stale.' } });
+    await vi.waitFor(() => expect(scheduler.hasActiveWork()).toBe(false));
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)).toMatchObject({ nextReflectionAt: 1060000 });
+    expect(scheduler.snapshot().agents.find(value => value.agentId === agent.id)?.nextSpeechAt).toBe(1030000);
   });
 
   it('retains all four occupied slots when timed-out handlers ignore abort and never overlaps an agent', async () => {
@@ -786,6 +913,7 @@ describe('independent decision scheduling', () => {
     const scheduler = makeScheduler(async value => {
       if (value.id !== agent.id) return { reflectionProcessed: true, action: { type: 'wait' } };
       decisions += 1;
+      await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
       return { reflectionProcessed: true, action: { type: 'wait' }, engagement: { rootMessageId: source.id, targetAgentId: companion.id },
         speechPlan: { delayMs: 20000, replyToId: source.id, targetAgentId: companion.id } };
     });

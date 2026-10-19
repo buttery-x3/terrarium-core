@@ -9,7 +9,7 @@ import {
   deleteAgentSchema,
   defaultSettings, settingsSchema, actionResponseSchema,
   conversationMessageSchema, actionJsonSchema,
-  resolveScheduling, upgradeReflectionSettings,
+  resolveScheduling, upgradeReflectionSettings, canEat,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
@@ -22,8 +22,8 @@ describe('runtime contracts', () => {
     for (const type of ['speak', 'emote', 'arrival', 'departure']) expect(conversationMessageSchema.safeParse({ ...record, type }).success).toBe(true);
     for (const item of [record, { ...record, type: 'wait' }, { ...record, type: 'emote', content: 'x'.repeat(241) }, { ...record, type: 'emote', energy: 100 }])
       expect(conversationMessageSchema.safeParse(item).success).toBe(false);
-    expect(actionJsonSchema(true).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['emote', 'speak', 'move', 'wait', 'eat']);
-    expect(actionJsonSchema(false).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['speak', 'move', 'wait', 'eat']);
+    expect(actionJsonSchema(true).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['emote', 'speak', 'move', 'wait']);
+    expect(actionJsonSchema(false).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['speak', 'move', 'wait']);
   });
   it('upgrades version-2 settings while preserving customization and requires complete version-3 settings', () => {
     const { activity, scheduling, relationships, news, media, prompts: { observations, emotes, reflection, appraisals, relationshipSummary, newsSelection, mediaParticipation, mediaVote, ...prompts }, ...settings } = defaultSettings;
@@ -65,6 +65,21 @@ describe('runtime contracts', () => {
     expect(actionResponseSchema.parse({ action: { type: 'eat' }, intention: null })).toEqual({ action: { type: 'eat' }, intention: null });
     for (const value of [{ action: { type: 'eat', energy: 100 } }, { action: { type: 'eat' }, intention: 'a'.repeat(241) }, { action: [{ type: 'move', roomId: 'food' }, { type: 'eat' }] }])
       expect(actionResponseSchema.safeParse(value).success).toBe(false);
+  });
+  it('offers eating only for enabled low energy below maximum in a food-source room', () => {
+    const energy = { ...defaultSettings.energy, enabled: true };
+    for (const current of [0, 24.999, 25]) expect(canEat(energy, current, true)).toBe(true);
+    for (const current of [25.001, 97, 98, 99, 100]) expect(canEat(energy, current, true)).toBe(false);
+    expect(canEat(defaultSettings.energy, 0, true)).toBe(false);
+    expect(canEat(energy, 0, false)).toBe(false);
+    expect(canEat({ ...energy, lowThreshold: 0 }, 0, true)).toBe(true);
+    expect(canEat({ ...energy, lowThreshold: 10 }, 10.001, true)).toBe(false);
+    expect(canEat({ ...energy, lowThreshold: 100 }, 100, true)).toBe(false);
+    expect(canEat({ ...energy, lowThreshold: 100 }, 99, true)).toBe(true);
+    const actions = (eligible: boolean) => actionJsonSchema(false, false, eligible).properties.action.anyOf.map(option => option.properties.type.enum[0]);
+    expect(actions(canEat(energy, 25, true))).toContain('eat');
+    expect(actions(canEat(energy, 97, true))).not.toContain('eat');
+    expect(actions(false)).toContain('wait');
   });
   it('requires one explicit agent ID for deletion', () => {
     expect(deleteAgentSchema.parse({ id: 'agent-1' })).toEqual({ id: 'agent-1' });

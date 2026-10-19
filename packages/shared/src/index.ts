@@ -108,10 +108,11 @@ export const actionResponseJsonSchema = {
   required: ['action', 'intention'],
   additionalProperties: false,
 };
-export function actionJsonSchema(emotesEnabled: boolean, mediaEnabled = false) {
+export function actionJsonSchema(emotesEnabled: boolean, mediaEnabled = false, eatEligible = false) {
   return { ...actionResponseJsonSchema, properties: { ...actionResponseJsonSchema.properties,
     action: { anyOf: actionResponseJsonSchema.properties.action.anyOf.filter(option =>
-      (emotesEnabled || option.properties.type.enum[0] !== 'emote') && (mediaEnabled || option.properties.type.enum[0] !== 'propose-media')) },
+      (emotesEnabled || option.properties.type.enum[0] !== 'emote') && (mediaEnabled || option.properties.type.enum[0] !== 'propose-media') &&
+      (eatEligible || option.properties.type.enum[0] !== 'eat')) },
   } };
 }
 export const cursorSchema = z.object({ createdAt: z.string().datetime(), id: z.string().min(1) }).strict();
@@ -128,7 +129,7 @@ export const defaultPrompts = {
   framing: 'You inhabit a simulated terrarium. Choose how to spend this turn according to your own preferences and current circumstances.',
   profiles: 'Personality describes your manner and temperament. Motivations describe what you seek or avoid, including company, solitude, interests and tolerance for repetition. Current intention is an optional immediate aim, not memory or an obligation.',
   actionSelection: 'Choose one available action first. Formulate speech only if you choose speak and a speech opportunity is available. Moving, eating, changing subject and waiting silently are valid choices. An emote opportunity permits an externally observable behaviour but never requires one. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.',
-  energy: 'When energy is enabled and low, prioritise obtaining food. Choose a food-source destination yourself, move there, then eat on a later turn. After eating, reconsider your next action; you may stay. Zero energy imposes no additional action restriction.',
+  energy: 'When energy is enabled and at or below the configured low threshold, prioritise obtaining food. Eating is available only in a food-source room while energy is at or below that threshold and below maximum. When above the low threshold, choose another available action instead of topping up. Choose a food-source destination yourself, move there, then eat on a later turn. After eating, reconsider your next action; you may stay. Zero energy imposes no additional action restriction.',
   reminders: 'Describe only actions the world supports as completed actions. Imaginary construction or saying you ate does not change the world. Private reactions and immediate intentions describe your current state; they are not public speech, completed actions or obligations. Waiting silently produces no public event.',
   observations: 'Your personal memory contains only events you observed when present, including your own visible contributions. It travels with you between rooms. Read each item\'s timestamp, room and type: remembered activity is not necessarily happening now or here. Arriving gives you no earlier room transcript. You may listen, ask questions or mention experiences from elsewhere without any required greeting or topic change.',
   emotes: 'An emote is one short externally observable behaviour, at most 240 characters. Write in third person, identifying yourself. Quiet, mundane behaviour is enough, such as folding your arms and watching the doorway. Do not include inner thoughts, hidden intentions, monologues or quoted dialogue. Emotes cannot move you, feed you, create items, build machines or grant capabilities. Do not combine an emote with another action.',
@@ -174,6 +175,9 @@ export const settingsSchema = z.object({
   diagnostics: z.object({ maxPayloadMiB: z.number().int().min(32).max(16384), retention: z.literal('manual') }).strict(),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
+export function canEat(energy: Settings['energy'], currentEnergy: number, isFoodSource: boolean): boolean {
+  return energy.enabled && isFoodSource && currentEnergy <= energy.lowThreshold && currentEnergy < energy.maximum;
+}
 export const defaultSettings: Settings = {
   energy: { enabled: false, initial: 100, maximum: 100, depletionPerMinute: 5, lowThreshold: 25, replenishment: 'fill' },
   prompts: defaultPrompts,
@@ -383,6 +387,7 @@ export type SpeechPlanProposal = { delayMs: number; replyToId: string | null; ta
 export type DecisionOpportunity = {
   reflection: boolean; speech: boolean; emote: boolean; requestedAt: number;
   reason: 'cadence' | 'engagement' | 'scheduled-speech';
+  engagementTrigger?: { rootMessageId: string; targetAgentId: string; replyToId: string; sourceAgentId: string; requestedAt: number };
   speechPlan?: { dueAt: number; requestedAt: number; replyToId: string | null; targetAgentId: string | null };
   pendingSpeechPlan?: { dueAt: number; requestedAt: number; replyToId: string | null; targetAgentId: string | null; remainingMs: number };
 };

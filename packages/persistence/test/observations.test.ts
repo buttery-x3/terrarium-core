@@ -88,6 +88,53 @@ describe('private reflection and local exchanges', () => {
     expect(await world.reflections()).toHaveLength(1);
   });
 
+  it('validates an engagement trigger independently of a coalesced reply without changing the subscription', async () => {
+    const partner = await world.saveAgent(input), observer = await world.saveAgent({ ...input, name: 'Observer' });
+    const participant = await world.saveAgent({ ...input, name: 'Participant' });
+    const root = (await act(partner.id, { type: 'speak', message: 'First topic' })).message!;
+    const engagement = { roomId: observer.roomId, rootMessageId: root.id, targetAgentId: partner.id };
+    await world.saveReflection(observer.id, observer.revision, { engagement }, () => true);
+    const trigger = (await act(participant.id, { type: 'speak', message: 'Joining the first topic', replyToId: root.id })).message!;
+    const other = (await act(partner.id, { type: 'speak', message: 'Another topic' })).message!;
+    const guard = { ...engagement, replyToId: trigger.id, sourceAgentId: participant.id };
+    const result = await world.applyAction(observer.id, observer.revision, { type: 'speak', message: 'A separately scheduled reply', replyToId: other.id }, () => true, undefined,
+      { sourceIds: (await world.memory(observer.id)).map(message => message.id), engagementGuard: guard });
+    expect(result.message).toMatchObject({ replyToId: other.id, conversationId: other.id });
+    expect((await world.reflection(observer.id)).engagement).toEqual(engagement);
+  });
+
+  it.each(['cleared', 'partner-returned', 'partner-disabled', 'feature-disabled', 'source-departed', 'wrong-author', 'wrong-root', 'unwitnessed'] as const)
+    ('rejects a stale engagement trigger (%s) before private or public writes', async change => {
+      const partner = await world.saveAgent(input), observer = await world.saveAgent({ ...input, name: 'Observer' });
+      const participant = await world.saveAgent({ ...input, name: 'Participant' });
+      const root = (await act(partner.id, { type: 'speak', message: 'First topic' })).message!;
+      const engagement = { roomId: observer.roomId, rootMessageId: root.id, targetAgentId: partner.id };
+      await world.saveReflection(observer.id, observer.revision, { reaction: 'Existing private reaction', engagement }, () => true);
+      const trigger = (await act(participant.id, { type: 'speak', message: 'Joining the topic', replyToId: root.id })).message!;
+      const guard = { ...engagement, replyToId: trigger.id, sourceAgentId: participant.id };
+      let sourceIds = (await world.memory(observer.id)).map(message => message.id);
+      if (change === 'cleared') await world.saveReflection(observer.id, observer.revision, { engagement: null }, () => true);
+      if (change === 'partner-returned') {
+        await act(partner.id, { type: 'move', roomId: 'room-2' });
+        await act(partner.id, { type: 'move', roomId: 'room-1' });
+      }
+      if (change === 'partner-disabled') await world.saveAgent({ ...input, id: partner.id, enabled: false });
+      if (change === 'feature-disabled') await world.saveSettings({ ...defaultSettings, scheduling: { ...defaultSettings.scheduling, engagementEnabled: false } });
+      if (change === 'source-departed') await act(participant.id, { type: 'move', roomId: 'room-2' });
+      if (change === 'wrong-author') guard.sourceAgentId = partner.id;
+      if (change === 'wrong-root') {
+        const other = (await act(participant.id, { type: 'speak', message: 'A different topic' })).message!;
+        guard.replyToId = other.id; sourceIds.push(other.id);
+      }
+      if (change === 'unwitnessed') sourceIds = [];
+      const before = await world.reflection(observer.id), history = await world.history({ roomId: observer.roomId });
+      await expect(world.applyAction(observer.id, observer.revision, { type: 'speak', message: 'Must not be saved' }, () => true, undefined,
+        { sourceIds, engagementGuard: guard, reflection: { reaction: 'Uncommitted reaction', intention: null }, engagement }))
+        .rejects.toMatchObject({ category: 'stale' });
+      expect(await world.reflection(observer.id)).toEqual(before);
+      expect(await world.history({ roomId: observer.roomId })).toEqual(history);
+    });
+
   it('validates persisted timing overrides against new shared settings and configuration imports', async () => {
     const a = await world.saveAgent({ ...input, timingOverrides: { speechMinDelayMs: 30000 } });
     expect(a.timingOverrides).toEqual({ speechMinDelayMs: 30000 });

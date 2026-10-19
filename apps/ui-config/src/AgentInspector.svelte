@@ -20,6 +20,7 @@
       <dt>Next emote opportunity</dt><dd>{timestamp(activity.nextEmoteAt)}</dd>
       <dt>Next relationship summary check</dt><dd>{timestamp(activity.nextRelationshipSummaryAt)}</dd>
     </dl>
+    <p>Reflection follows its regular cadence. The next speech opportunity includes any subscribed-exchange deadline; speech remains optional.</p>
     {#if activity.error}<p role="alert">{activity.error}</p>{/if}
   {:else}<p>No operations scheduled.</p>{/if}
   <h4>Generated private character state</h4>
