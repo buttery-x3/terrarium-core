@@ -6,9 +6,37 @@ Stage 4 is validated on `codex/flame-148-media`, stacked on the reflection, rela
 
 Normal development startup used a temporary database on port 3138, with configuration and terrain frontends on 4273/4274. All watchers compiled without errors; health, both pages and both transformed Svelte modules returned HTTP 200. These temporary processes were stopped afterward.
 
-A separate in-memory browser fixture used the real application and a deterministic provider. Alice started *Spirited Away* immediately without a vote. Barry proposed *Planet Earth*; the UI showed two pending votes, no assumed proposer agreement and a read-only request preview. Starting the fixture requested two independent votes, recorded both choices and replaced the programme once. Pause froze playback at 594,304 milliseconds remaining; Stop preserved it. Advancing the fixture clock past expiry cleared the programme and displayed “Nothing is currently playing.” The operator could inspect the passed ballot and original programme description. Browser inspection confirmed the layout; focused render checks cover disabled guidance and escaped text. Captured previews now survive unrelated background updates.
+A separate in-memory browser fixture used the real application and a deterministic provider. Alice started *Spirited Away* immediately without a vote. Barry proposed *Planet Earth*; the UI showed two pending votes, no assumed proposer agreement and a read-only request preview. Starting the fixture requested two independent votes, recorded both choices and replaced the programme once. Pause froze playback at 594,304 milliseconds remaining; Stop preserved it. Advancing the fixture clock past expiry cleared the programme and displayed “Nothing is currently playing.” The operator could inspect the passed ballot and original programme description. Browser inspection confirmed the layout; focused render checks cover disabled guidance and escaped text. A second browser check confirmed the captured preview remained visible after actual vote completion and unrelated reflection updates, with its original capture label.
 
-The approved room setup was applied through the existing configuration preview/import while the actual world was stopped, after a database backup. `room-1` is now News Room with its original ID; `media-room` was added. Both capabilities are enabled with their approved defaults. Before/after hashes of all 16 authored agent configurations and current energy matched; all 1,123 archived events and 800 observation links remained. The run stayed stopped. The two isolated live comparison runs are documented separately below when complete.
+The approved room setup was applied through the existing configuration preview/import while the actual world was stopped, after a database backup. `room-1` is now News Room with its original ID; `media-room` was added. Both capabilities are enabled with their approved defaults. Before/after hashes of all 16 authored agent configurations and current energy matched; all 1,123 archived events and 800 observation links remained. The run stayed stopped.
+
+## FLAME-148 controlled live comparison — 19 October 2026
+
+Two isolated 15-minute runs used the same saved starting database and the existing Barry, Pip, Felix and Mara profiles. Only these four residents were enabled/present in the isolated copies; the actual sixteen-resident world remained stopped. Their authored profiles, motivations, models, configured intervals and memory limits matched exactly across copies. Starting positions, energy and personal observations came from the same snapshot. The baseline used FLAME-147 commit `9b9bd1a`; the enhanced run used the integrated reflection/relationships/news/media implementation and the approved room setup. Existing custom shared prompts, including the energy guidance, were preserved. Normal random scheduling and model sampling were not seeded, so this is one observed pair of runs rather than a causal or statistical result.
+
+Baseline ran from 01:12:44 to 01:27:46 UTC; enhanced ran from 01:34:05 to 01:49:05 UTC. They used 110 model requests combined, below the 160-request limit; including the two earlier search capability/smoke requests brings this task's live checks to 112. Neither run reached its cap. All 110 operation attempts applied successfully, with no provider failures, validation failures or cancellations.
+
+| Observation | FLAME-147 baseline | Enhanced implementation |
+| --- | ---: | ---: |
+| Model requests | 37 | 73 |
+| Speech messages | 13 | 0 |
+| Authored emotes | 5 | 2 |
+| Moves | 7 | 3 |
+| Eat actions | 12 | 61 |
+| Silent wait actions | 0 | 5 |
+| Shared news selections | 0 | 2 |
+| New appraisals / relationship summaries | Not supported | 0 / 0 |
+| Programme proposals / ballots | Not supported | 0 / 0 |
+
+The baseline included person-directed exchanges: Mara asked Barry for an ordinary opinion, followed by tea/coffee discussion; Felix responded to Pip's rhythm. Pip repeated knee-tapping/resting-hand emotes, and Barry nodded quietly. The enhanced run had only two quiet Pip emotes and five truly silent waits, but no person-directed dialogue. All 56 enhanced reflection responses explicitly returned no speech plan, no engagement and no appraisals; the scheduler did not suppress requested speech. The other enhanced requests were fifteen emote opportunities and two shared news requests. Median recorded due-to-start delay was 637 ms (maximum 6,997 ms), compared with baseline 467 ms (maximum 754 ms); these include shared-slot waiting and are not a performance benchmark.
+
+News successfully refreshed from an entertainment selection about a poetry gathering to a sport/upcoming-event selection, with different actual search-source URLs and retrieval timestamps. No resident entered the News Room or Media Room, so this run provides no live evidence of reactions to their activity, media voting or resulting relationship changes. Those mechanisms are covered by deterministic and manual fixture checks. Private reflections continued to refer to previously witnessed exchanges after movement, including the earlier magpie joke, but no enhanced outward conversation demonstrated cross-room continuity. The baseline did refer back to earlier towel/riddle material. Fewer outward events alone therefore do not establish improved social behaviour.
+
+**Unresolved behavioural finding:** the enhanced run amplified repeated eating while already well-fed. Sixty of its sixty-one eat actions started above the configured low-energy threshold of 25; the baseline already had eleven such actions out of twelve. Every inspected eat restored energy to 100, and captured provider payloads matched the current numeric energy. For example, diagnostic `1a85ed9e-673c-4393-9301-225d3cc2101b` supplied Felix energy 97.4625, yet the model described low energy and chose to eat. Many private intentions repeated “eat, then leave” without following through. This is evidence of a model-choice loop, not stale numeric state or failed persistence.
+
+A possible contributor is that eating creates no observation and the next request has no explicit last-completed-action record; normal decay lowers energy before the next reflection while its pre-action intention remains. This is an inference, not demonstrated causation. A bounded own-action result or clarified well-fed prompt guidance would be separate follow-up scope. No profiles, prompts, energy settings or live-run conditions were changed to improve this comparison's outcome. The social-improvement goal is not demonstrated by these runs.
+
+The enhanced run began before the final media-timeout diagnostic correction; it made no media-vote requests. That correction and final UI preview fixes are validated by the final 240-test suite and manual browser checks above. Local databases, transcripts, raw results and analyses are retained under `data/flame148-comparison` and excluded from implementation commits. The temporary baseline worktree was archived after preserving its harness/results. This four-resident exercise does not replace the deterministic sixteen-agent concurrency tests or establish sustained behaviour across a full population.
 
 ## FLAME-148 news validation — 19 October 2026
 
@@ -32,7 +60,7 @@ Development startup used a temporary database, isolated server port 3138 and `pn
 
 A manual check used the compiled application, an isolated in-memory database, a deterministic provider and a real Socket.IO client. Starting one enabled observer produced exactly one reflection request, saved its private reaction and emitted zero public events. Stop succeeded. This checks private reflection and inactivity through the scheduler/socket/persistence path without consuming real model usage.
 
-The private-state inspector's focused rendering tests cover generated-text escaping, current-room occupants without remote residents, independent schedules with no invented speech deadline, timestamp display and empty state. The UI build and Svelte checks passed independently. The approved two-run live behavioural comparison remains pending.
+The private-state inspector's focused rendering tests cover generated-text escaping, current-room occupants without remote residents, independent schedules with no invented speech deadline, timestamp display and empty state. The UI build and Svelte checks passed independently. The later integrated live comparison is recorded above.
 
 ## FLAME-147 validation — 19 October 2026
 
