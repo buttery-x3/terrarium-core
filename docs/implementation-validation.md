@@ -1,5 +1,15 @@
 # Implementation validation
 
+## FLAME-148 reflection validation — 19 October 2026
+
+Stage 1 is validated on `codex/flame-148-reflection`. `pnpm build` passed for all six packages. `pnpm check` reported zero errors and zero warnings in both Svelte frontends. `pnpm test` passed 159 tests: 22 shared contracts, 35 persistence, 14 provider, 56 server and 32 configuration UI/socket tests. Existing configuration expectations now reflect version 4. These results do not establish validation of later relationship, news or media stages.
+
+Development startup used a temporary database, isolated server port 3138 and `pnpm dev --filter=!@terrarium/ui-config`. The server started and package watchers reported zero TypeScript errors. Separate configuration/terrain development servers on ports 4273/4274 compiled; both transformed `/src/App.svelte` responses returned HTTP 200. Existing development instances and saved production data were not used for this check.
+
+A manual check used the compiled application, an isolated in-memory database, a deterministic provider and a real Socket.IO client. Starting one enabled observer produced exactly one reflection request, saved its private reaction and emitted zero public events. Stop succeeded. This checks private reflection and inactivity through the scheduler/socket/persistence path without consuming real model usage.
+
+The private-state inspector's focused rendering tests cover generated-text escaping, current-room occupants without remote residents, independent schedules with no invented speech deadline, timestamp display and empty state. The UI build and Svelte checks passed independently. The approved two-run live behavioural comparison remains pending.
+
 ## FLAME-147 validation — 19 October 2026
 
 `pnpm build` succeeds for all six packages. `pnpm check` reports zero errors and zero warnings in both frontends. `pnpm test` passes 126 tests: 21 shared contracts, 29 persistence, 14 provider/auth, 33 turn/scheduler, 25 UI/socket integration and 4 Svelte activity-rendering cases.

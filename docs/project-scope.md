@@ -21,10 +21,10 @@ Personality retains the existing editable `instructions` field. Motivations and 
 | Conversation clearing | Confirm permanent deletion for the current room or all rooms while stopped. Preserve room/agent settings; reset both views and agent context, reject stale history responses and late turns. |
 | World configuration | Versioned migration preserves messages. Five initial rooms; no automatic agents. Create/edit rooms and create/edit/disable/delete agents; persisted membership. Agent deletion requires confirmation, cancels its turn and preserves past messages. |
 | Configuration files | Export all room/agent settings as versioned JSON; validate and preview imports; merge by ID in one transaction while stopped. Preserve omitted records and history. |
-| Agents              | Editable name, instructions, model, cadence, personal memory limit, room, enabled state. Persistent FIFO of 1–50 personally observed items across rooms; new-agent form defaults to 30. |
+| Agents              | Editable name, instructions, model, independent timing overrides, personal memory limit, room, enabled state. Persistent FIFO of 1–50 personally observed items across rooms; new-agent form defaults to 30. |
 | Model integration   | ChatGPT OAuth with PKCE and verified identity, Windows protected storage, model discovery, completed Responses streams. Initial model: `gpt-6-luna`. Other adapters remain unused mocks. |
-| Actions             | `speak`, `move`, `eat`, and `emote` (or `wait` when emotes are disabled). Successful moves produce local departure/arrival activity when enabled. Technical failures remain operational errors. |
-| Scheduling          | One active turn per agent, four concurrent requests, 60-second attempts, two retries. Pause finishes active work; stop/disable/edits/movement discard stale results.                     |
+| Actions             | `speak`, `move`, `eat`, `emote`, and silent `wait`. Speech/emote eligibility is independent; no opportunity requires outward activity. Successful moves produce local departure/arrival activity when enabled. Technical failures remain operational errors. |
+| Scheduling          | One active operation per agent, four concurrent requests, independent reflection/speech/emote schedules, 60-second attempts, two retries. Pause finishes active work; stop/disable/edits/movement discard stale results. |
 | Web interface       | Timeline, older messages, reconnect recovery, room/agent forms, ChatGPT connection, run controls, activity/error feedback.                                                               |
 | Terrain             | Optional existing Pixi view consumes the shared conversation event. Further graphical development remains deferred.                                                                      |
 
@@ -44,9 +44,17 @@ Version-2 configuration includes these authored settings; version-1 imports pres
 
 FLAME-147 adds typed emotes, automatic arrival/departure events and individual bounded observation buffers. Observation delivery occurs transactionally at commit time, even between an agent's turns. Memories survive movement and restart; new and migrated agents receive no archive backfill. Full operator archives remain separate. Version-3 configuration includes the activity toggles and editable observation/emote guidance, with version-1/2 import compatibility. No dependencies or authentication changes are required.
 
+## FLAME-148 reflection stage
+
+The first FLAME-148 branch adds latest private reactions and immediate intentions, independent speech/emote opportunities, true inactivity and a single optional local exchange subscription per agent. Future speech is generated against fresh context when due, with server validation of witnessed replies and present interlocutors. Other agents' private state remains inaccessible to model context. The operator can inspect private state, occupants and schedules, edit shared timing and optional agent overrides, preview each operation and inspect requested/scheduled/actual diagnostic times.
+
+Defaults are 60-second reflections, requested speech delays of 15–150 seconds with a 15-second cooldown, and emote opportunities 120–300 seconds apart. Version-4 configuration contains authored settings and timing, while runtime reflections and pending work stay separate. Migration 4 preserves existing profiles and observations. No dependencies or authentication changes are added in this stage.
+
+The remaining approved stacked branches implement relationships, diverse web-searched news, then locally suggested movie/TV playback. Those features are planned, not part of the reflection implementation. See the [approved branch plan](development-plan.md#approved-flame-148-stacked-implementation).
+
 ## Deferred scope
 
-Relationship scores, separate long-term memory, judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
+Relationship scores and summaries, news selection and movie/TV playback are approved later FLAME-148 stages. Judicial actions, additional graphical behavior, snapshots beyond current needs, and implementation of every provider remain deferred. This release introduces no third frontend, queue service, distributed agent platform, general action framework, user-account system, or replacement stack. An MBTI population can be manually configured; it is not automatically seeded.
 
 ## Release boundaries
 

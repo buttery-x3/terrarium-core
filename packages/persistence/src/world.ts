@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema } from '@terrarium/shared';
+import { actionSchema, clearHistorySchema, configurationSchema, settingsSchema, diagnosticFilterSchema, resolveScheduling, timingOverridesSchema } from '@terrarium/shared';
 import type { Kysely, Selectable } from 'kysely';
 import type {
   Agent,
@@ -16,6 +16,7 @@ import type {
   RoomInput,
   WorldState,
   Settings, AttemptDetails, DiagnosticFilter, DiagnosticRecord, DiagnosticPage, DiagnosticUsage,
+  ReflectionState,
 } from '@terrarium/shared';
 import type { DB } from './index.js';
 
@@ -39,6 +40,7 @@ const agentRecord = (row: Selectable<DB['agents']>): Agent => ({
   motivations: row.motivations,
   intention: row.intention,
   energy: row.energy,
+  ...(row.timing_overrides !== '{}' ? { timingOverrides: timingOverridesSchema.parse(JSON.parse(row.timing_overrides)) } : {}),
 });
 const messageRecord = (
   row: Selectable<DB['messages']>,
@@ -50,6 +52,22 @@ const messageRecord = (
   createdAt: row.created_at,
   content: row.content,
   type: row.type,
+  ...(row.reply_to_id ? { replyToId: row.reply_to_id } : {}),
+  ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
+});
+export type ReflectionUpdate = { reaction?: string | null; intention?: string | null; engagement?: ReflectionState['engagement'] };
+export type DecisionUpdate = {
+  sourceIds?: readonly string[]; reflection?: { reaction: string | null; intention: string | null } | null;
+  engagement?: ReflectionState['engagement']; targetAgentId?: string | null;
+};
+const emptyReflection = (agentId: string): ReflectionState => ({ agentId, reflectedAt: null, reaction: null, intention: null,
+  lastSpeechAt: null, lastEmoteAt: null, engagement: null });
+const reflectionRecord = (row: Selectable<DB['reflections']>): ReflectionState => ({ agentId: row.agent_id,
+  reflectedAt: row.reflected_at, reaction: row.reaction, intention: row.intention,
+  lastSpeechAt: row.last_speech_at, lastEmoteAt: row.last_emote_at,
+  engagement: row.engagement_room_id && row.engagement_root_message_id && row.engagement_target_agent_id ? {
+    roomId: row.engagement_room_id, rootMessageId: row.engagement_root_message_id, targetAgentId: row.engagement_target_agent_id,
+  } : null,
 });
 
 export class World {
@@ -85,6 +103,7 @@ export class World {
 
   async validateSettings(value: Settings) {
     const settings = settingsSchema.parse(value);
+    for (const agent of await this.agents()) resolveScheduling(settings, agent);
     if (settings.energy.enabled && !(await this.rooms()).some(room => room.isFoodSource))
       throw new Error('Configuration requires at least one food-source room before energy can be enabled.');
     if ((await this.agents()).some(agent => agent.energy > settings.energy.maximum))
@@ -96,6 +115,7 @@ export class World {
     return this.db.transaction().execute(async db => {
       const settings = await new World(db).validateSettings(value);
       await db.updateTable('settings').set(({ eb }) => ({ value: JSON.stringify(settings), version: eb('version', '+', 1) })).where('id', '=', 1).execute();
+      if (!settings.scheduling.engagementEnabled) await new World(db).clearEngagements();
       return new World(db).settings();
     });
   }
@@ -118,7 +138,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 3,
+        version: 4,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -169,6 +189,7 @@ export class World {
         if (!agents.has(agent.id)) defaults.push(`Agent ${agent.id}: empty motivations/intention; initial energy ${state.settings.energy.initial}.`);
     }
     if (configuration.version === 2) defaults.push('Older settings include default observable-event and emote guidance when absent. Personal memories are not imported.');
+    if (configuration.version < 4) defaults.push('Older settings use shared reflection, speech and emote timing defaults when absent. Private reflections are not imported.');
     const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
@@ -176,6 +197,9 @@ export class World {
       throw new Error('Configuration requires at least one food-source room while energy is enabled.');
     if (state.agents.some(agent => agent.energy > settings.energy.maximum))
       throw new Error('Configuration maximum energy cannot be below an agent\'s current energy.');
+    const mergedAgents = new Map(state.agents.map(agent => [agent.id, agent]));
+    for (const agent of configuration.agents) mergedAgents.set(agent.id, { ...mergedAgents.get(agent.id), ...agent } as Agent);
+    for (const agent of mergedAgents.values()) resolveScheduling(settings, agent);
     return {
       token: createHash('sha256')
         .update(JSON.stringify({ configuration, state: { ...state, agents: state.agents.map(({ energy, ...agent }) => agent) } }))
@@ -259,6 +283,7 @@ export class World {
           motivations: agent.motivations ?? previous?.motivations ?? '',
           intention: agent.intention ?? previous?.intention ?? '',
           energy: previous?.energy ?? (configuration.version >= 2 ? configuration.settings! : state.settings).energy.initial,
+          timing_overrides: JSON.stringify(agent.timingOverrides ?? previous?.timingOverrides ?? {}),
         };
         await db
           .insertInto('agents')
@@ -268,10 +293,13 @@ export class World {
           )
           .execute();
         await new World(db).trimMemory(agent.id, agent.contextMessageLimit);
+        if (previous && (previous.roomId !== agent.roomId || !agent.enabled)) await new World(db).clearEngagements(agent.id);
       }
       if (configuration.version >= 2) await db.updateTable('settings').set(({ eb }) => ({
         value: JSON.stringify(configuration.settings), version: eb('version', '+', 1),
       })).where('id', '=', 1).execute();
+      if (configuration.settings && configuration.version >= 2 && !configuration.settings.scheduling.engagementEnabled)
+        await new World(db).clearEngagements();
       return preview;
     });
   }
@@ -305,6 +333,8 @@ export class World {
     await this.syncEnergy();
     return this.db.transaction().execute(async (db) => {
       const previous = input.id ? await new World(db).agent(input.id) : undefined;
+      const timingOverrides = input.timingOverrides ?? previous?.timingOverrides;
+      resolveScheduling((await new World(db).settings()).value, { timingOverrides });
       if (
         !(await db
           .selectFrom('rooms')
@@ -326,6 +356,7 @@ export class World {
         context_message_limit: input.contextMessageLimit,
         motivations: input.motivations ?? previous?.motivations ?? '',
         intention: input.intention ?? previous?.intention ?? '',
+        timing_overrides: JSON.stringify(timingOverrides ?? {}),
       };
       if (input.id) {
         const updated = await db
@@ -341,6 +372,7 @@ export class World {
           .execute();
       }
       await new World(db).trimMemory(id, input.contextMessageLimit);
+      if (previous && (previous.roomId !== input.roomId || !input.enabled)) await new World(db).clearEngagements(id);
       return agentRecord(
         await db
           .selectFrom('agents')
@@ -359,6 +391,8 @@ export class World {
         .executeTakeFirstOrThrow();
       if (!result.numDeletedRows) throw new Error('Agent does not exist.');
       await db.deleteFrom('observations').where('agent_id', '=', id).execute();
+      await new World(db).clearEngagements(id);
+      await db.deleteFrom('reflections').where('agent_id', '=', id).execute();
       return { id };
     });
   }
@@ -375,6 +409,82 @@ export class World {
       .orderBy('observations.sequence', 'asc').execute()).map(messageRecord);
   }
 
+  async reflection(agentId: string): Promise<ReflectionState> {
+    const row = await this.db.selectFrom('reflections').selectAll().where('agent_id', '=', agentId).executeTakeFirst();
+    return row ? reflectionRecord(row) : emptyReflection(agentId);
+  }
+
+  async reflections(): Promise<ReflectionState[]> {
+    const rows = new Map((await this.db.selectFrom('reflections').selectAll().execute()).map(row => [row.agent_id, reflectionRecord(row)]));
+    return (await this.agents()).map(agent => rows.get(agent.id) ?? emptyReflection(agent.id));
+  }
+
+  async clearEngagements(agentId?: string) {
+    let query = this.db.updateTable('reflections').set({ engagement_room_id: null, engagement_root_message_id: null, engagement_target_agent_id: null });
+    if (agentId) query = query.where(eb => eb.or([eb('agent_id', '=', agentId), eb('engagement_target_agent_id', '=', agentId)]));
+    await query.execute();
+  }
+
+  async validateReply(agentId: string, replyToId: string, sourceIds?: readonly string[]): Promise<ConversationMessage> {
+    const actor = await this.agent(agentId);
+    const source = await this.db.selectFrom('messages').selectAll().where('id', '=', replyToId).executeTakeFirst();
+    // INVARIANT: supplied source IDs come from the server-owned observation snapshot before the request.
+    const witnessed = sourceIds ? sourceIds.includes(replyToId) : Boolean(await this.db.selectFrom('observations').select('sequence')
+      .where('agent_id', '=', agentId).where('message_id', '=', replyToId).executeTakeFirst());
+    const author = source ? await this.agent(source.agent_id) : undefined;
+    if (!actor || !source || source.type !== 'speak' || !witnessed || source.room_id !== actor.roomId ||
+      !author || !author.enabled || author.id === agentId || author.roomId !== actor.roomId)
+      throw new ActionError('world-validation', 'A reply requires witnessed speech from another agent still in this room.');
+    return { ...messageRecord(source), conversationId: source.conversation_id ?? source.id };
+  }
+
+  private async writeReflection(agentId: string, update: ReflectionUpdate, sourceIds?: readonly string[], publicAction?: { type: 'speak' | 'emote'; createdAt: string }) {
+    for (const [key, limit] of [['reaction', 1000], ['intention', 240]] as const) {
+      const value = update[key];
+      if (value !== undefined && value !== null && (typeof value !== 'string' || value.length > limit))
+        throw new ActionError('world-validation', `Private ${key} exceeds its allowed length.`);
+    }
+    if (update.engagement) {
+      const actor = await this.agent(agentId), target = await this.agent(update.engagement.targetAgentId);
+      const sources = sourceIds ? await this.db.selectFrom('messages').selectAll().where('id', 'in', [...sourceIds]).execute().then(rows => rows.map(messageRecord)) : await this.memory(agentId);
+      if (!(await this.settings()).value.scheduling.engagementEnabled || !actor || !target || !target.enabled || actor.id === target.id ||
+        actor.roomId !== update.engagement.roomId || target.roomId !== actor.roomId ||
+        !sources.some(source => source.type === 'speak' && source.roomId === actor.roomId && source.agentId === target.id &&
+          (source.conversationId ?? source.id) === update.engagement!.rootMessageId))
+        throw new ActionError('world-validation', 'Engagement requires a witnessed local exchange and a present interlocutor.');
+    }
+    const state = await this.reflection(agentId);
+    if (update.reaction !== undefined || update.intention !== undefined) state.reflectedAt = new Date().toISOString();
+    if (update.reaction !== undefined) state.reaction = update.reaction;
+    if (update.intention !== undefined) state.intention = update.intention;
+    if (update.engagement !== undefined) state.engagement = update.engagement;
+    if (publicAction?.type === 'speak') state.lastSpeechAt = publicAction.createdAt;
+    if (publicAction?.type === 'emote') state.lastEmoteAt = publicAction.createdAt;
+    const values = { agent_id: agentId, reflected_at: state.reflectedAt, reaction: state.reaction, intention: state.intention,
+      last_speech_at: state.lastSpeechAt, last_emote_at: state.lastEmoteAt, engagement_room_id: state.engagement?.roomId ?? null,
+      engagement_root_message_id: state.engagement?.rootMessageId ?? null, engagement_target_agent_id: state.engagement?.targetAgentId ?? null };
+    await this.db.insertInto('reflections').values(values).onConflict(conflict => conflict.column('agent_id').doUpdateSet(values)).execute();
+    return state;
+  }
+
+  async saveReflection(agentId: string, revision: number, update: ReflectionUpdate, stillCurrent: () => boolean, attemptId?: string) {
+    return this.db.transaction().execute(async db => {
+      const world = new World(db), agent = await world.agent(agentId);
+      const check = () => {
+        if (!agent || !agent.enabled || agent.revision !== revision || !stillCurrent()) throw new ActionError('stale', 'This reflection is no longer current.');
+      };
+      check();
+      if (attemptId) {
+        const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
+        if (record.ended_at) throw new ActionError('stale', 'This attempt has already ended.');
+      }
+      const reflection = await world.writeReflection(agentId, update);
+      if (attemptId) await world.updateDiagnostic(attemptId, { reflection }, 'applied', 'reflect');
+      check();
+      return reflection;
+    });
+  }
+
   private async insertMessage(
     db: Kysely<DB>,
     roomId: string,
@@ -382,6 +492,7 @@ export class World {
     speaker: string,
     content: string,
     type: ConversationMessage['type'] = 'speak',
+    reply?: ConversationMessage,
   ) {
     if (
       !(await db
@@ -414,6 +525,8 @@ export class World {
       createdAt,
       type,
     };
+    if (type === 'speak') message.conversationId = reply?.conversationId ?? reply?.id ?? message.id;
+    if (reply) message.replyToId = reply.id;
     await db
       .insertInto('messages')
       .values({
@@ -424,6 +537,8 @@ export class World {
         content,
         created_at: createdAt,
         type,
+        reply_to_id: message.replyToId ?? null,
+        conversation_id: message.conversationId ?? null,
       })
       .execute();
     const observers = await db.selectFrom('agents').select(['id', 'context_message_limit']).where('room_id', '=', roomId).execute();
@@ -454,6 +569,8 @@ export class World {
       let observedMessages = db.selectFrom('messages').select('id');
       if (selection.scope === 'room') observedMessages = observedMessages.where('room_id', '=', selection.roomId);
       await db.deleteFrom('observations').where('message_id', 'in', observedMessages).execute();
+      await db.updateTable('reflections').set({ engagement_room_id: null, engagement_root_message_id: null, engagement_target_agent_id: null })
+        .where('engagement_room_id', 'in', roomIds).execute();
       let query = db.deleteFrom('messages');
       if (selection.scope === 'room')
         query = query.where('room_id', '=', selection.roomId);
@@ -507,6 +624,7 @@ export class World {
     action: AgentAction,
     stillCurrent: () => boolean,
     attemptId?: string,
+    decision?: DecisionUpdate,
   ) {
     action = actionSchema.parse(action);
     await this.syncEnergy();
@@ -522,11 +640,19 @@ export class World {
           throw new ActionError('stale', 'This turn is no longer current.');
       };
       check();
-      const settings = (await new World(db).settings()).value;
-      if (action.type === 'wait' && settings.activity.emotesEnabled)
-        throw new ActionError('world-validation', 'Emotes are enabled; use emote for a quiet turn.');
+      const world = new World(db);
+      const settings = (await world.settings()).value;
       if (action.type === 'emote' && !settings.activity.emotesEnabled)
         throw new ActionError('world-validation', 'Emotes are disabled; use wait for a quiet turn.');
+      if (decision?.targetAgentId) {
+        const target = await world.agent(decision.targetAgentId);
+        if (!target || !target.enabled || target.id === agentId || target.roomId !== row.room_id)
+          throw new ActionError('stale', 'The intended interlocutor is no longer in this room.');
+      }
+      const reply = action.type === 'speak' && action.replyToId ? await world.validateReply(agentId, action.replyToId, decision?.sourceIds) : undefined;
+      if (decision?.reflection || decision?.engagement !== undefined) await world.writeReflection(agentId, {
+        ...decision.reflection, ...(decision.engagement !== undefined ? { engagement: decision.engagement } : {}),
+      }, decision.sourceIds);
       let message: ConversationMessage | undefined;
       const events: ConversationMessage[] = [];
       if (action.type === 'speak' || action.type === 'emote')
@@ -537,6 +663,7 @@ export class World {
           row.name,
           action.message,
           action.type,
+          reply,
         );
       if (action.type === 'move') {
         const destination = await db
@@ -556,6 +683,7 @@ export class World {
           .set({ room_id: action.roomId, revision: row.revision + 1 })
           .where('id', '=', row.id)
           .execute();
+        if (action.roomId !== row.room_id) await world.clearEngagements(row.id);
         if (observableMove)
           events.push(await this.insertMessage(db, action.roomId, row.id, row.name, `${row.name} enters ${destination.name}.`, 'arrival'));
       }
@@ -569,6 +697,7 @@ export class World {
         await db.updateTable('agents').set({ energy: energyAfter }).where('id', '=', row.id).execute();
       }
       const moved = action.type === 'move' && action.roomId !== row.room_id;
+      const reflection = message ? await world.writeReflection(agentId, {}, undefined, { type: action.type as 'speak' | 'emote', createdAt: message.createdAt }) : await world.reflection(agentId);
       if (attemptId) {
         const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
         if (record.ended_at) throw new ActionError('stale', 'This attempt has already ended.');
@@ -577,10 +706,11 @@ export class World {
           sourceRoomId: row.room_id, destinationRoomId: action.type === 'move' ? action.roomId : row.room_id,
           moved, ...(message ? { messageId: message.id } : {}), eventIds: events.map(event => event.id), energyBefore: row.energy, energyAfter,
           passiveDecay: Math.max(0, (details.energySeen ?? row.energy) - row.energy),
+          reflection,
         }, action.type === 'move' && !moved ? 'applied-noop' : 'applied', action.type);
       }
       check();
-      return { message, events, moved, energyBefore: row.energy, energyAfter };
+      return { message, events, moved, energyBefore: row.energy, energyAfter, reflection };
     });
   }
 
@@ -592,7 +722,7 @@ export class World {
       limitBytes: (await this.settings()).value.diagnostics.maxPayloadMiB * 1024 * 1024, retention: 'manual' };
   }
 
-  async scheduleTurn(agent: Agent, dueAt: number) {
+  async scheduleTurn(agent: Agent, dueAt: number, operation = 'action', requestedAt = Date.now()) {
     try {
       const id = randomUUID();
       const usage = await this.diagnosticUsage();
@@ -601,6 +731,7 @@ export class World {
         id, turn_id: id, agent_id: agent.id, agent_name: agent.name, room_id: agent.roomId,
         scheduled_at: new Date().toISOString(), due_at: new Date(dueAt).toISOString(), started_at: null, ended_at: null,
         attempt: 0, model: agent.model, action: null, outcome: 'scheduled', details: '{}', bytes: 1024, reserved_bytes: 0,
+        operation, requested_at: new Date(requestedAt).toISOString(),
       }).execute();
       return id;
     } catch (error) { throw new DiagnosticError(`Diagnostics could not schedule a turn: ${error instanceof Error ? error.message : 'write failed'}`); }
@@ -651,6 +782,7 @@ export class World {
   async interruptUnfinished() {
     await this.db.updateTable('decisions').set({ outcome: 'interrupted', ended_at: new Date().toISOString(), reserved_bytes: 0 })
       .where('ended_at', 'is', null).execute();
+    await this.clearEngagements();
   }
 
   async diagnostics(input: DiagnosticFilter = {}, details = false): Promise<DiagnosticPage> {
@@ -664,8 +796,8 @@ export class World {
     if (filter.to) query = query.where('scheduled_at', '<=', filter.to);
     if (filter.before) query = query.where('sequence', '<', filter.before);
     const rows = await query.select(details ? [
-      'sequence', 'id', 'turn_id', 'agent_id', 'agent_name', 'room_id', 'scheduled_at', 'due_at', 'started_at', 'ended_at', 'attempt', 'model', 'action', 'outcome', 'details',
-    ] : ['sequence', 'id', 'turn_id', 'agent_id', 'agent_name', 'room_id', 'scheduled_at', 'due_at', 'started_at', 'ended_at', 'attempt', 'model', 'action', 'outcome'])
+      'sequence', 'id', 'turn_id', 'agent_id', 'agent_name', 'room_id', 'scheduled_at', 'due_at', 'started_at', 'ended_at', 'attempt', 'model', 'action', 'outcome', 'details', 'operation', 'requested_at',
+    ] : ['sequence', 'id', 'turn_id', 'agent_id', 'agent_name', 'room_id', 'scheduled_at', 'due_at', 'started_at', 'ended_at', 'attempt', 'model', 'action', 'outcome', 'operation', 'requested_at'])
       .orderBy('sequence', 'desc').limit(filter.limit + 1).execute();
     const records = rows.slice(0, filter.limit).map(row => this.diagnosticRecord(row));
     return { records, hasMore: rows.length > filter.limit, next: records.at(-1)?.sequence };
@@ -675,6 +807,7 @@ export class World {
     return { sequence: row.sequence, id: row.id, turnId: row.turn_id, agentId: row.agent_id, agentName: row.agent_name,
       roomId: row.room_id, scheduledAt: row.scheduled_at, dueAt: row.due_at, startedAt: row.started_at, endedAt: row.ended_at,
       attempt: row.attempt, model: row.model, action: row.action, outcome: row.outcome,
+      operation: row.operation, ...(row.requested_at ? { requestedAt: row.requested_at } : {}),
       ...(row.details ? { details: JSON.parse(row.details) } : {}) };
   }
 

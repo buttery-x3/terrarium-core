@@ -9,6 +9,7 @@ import {
   deleteAgentSchema,
   defaultSettings, settingsSchema, actionResponseSchema,
   conversationMessageSchema, actionJsonSchema,
+  resolveScheduling, upgradeReflectionSettings,
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
@@ -21,11 +22,11 @@ describe('runtime contracts', () => {
     for (const type of ['speak', 'emote', 'arrival', 'departure']) expect(conversationMessageSchema.safeParse({ ...record, type }).success).toBe(true);
     for (const item of [record, { ...record, type: 'wait' }, { ...record, type: 'emote', content: 'x'.repeat(241) }, { ...record, type: 'emote', energy: 100 }])
       expect(conversationMessageSchema.safeParse(item).success).toBe(false);
-    expect(actionJsonSchema(true).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['emote', 'speak', 'move', 'eat']);
+    expect(actionJsonSchema(true).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['emote', 'speak', 'move', 'wait', 'eat']);
     expect(actionJsonSchema(false).properties.action.anyOf.map(option => option.properties.type.enum[0])).toEqual(['speak', 'move', 'wait', 'eat']);
   });
   it('upgrades version-2 settings while preserving customization and requires complete version-3 settings', () => {
-    const { activity, prompts: { observations, emotes, ...prompts }, ...settings } = defaultSettings;
+    const { activity, scheduling, prompts: { observations, emotes, reflection, ...prompts }, ...settings } = defaultSettings;
     prompts.actionSelection = 'Custom action choices';
     const old = { format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: { ...settings, prompts } };
     const upgraded = configurationSchema.parse(old);
@@ -33,6 +34,25 @@ describe('runtime contracts', () => {
     expect(configurationSchema.safeParse({ ...old, version: 3 }).success).toBe(false);
     expect(configurationSchema.parse({ ...upgraded, version: 3 }).settings).toEqual(upgraded.settings);
     expect(settingsSchema.safeParse({ ...defaultSettings, activity: { emotesEnabled: true } }).success).toBe(false);
+  });
+  it('upgrades prior reflection settings without overwriting custom guidance and validates merged scheduling', () => {
+    const { scheduling, prompts: { reflection, ...prompts }, ...settings } = defaultSettings;
+    const previous = { ...settings, prompts: { ...prompts, actionSelection: 'Custom choices', reminders: 'Custom reminder' } };
+    const upgraded = upgradeReflectionSettings(previous);
+    expect(upgraded.prompts).toMatchObject({ actionSelection: 'Custom choices', reminders: 'Custom reminder', reflection });
+    expect(upgraded.scheduling).toEqual(scheduling);
+    const old = { format: 'terrarium-config', version: 3, rooms: [], agents: [], settings: previous };
+    expect(configurationSchema.parse(old).settings).toEqual(upgraded);
+    expect(configurationSchema.safeParse({ ...old, version: 4 }).success).toBe(false);
+    expect(resolveScheduling(defaultSettings, { timingOverrides: { reflectionIntervalMs: 120000 } })).toEqual({ ...scheduling, reflectionIntervalMs: 120000 });
+    expect(() => resolveScheduling(defaultSettings, { timingOverrides: { speechMinDelayMs: 200000 } })).toThrow('Maximum');
+    expect(() => resolveScheduling(defaultSettings, { timingOverrides: { emoteMaxIntervalMs: 1 } })).toThrow('Maximum');
+    expect(() => resolveScheduling(defaultSettings, { timingOverrides: { reflectionIntervalMs: 0 } })).toThrow();
+    const speech = actionJsonSchema(true).properties.action.anyOf.find(option => option.properties.type.enum[0] === 'speak')!;
+    expect(speech.required).toContain('replyToId');
+    expect(actionSchema.parse({ type: 'speak', message: 'Hello', replyToId: null })).toMatchObject({ replyToId: null });
+    expect(conversationMessageSchema.safeParse({ id: 'event', roomId: 'room-1', agentId: 'a', speaker: 'A', createdAt: '2026-10-19T00:00:00.000Z',
+      content: 'A watches.', type: 'emote', replyToId: 'speech' }).success).toBe(false);
   });
   it('requires complete version-2 prompt settings without restoring missing defaults', () => {
     expect(configurationSchema.parse({ format: 'terrarium-config', version: 2, rooms: [], agents: [], settings: defaultSettings }).settings).toEqual(defaultSettings);

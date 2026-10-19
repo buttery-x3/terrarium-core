@@ -1,20 +1,17 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import type { Agent, AgentActivity, RunState } from '@terrarium/shared';
+import { resolveScheduling, type Agent, type AgentActivity, type ConversationMessage, type DecisionOpportunity, type RunState, type Settings } from '@terrarium/shared';
 import { DiagnosticError, type World } from '@terrarium/persistence';
 import { TurnError } from './turns.js';
+import type { DecisionResult } from './reflection.js';
 
-type TurnHandler = (
-  agent: Agent,
-  signal: AbortSignal,
-  stillCurrent: () => boolean,
-  onApplied: () => void,
-  attemptId?: string,
-) => Promise<void>;
-type ActiveTurn = {
-  controller: AbortController;
-  revision: number;
-  epoch: number;
-  turnId: string;
+type TurnHandler = (agent: Agent, signal: AbortSignal, stillCurrent: () => boolean,
+  onApplied: () => void, attemptId?: string, opportunity?: DecisionOpportunity) => Promise<DecisionResult | void>;
+type ActiveTurn = { controller: AbortController; revision: number; epoch: number; turnId: string; opportunity: DecisionOpportunity };
+type Schedule = {
+  revision: number; reflectionAt: number; emoteAt: number; emoteCheckedAt: number;
+  speechPlan?: NonNullable<DecisionOpportunity['speechPlan']>; engagementAt?: number;
+  engagement?: { roomId: string; rootMessageId: string; targetAgentId: string } | null;
+  lastDecisionAt: number; lastSpeechAt: number; timing: Settings['scheduling'];
 };
 
 export class Scheduler {
@@ -22,129 +19,134 @@ export class Scheduler {
   private epoch = 0;
   private active = new Map<string, ActiveTurn>();
   private activity = new Map<string, AgentActivity>();
+  private schedules = new Map<string, Schedule>();
+  private flights = new Map<string, Promise<unknown>>();
   private ticking = false;
   private timer?: ReturnType<typeof setInterval>;
   private error?: string;
+  private pausedAt?: number;
   private pending = new Set<Promise<void>>();
 
-  constructor(
-    private world: World,
-    private handler: TurnHandler,
-    private publish: (state: RunState) => void,
-    private options = {
-      concurrency: 4,
-      timeoutMs: 60000,
-      retries: 2,
-      backoffMs: 1000,
-    },
-  ) {}
+  constructor(private world: World, private handler: TurnHandler, private publish: (state: RunState) => void,
+    private options = { concurrency: 4, timeoutMs: 60000, retries: 2, backoffMs: 1000 }) {}
 
   snapshot(): RunState {
-    return {
-      state: this.state,
-      agents: [...this.activity.values()],
-      concurrency: this.options.concurrency,
-      ...(this.error ? { error: this.error } : {}),
-    };
+    return { state: this.state, agents: [...this.activity.values()].map(activity => {
+      const schedule = this.schedules.get(activity.agentId);
+      return { ...activity, ...(schedule ? {
+        nextReflectionAt: Math.min(schedule.reflectionAt, schedule.engagementAt ?? Infinity),
+        nextSpeechAt: schedule.speechPlan?.dueAt, nextEmoteAt: Number.isFinite(schedule.emoteAt) ? schedule.emoteAt : undefined,
+      } : {}) };
+    }), concurrency: this.options.concurrency, ...(this.error ? { error: this.error } : {}) };
   }
-  private emit() {
-    this.publish(this.snapshot());
+  private emit() { this.publish(this.snapshot()); }
+  private now() { return this.pausedAt ?? Date.now(); }
+  private emoteDelay(timing: Settings['scheduling']) {
+    return timing.emoteMinIntervalMs + Math.random() * (timing.emoteMaxIntervalMs - timing.emoteMinIntervalMs);
   }
-  watch() {
-    this.timer ??= setInterval(() => {
-      void this.tick();
-    }, 500);
+  private due(schedule: Schedule) {
+    return Math.min(schedule.reflectionAt, schedule.emoteAt, schedule.speechPlan?.dueAt ?? Infinity, schedule.engagementAt ?? Infinity);
   }
-  close() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    return this.stop();
+  private refreshActivity(id: string, error?: string) {
+    const schedule = this.schedules.get(id);
+    if (!schedule || this.active.has(id)) return;
+    this.activity.set(id, { agentId: id, state: error ? 'error' : 'scheduled', dueAt: this.due(schedule), ...(error ? { error } : {}) });
   }
+  watch() { this.timer ??= setInterval(() => { void this.tick(); }, 500); }
+  close() { if (this.timer) clearInterval(this.timer); this.timer = undefined; return this.stop(); }
 
   async start() {
     if (this.state === 'running') return;
+    const epoch = this.epoch;
     await this.world.validateSettings((await this.world.settings()).value);
-    this.error = undefined;
-    this.state = 'running';
-    await this.world.syncEnergy(Date.now(), true);
-    try {
-      await this.changed();
-    } catch (error) {
-      if (error instanceof DiagnosticError) this.diagnosticFailure(error.message);
-      else this.failedStateRead();
-      throw error;
+    if (this.epoch !== epoch || this.snapshot().state === 'running') return;
+    if (this.pausedAt !== undefined) {
+      const elapsed = Date.now() - this.pausedAt;
+      for (const schedule of this.schedules.values()) {
+        schedule.reflectionAt += elapsed; schedule.emoteAt += elapsed; schedule.emoteCheckedAt += elapsed;
+        schedule.lastDecisionAt += elapsed; schedule.lastSpeechAt += elapsed;
+        if (schedule.engagementAt !== undefined) schedule.engagementAt += elapsed;
+        if (schedule.speechPlan) schedule.speechPlan.dueAt += elapsed;
+      }
     }
+    this.pausedAt = undefined; this.error = undefined; this.state = 'running';
+    await this.world.syncEnergy(Date.now(), true);
+    try { await this.changed(); } catch (error) { this.fail(error); throw error; }
     this.emit();
   }
   pause() {
-    if (this.state === 'running') {
-      this.state = 'paused';
-      void this.world.syncEnergy(Date.now(), false).catch(() => this.diagnosticFailure('Could not checkpoint energy.'));
-      this.emit();
-    }
-  }
-  stop() {
-    this.state = 'stopped';
-    this.epoch += 1;
-    this.error = undefined;
-    for (const active of this.active.values()) active.controller.abort();
-    const finishing: Promise<unknown>[] = [this.world.syncEnergy(Date.now(), false).catch(() => this.diagnosticFailure('Could not checkpoint energy.'))];
-    for (const activity of this.activity.values()) if (activity.turnId && !this.active.has(activity.agentId))
-      finishing.push(this.world.endTurn(activity.turnId, 'cancelled-before-start').catch(error => this.diagnosticFailure(error.message)));
-    this.activity.clear();
+    if (this.state !== 'running') return;
+    this.pausedAt = Date.now(); this.state = 'paused';
+    void this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error));
     this.emit();
-    return Promise.allSettled([...finishing, ...this.pending]);
   }
-  hasActiveWork() { return this.active.size > 0 || this.pending.size > 0; }
+  async stop() {
+    this.state = 'stopped'; this.pausedAt = undefined; this.epoch += 1; this.error = undefined;
+    for (const active of this.active.values()) active.controller.abort();
+    this.schedules.clear(); this.activity.clear(); this.emit();
+    await Promise.allSettled([this.world.syncEnergy(Date.now(), false).catch(error => this.fail(error)), ...this.pending]);
+    await this.world.clearEngagements();
+  }
+  hasActiveWork() { return this.active.size > 0 || this.pending.size > 0 || this.flights.size > 0; }
+
   async changed() {
     try {
-    const agents = await this.world.agents();
-    const enabled = new Map(
-      agents.filter((agent) => agent.enabled).map((agent) => [agent.id, agent]),
-    );
-    for (const [id, active] of this.active) {
-      if (enabled.get(id)?.revision !== active.revision)
-        active.controller.abort();
-    }
-    for (const [id, activity] of this.activity)
-      if (!enabled.has(id)) {
-        if (activity.turnId && !this.active.has(id)) await this.world.endTurn(activity.turnId, 'cancelled-before-start');
-        this.activity.delete(id);
+      const [agents, settings, reflections] = await Promise.all([this.world.agents(), this.world.settings(), this.world.reflections()]);
+      const enabled = new Map(agents.filter(agent => agent.enabled).map(agent => [agent.id, agent]));
+      for (const [id, active] of this.active) if (enabled.get(id)?.revision !== active.revision) active.controller.abort();
+      for (const id of this.schedules.keys()) if (!enabled.has(id)) { this.schedules.delete(id); this.activity.delete(id); }
+      if (this.state !== 'stopped') for (const agent of enabled.values()) {
+        let schedule = this.schedules.get(agent.id);
+        if (!schedule || schedule.revision !== agent.revision) {
+          const timing = resolveScheduling(settings.value, agent), now = this.now();
+          const reflection = reflections.find(item => item.agentId === agent.id);
+          schedule = { revision: agent.revision, reflectionAt: now, emoteAt: now + this.emoteDelay(timing),
+            emoteCheckedAt: now, timing, lastDecisionAt: -Infinity,
+            lastSpeechAt: reflection?.lastSpeechAt ? Date.parse(reflection.lastSpeechAt) : -Infinity, engagement: null };
+          this.schedules.set(agent.id, schedule);
+        }
+        if (!settings.value.activity.emotesEnabled) schedule.emoteAt = Infinity;
+        const engagement = schedule.engagement;
+        if (engagement && (!settings.value.scheduling.engagementEnabled || agent.roomId !== engagement.roomId ||
+          !agents.some(other => other.id === engagement.targetAgentId && other.enabled && other.roomId === agent.roomId))) {
+          schedule.engagement = null; schedule.engagementAt = undefined;
+        }
+        if (schedule.speechPlan?.targetAgentId && !agents.some(other => other.id === schedule!.speechPlan!.targetAgentId && other.enabled && other.roomId === agent.roomId))
+          schedule.speechPlan = undefined;
+        this.refreshActivity(agent.id, this.activity.get(agent.id)?.error);
       }
-    if (this.state !== 'stopped') {
-      for (const agent of enabled.values()) {
-        if (
-          !this.active.has(agent.id) &&
-          this.activity.get(agent.id)?.dueAt === undefined
-        )
-          this.activity.set(agent.id, {
-            agentId: agent.id,
-            state: 'scheduled',
-            dueAt: Date.now(),
-            turnId: await this.world.scheduleTurn(agent, Date.now()),
-          });
-      }
-    }
-    this.emit();
-    } catch (error) {
-      if (error instanceof DiagnosticError) this.diagnosticFailure(error.message);
-      throw error;
-    }
+      this.emit();
+    } catch (error) { this.fail(error); throw error; }
   }
 
-  private failedStateRead() {
+  observe(message: ConversationMessage) {
     if (this.state === 'stopped') return;
-    this.error =
-      'Could not read saved agent state. Check the database, then resume.';
-    this.state = 'paused';
-    void this.world.syncEnergy(Date.now(), false).catch(() => {});
+    for (const [id, schedule] of this.schedules) {
+      const engagement = schedule.engagement;
+      if (message.type === 'departure' && message.agentId === engagement?.targetAgentId && message.roomId === engagement.roomId) {
+        schedule.engagement = null; schedule.engagementAt = undefined;
+      }
+      if (message.type === 'departure' && message.agentId === schedule.speechPlan?.targetAgentId) {
+        schedule.speechPlan = undefined; this.refreshActivity(id);
+      }
+      if (message.type !== 'speak' || message.agentId === id || !engagement || !schedule.timing.engagementEnabled ||
+        engagement.roomId !== message.roomId || engagement.rootMessageId !== (message.conversationId ?? message.id)) continue;
+      const dueAt = Math.max(this.now(), schedule.lastDecisionAt + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
+      schedule.engagementAt = Math.min(schedule.engagementAt ?? Infinity, dueAt);
+      this.refreshActivity(id);
+    }
     this.emit();
   }
 
-  private diagnosticFailure(message: string) {
-    if (this.state !== 'stopped') this.state = 'paused';
-    this.error = `${message} The run cannot continue without durable diagnostics. Choose Stop, resolve the problem, then Start.`;
-    for (const active of this.active.values()) active.controller.abort();
+  private fail(error: unknown) {
+    if (error instanceof DiagnosticError) {
+      if (this.state !== 'stopped') { this.state = 'paused'; this.pausedAt ??= Date.now(); }
+      this.error = error.message + ' The run cannot continue without durable diagnostics. Choose Stop, resolve the problem, then Start.';
+      for (const active of this.active.values()) active.controller.abort();
+    } else if (this.state !== 'stopped') {
+      this.state = 'paused'; this.pausedAt ??= Date.now();
+      this.error = 'Could not read saved agent state. Check the database, then resume.';
+    }
     void this.world.syncEnergy(Date.now(), false).catch(() => {});
     this.emit();
   }
@@ -152,150 +154,123 @@ export class Scheduler {
   async tick() {
     if (this.ticking || this.state !== 'running') return;
     this.ticking = true;
+    const epoch = this.epoch;
     try {
-      await this.world.syncEnergy();
+      await this.world.syncEnergy(); await this.changed();
       const agents = await this.world.agents();
-      if (this.state !== 'running') return;
-      agents.sort(
-        (left, right) =>
-          (this.activity.get(left.id)?.dueAt ?? Infinity) -
-          (this.activity.get(right.id)?.dueAt ?? Infinity),
-      );
+      if (this.state !== 'running' || this.epoch !== epoch) return;
+      agents.sort((a, b) => (this.activity.get(a.id)?.dueAt ?? Infinity) - (this.activity.get(b.id)?.dueAt ?? Infinity));
       for (const agent of agents) {
-        if (this.active.size >= this.options.concurrency) break;
-        const activity = this.activity.get(agent.id);
-        if (
-          !agent.enabled ||
-          this.active.has(agent.id) ||
-          !activity ||
-          (activity.dueAt ?? Infinity) > Date.now()
-        )
-          continue;
-        const active = {
-          controller: new AbortController(),
-          revision: agent.revision,
-          epoch: this.epoch,
-          turnId: activity.turnId ?? await this.world.scheduleTurn(agent, activity.dueAt ?? Date.now()),
+        // INVARIANT: a timed-out handler retains its slot until it actually settles.
+        if (new Set([...this.active.keys(), ...this.flights.keys()]).size >= this.options.concurrency) break;
+        const schedule = this.schedules.get(agent.id), now = Date.now();
+        if (!agent.enabled || !schedule || this.active.has(agent.id) || this.flights.has(agent.id) || this.due(schedule) > now) continue;
+        const dueAt = this.due(schedule), engagement = (schedule.engagementAt ?? Infinity) <= now;
+        const opportunity: DecisionOpportunity = {
+          reflection: schedule.reflectionAt <= now || engagement,
+          speech: (schedule.speechPlan?.dueAt ?? Infinity) <= now, emote: schedule.emoteAt <= now,
+          requestedAt: schedule.speechPlan?.dueAt === dueAt ? schedule.speechPlan.requestedAt : dueAt,
+          reason: engagement ? 'engagement' : (schedule.speechPlan?.dueAt ?? Infinity) <= now ? 'scheduled-speech' : 'cadence',
+          ...((schedule.speechPlan?.dueAt ?? Infinity) <= now ? { speechPlan: { ...schedule.speechPlan! } } : {}),
         };
+        const operation = opportunity.reflection ? 'reflection' : opportunity.speech ? 'speech' : 'emote';
+        const active: ActiveTurn = { controller: new AbortController(), revision: agent.revision, epoch: this.epoch,
+          turnId: await this.world.scheduleTurn(agent, dueAt, operation, opportunity.requestedAt), opportunity };
+        if (this.state !== 'running' || this.epoch !== epoch) { await this.world.endTurn(active.turnId, 'cancelled-before-start'); break; }
+        if (opportunity.reflection) { schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs; schedule.engagementAt = undefined; }
+        if (opportunity.speech) schedule.speechPlan = undefined;
+        if (opportunity.emote) { schedule.emoteCheckedAt = now; schedule.emoteAt = now + this.emoteDelay(schedule.timing); }
         this.active.set(agent.id, active);
-        this.activity.set(agent.id, { agentId: agent.id, state: 'running', turnId: active.turnId });
-        this.emit();
+        this.activity.set(agent.id, { agentId: agent.id, state: 'running', operation, turnId: active.turnId }); this.emit();
         const task = this.run(agent, active);
-        this.pending.add(task);
-        void task.finally(() => this.pending.delete(task));
+        this.pending.add(task); void task.finally(() => this.pending.delete(task));
       }
-    } catch (error) {
-      if (error instanceof DiagnosticError) this.diagnosticFailure(error.message);
-      else this.failedStateRead();
-    } finally {
-      this.ticking = false;
-    }
+    } catch (error) { this.fail(error); }
+    finally { this.ticking = false; }
   }
 
   private async run(agent: Agent, active: ActiveTurn) {
-    let failure: string | undefined;
-    let outcome = 'cancelled';
-    const current = () =>
-      this.epoch === active.epoch &&
-      !active.controller.signal.aborted &&
-      this.state !== 'stopped';
+    let failure: string | undefined, outcome = 'cancelled';
+    let requestedEmote = false;
+    const current = () => this.epoch === active.epoch && !active.controller.signal.aborted && this.state !== 'stopped';
     try {
       for (let attempt = 0; attempt <= this.options.retries; attempt++) {
-        let applied = false;
+        let applied = false, settled = false;
         active.controller.signal.throwIfAborted();
         const attemptId = await this.world.startAttempt(active.turnId, attempt + 1, agent);
         const attemptController = new AbortController();
-        const signal = AbortSignal.any([
-          active.controller.signal,
-          attemptController.signal,
-        ]);
-        const timeout = setTimeout(
-          () =>
-            attemptController.abort(new Error('The model request timed out.')),
-          this.options.timeoutMs,
-        );
+        const signal = AbortSignal.any([active.controller.signal, attemptController.signal]);
+        const timeout = setTimeout(() => attemptController.abort(new Error('The model request timed out.')), this.options.timeoutMs);
         let cancel: (() => void) | undefined;
         try {
           const aborted = new Promise<never>((_, reject) => {
-            cancel = () =>
-              reject(signal.reason ?? new Error('Turn cancelled.'));
-            signal.addEventListener('abort', cancel, { once: true });
-            if (signal.aborted) cancel();
+            cancel = () => reject(signal.reason ?? new Error('Turn cancelled.'));
+            signal.addEventListener('abort', cancel, { once: true }); if (signal.aborted) cancel();
           });
-          await Promise.race([
-            this.handler(
-              agent,
-              signal,
-              () => current() && !signal.aborted,
-              () => {
-                applied = true;
-              },
-              attemptId,
-            ),
-            aborted,
-          ]);
-          failure = undefined;
-          outcome = 'completed';
-          await this.world.updateDiagnostic(attemptId, {}, 'completed');
-          break;
+          const handler = this.handler(agent, signal, () => current() && !signal.aborted, () => { applied = true; }, attemptId, active.opportunity);
+          this.flights.set(agent.id, handler);
+          const settledHandler = handler.finally(() => {
+            settled = true; if (this.flights.get(agent.id) === handler) this.flights.delete(agent.id);
+          });
+          const result = await Promise.race([settledHandler, aborted]);
+          requestedEmote = Boolean(result?.reflectionProcessed && result.requestEmote);
+          if (result && current()) await this.acceptResult(agent, active, result);
+          failure = undefined; outcome = 'completed';
+          await this.world.updateDiagnostic(attemptId, {}, outcome); break;
         } catch (error) {
           const reason = error instanceof Error ? error.message : 'The turn failed.';
           outcome = !current() ? 'cancelled' : attemptController.signal.aborted ? 'timeout' : error instanceof TurnError ? error.category : 'provider';
-          if (error instanceof DiagnosticError) {
-            this.diagnosticFailure(error.message); outcome = 'diagnostic-failure';
-            await this.world.updateDiagnostic(attemptId, { error: error.message }, outcome).catch(() => {});
-            break;
-          }
+          if (error instanceof DiagnosticError) { this.fail(error); outcome = 'diagnostic-failure'; }
           await this.world.updateDiagnostic(attemptId, { error: reason }, applied ? 'applied-notification-failure' : outcome);
-          if (!current()) break;
-          failure = `Attempt ${attempt + 1}/${this.options.retries + 1} failed: ${reason}`;
-          if (applied) break;
-          if (attempt < this.options.retries)
-            await delay(this.options.backoffMs * 2 ** attempt, undefined, {
-              signal: active.controller.signal,
-            });
-        } finally {
-          clearTimeout(timeout);
-          if (cancel) signal.removeEventListener('abort', cancel);
-        }
+          if (!current() || error instanceof DiagnosticError) break;
+          failure = 'Attempt ' + (attempt + 1) + '/' + (this.options.retries + 1) + ' failed: ' + reason;
+          if (applied || outcome === 'stale') break;
+          if (attempt < this.options.retries) await delay(this.options.backoffMs * 2 ** attempt, undefined, { signal: active.controller.signal });
+          if (!settled) break;
+        } finally { clearTimeout(timeout); if (cancel) signal.removeEventListener('abort', cancel); }
       }
     } catch (error) {
-      if (error instanceof DiagnosticError) {
-        outcome = 'diagnostic-failure';
-        this.diagnosticFailure(error.message);
-        await this.world.updateDiagnostic(active.turnId, { error: error.message }, outcome).catch(() => {});
-      }
-      if (current()) failure = 'The turn failed.';
+      if (error instanceof DiagnosticError) { outcome = 'diagnostic-failure'; this.fail(error); }
+      if (current()) failure ??= 'The turn failed.';
     } finally {
-      this.active.delete(agent.id);
+      if (this.active.get(agent.id) === active) this.active.delete(agent.id);
       try {
         await this.world.endTurn(active.turnId, outcome);
-        const latest = await this.world.agent(agent.id);
-        if (this.state !== 'stopped' && latest?.enabled && !this.error) {
-          const dueAt =
-            Date.now() +
-            latest.minIntervalMs +
-            Math.random() * (latest.maxIntervalMs - latest.minIntervalMs);
-          this.activity.set(agent.id, {
-            agentId: agent.id,
-            state: failure ? 'error' : 'scheduled',
-            dueAt,
-            ...(failure ? { error: failure } : {}),
-            turnId: await this.world.scheduleTurn(latest, dueAt),
-          });
-        } else this.activity.delete(agent.id);
-      } catch (error) {
-        if (error instanceof DiagnosticError) this.diagnosticFailure(error.message);
-        else if (this.state !== 'stopped') {
-          this.activity.set(agent.id, {
-            agentId: agent.id,
-            state: 'error',
-            error: 'Could not reload agent state.',
-          });
-          this.failedStateRead();
-        }
-      }
+        const schedule = this.schedules.get(agent.id), latest = await this.world.agent(agent.id);
+        if (schedule && latest?.enabled && this.state !== 'stopped' && this.epoch === active.epoch && schedule.revision === active.revision) {
+          const now = this.now(); schedule.lastDecisionAt = now;
+          if (schedule.engagementAt !== undefined)
+            schedule.engagementAt = Math.max(schedule.engagementAt, now + schedule.timing.speechCooldownMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs);
+          if (active.opportunity.reflection) schedule.reflectionAt = now + schedule.timing.reflectionIntervalMs;
+          if (active.opportunity.emote) {
+            schedule.emoteCheckedAt = now;
+            schedule.emoteAt = now + (requestedEmote ? schedule.timing.emoteMinIntervalMs : this.emoteDelay(schedule.timing));
+          }
+          if (latest.revision !== agent.revision && schedule.revision === agent.revision) {
+            schedule.revision = latest.revision; schedule.speechPlan = undefined; schedule.engagement = null; schedule.engagementAt = undefined;
+          }
+          this.refreshActivity(agent.id, failure);
+        } else if (schedule && latest?.enabled && this.state !== 'stopped') this.refreshActivity(agent.id);
+        else this.activity.delete(agent.id);
+      } catch (error) { this.fail(error); }
       this.emit();
     }
+  }
+
+  private async acceptResult(agent: Agent, active: ActiveTurn, result: DecisionResult) {
+    const schedule = this.schedules.get(agent.id);
+    if (!schedule || schedule.revision !== active.revision) return;
+    const now = this.now();
+    if (result.action?.type === 'speak') schedule.lastSpeechAt = now;
+    if (!result.reflectionProcessed) return;
+    if (result.speechPlan) {
+      const delayMs = Math.max(schedule.timing.speechMinDelayMs, Math.min(schedule.timing.speechMaxDelayMs, result.speechPlan.delayMs));
+      schedule.speechPlan = { dueAt: Math.max(now + delayMs, schedule.lastSpeechAt + schedule.timing.speechCooldownMs),
+        requestedAt: Date.now(), replyToId: result.speechPlan.replyToId, targetAgentId: result.speechPlan.targetAgentId };
+    } else schedule.speechPlan = undefined;
+    schedule.engagement = result.engagement ? { ...result.engagement, roomId: agent.roomId } : null;
+    if (!schedule.engagement) schedule.engagementAt = undefined;
+    if (result.requestEmote && Number.isFinite(schedule.emoteAt))
+      schedule.emoteAt = Math.min(schedule.emoteAt, Math.max(now, schedule.emoteCheckedAt + schedule.timing.emoteMinIntervalMs));
   }
 }

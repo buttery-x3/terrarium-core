@@ -2,8 +2,9 @@
   import { onMount } from "svelte";
   import { io } from "socket.io-client";
   import ActivityItem from "./ActivityItem.svelte";
+  import AgentInspector from "./AgentInspector.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
-  import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, Result, Room, RunState, WorldState } from "@terrarium/shared";
+  import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
   let connected = false;
@@ -38,7 +39,10 @@
   let activeSettings: Settings = structuredClone(defaultSettings);
   let settingsVersion = 0;
   let promptAgent = "";
+  let promptOperation: "reflection" | "speech" | "emote" = "reflection";
   let promptPreview: { payload: { model: string; instructions: string; input: unknown; text: unknown }; constraints: string } | undefined;
+  let reflections: ReflectionState[] = [];
+  let reflectionRequest = 0;
   let diagnosticAgent = "", diagnosticRoom = "", diagnosticAction = "", diagnosticOutcome = "", diagnosticFrom = "", diagnosticTo = "";
   let diagnosticPage: DiagnosticPage = { records: [], hasMore: false };
   let diagnosticBefore: number | undefined;
@@ -51,6 +55,16 @@
   let enabled = false;
   let minimumSeconds = 10;
   let maximumSeconds = 30;
+  const timingFields = [
+    { key: "reflectionIntervalMs", label: "Reflection interval" },
+    { key: "speechMinDelayMs", label: "Minimum speech delay" },
+    { key: "speechMaxDelayMs", label: "Maximum speech delay" },
+    { key: "speechCooldownMs", label: "Speech cooldown" },
+    { key: "emoteMinIntervalMs", label: "Minimum emote interval" },
+    { key: "emoteMaxIntervalMs", label: "Maximum emote interval" },
+  ] as const;
+  type TimingKey = typeof timingFields[number]["key"];
+  let agentTimingSeconds: Partial<Record<TimingKey, number>> = {};
   let contextMessages = 30;
   let importConfiguration: Configuration | undefined;
   let importPreview: ConfigurationPreview | undefined;
@@ -119,7 +133,17 @@
     motivations = agent?.motivations ?? ""; intention = agent?.intention ?? "";
     agentRoom = agent?.roomId ?? selectedRoom; agentModel = agent?.model ?? "gpt-6-luna"; enabled = agent?.enabled ?? false;
     minimumSeconds = (agent?.minIntervalMs ?? 10000) / 1000; maximumSeconds = (agent?.maxIntervalMs ?? 30000) / 1000;
+    agentTimingSeconds = {};
+    for (const { key } of timingFields) if (agent?.timingOverrides?.[key] !== undefined) agentTimingSeconds[key] = agent.timingOverrides[key]! / 1000;
     contextMessages = agent?.contextMessageLimit ?? 30;
+  }
+  async function loadReflections() {
+    if (!connected) return;
+    const sequence = ++reflectionRequest;
+    try {
+      const states = await request<ReflectionState[]>("reflection:list", {});
+      if (sequence === reflectionRequest && connected) reflections = states;
+    } catch (failure) { if (sequence === reflectionRequest && connected) error = failure instanceof Error ? failure.message : "Could not load private character state."; }
   }
   async function deleteAgent() {
     if (!deleteAgentConfirmation) return;
@@ -220,11 +244,12 @@
     socket.on("connect", () => {
       connected = true;
       void loadDiagnostics();
+      void loadReflections();
       // INVARIANT: reconnect discards caches that may have missed a conversation clear.
       histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
     });
-    socket.on("disconnect", () => { connected = false; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
+    socket.on("disconnect", () => { connected = false; reflections = []; reflectionRequest++; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
@@ -244,6 +269,7 @@
       agents = agents.map(agent => ({ ...agent, energy: energy.get(agent.id) ?? agent.energy }));
     });
     socket.on("diagnostics:changed", () => { if (!diagnosticBefore) void loadDiagnostics(); });
+    socket.on("reflection:changed", () => { void loadReflections(); });
     socket.on("conversation:cleared", (result: HistoryCleared) => {
       resetHistory(result.roomIds); clearConfirmation = undefined;
       void loadHistory(selectedRoom);
@@ -282,7 +308,7 @@
   </section>
   <section>
     <h2>Configuration files</h2>
-    <p>Save rooms and agents as JSON, including instructions, model, timing, enabled state and current room. Conversation history and ChatGPT credentials stay separate.</p>
+    <p>Save rooms and agents as JSON, including instructions, model, timing, enabled state and current room. Conversation history, generated private character state and ChatGPT credentials stay separate.</p>
     <button disabled={!connected || busy} on:click={() => perform(exportConfiguration)}>Export configuration</button>
     <label>Import configuration JSON <input type="file" accept=".json,application/json" disabled={!connected || busy} on:change={readConfigurationFile} /></label>
     <p>Files can be up to 512 KiB. Import updates matching IDs and adds new IDs. Entries absent from the file are kept.</p>
@@ -317,7 +343,7 @@
     {#if runState.state !== "stopped"}<p>Choose Stop before clearing conversation history.</p>{/if}
     {#if clearConfirmation}
       <div role="group" aria-label="Confirm conversation clearing">
-        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agent conversation context. Rooms, agents and their settings will be kept. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
+        <p>Permanently delete all saved messages in {clearConfirmation.label}? This cannot be undone. The messages will also be removed from agents' observed conversation memory. Rooms, agents and their settings will be kept. Generated private reactions and intentions are retained and may still reflect this conversation. Affected exchange subscriptions are cleared. Diagnostic snapshots and downloaded exports may still contain this conversation. Use Clear diagnostics separately to remove stored diagnostic copies.</p>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(clearHistory)}>Permanently delete messages</button>
         <button disabled={busy} on:click={() => { clearConfirmation = undefined; }}>Cancel clearing</button>
       </div>
@@ -353,7 +379,7 @@
   </section>
   <section>
     <h2>Agents</h2>
-    <p>Each agent can have one active turn. Up to {runState.concurrency} requests run at once.</p>
+    <p>Each agent can have one active operation. Up to {runState.concurrency} requests run at once. Reflection, speech and emotes have independent schedules; an opportunity can produce no outward action.</p>
     <ul>{#each agents as agent}
       <li><strong>{agent.name}</strong> · {rooms.find(room => room.id === agent.roomId)?.name ?? agent.roomId} · {agent.enabled ? "Enabled" : "Disabled"}
         · Energy {agent.energy.toFixed(2)} / {activeSettings.energy.maximum}
@@ -366,17 +392,16 @@
             <button disabled={busy} on:click={() => { deleteAgentConfirmation = undefined; }}>Cancel deletion</button>
           </div>
         {/if}
-        {#each runState.agents.filter(item => item.agentId === agent.id) as activity}
-          <p>{activity.state}{#if activity.dueAt} · Next turn after {new Date(activity.dueAt).toLocaleTimeString()}{/if}</p>
-          {#if activity.error}<p role="alert">{activity.error}</p>{/if}
-        {/each}
+        <AgentInspector {agent} {agents} reflection={reflections.find(item => item.agentId === agent.id)} activity={runState.agents.find(item => item.agentId === agent.id)} />
       </li>
     {:else}<li>No agents configured.</li>{/each}</ul>
     <button on:click={() => editAgent()}>New agent</button>
     <form on:submit|preventDefault={() => perform(async () => {
+      const timingOverrides: NonNullable<AgentInput["timingOverrides"]> = {};
+      for (const { key } of timingFields) if (agentTimingSeconds[key] !== undefined) timingOverrides[key] = Math.round(agentTimingSeconds[key]! * 1000);
       const input: AgentInput = { ...(agentId ? { id: agentId } : {}), name: agentName, instructions, motivations, intention, roomId: agentRoom,
         provider: "chatgpt", model: agentModel, enabled, minIntervalMs: Math.round(minimumSeconds * 1000),
-        maxIntervalMs: Math.round(maximumSeconds * 1000), contextMessageLimit: contextMessages };
+        maxIntervalMs: Math.round(maximumSeconds * 1000), contextMessageLimit: contextMessages, timingOverrides };
       const saved = await request<Agent>("agents:save", input); if (agents.some(agent => agent.id === saved.id)) editAgent(saved); notice = "Agent saved.";
     })}>
       <h3>{agentId ? "Edit agent" : "Create agent"}</h3>
@@ -385,13 +410,20 @@
       <label>Motivations and preferences <textarea bind:value={motivations} maxlength="8000" rows="4"></textarea></label>
       <p>Interests, company or solitude, conversational preferences and tolerance for repetition. There is no boredom meter or forced movement timer.</p>
       <label>Current intention (optional) <textarea bind:value={intention} maxlength="1000" rows="2"></textarea></label>
-      <p>An operator-configured immediate aim. Agents cannot rewrite it or store private notes.</p>
+      <p>An operator-configured immediate aim. Generated private reactions and intentions are saved separately and shown in the agent inspector.</p>
       <label>Current room <select bind:value={agentRoom} required>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
       <label>ChatGPT model <input bind:value={agentModel} list="chatgpt-models" required /></label>
       <datalist id="chatgpt-models">{#each models as model}<option value={model}></option>{/each}</datalist>
       <button type="button" disabled={!auth.connected || busy} on:click={discoverModels}>Refresh available models</button>
-      <label>Minimum seconds between turns <input type="number" min="0.001" step="0.001" bind:value={minimumSeconds} required /></label>
-      <label>Maximum seconds between turns <input type="number" min={minimumSeconds} step="0.001" bind:value={maximumSeconds} required /></label>
+      <h4>Timing overrides</h4>
+      <p>Leave a field blank to inherit its saved shared setting. All values are seconds. These schedules replace the legacy interval between turns.</p>
+      {#each timingFields as field}
+        <label>{field.label} override (seconds)
+          <input type="number" min="0.001" step="0.001" placeholder={String(activeSettings.scheduling[field.key] / 1000)} bind:value={agentTimingSeconds[field.key]} />
+          <small>Shared setting: {activeSettings.scheduling[field.key] / 1000} seconds</small>
+        </label>
+      {/each}
+      <details><summary>Legacy timing retained for configuration compatibility</summary><p>Saved legacy interval: {minimumSeconds}–{maximumSeconds} seconds. Superseded by reflection, speech and emote schedules.</p></details>
       <label>Personal memory limit <input type="number" min="1" max="50" bind:value={contextMessages} required /></label>
       <p>Keep this many personally observed speech and activity items across rooms. New agents start with empty memory; earlier room history is not included. Reducing the limit discards older observations.</p>
       <label><input type="checkbox" bind:checked={enabled} /> Enabled</label>
@@ -403,9 +435,18 @@
     <p>Saved settings version {settingsVersion}. Stop before saving changes. Prompt preview uses saved settings.</p>
     <p>Active energy rules: {activeSettings.energy.enabled ? "enabled" : "disabled"}; initial {activeSettings.energy.initial}; maximum {activeSettings.energy.maximum}; depletion {activeSettings.energy.depletionPerMinute} per running minute; low at {activeSettings.energy.lowThreshold} or below; meals fill to maximum.</p>
     <form on:submit|preventDefault={() => perform(async () => { await request("settings:save", settings); notice = "Shared settings saved."; })}>
+      <h3>Reflection and action timing</h3>
+      <p>Reflection updates private character state and may schedule speech or emotes. Due speech and emote opportunities use fresh local context. Remaining inactive is valid; movement and eating do not wait for speech eligibility.</p>
+      {#each timingFields as field}
+        <label>{field.label} (seconds)
+          <input type="number" min="0.001" step="0.001" value={settings.scheduling[field.key] / 1000} required on:input={event => { settings.scheduling[field.key] = Math.round(event.currentTarget.valueAsNumber * 1000); }} />
+        </label>
+      {/each}
+      <label><input type="checkbox" bind:checked={settings.scheduling.engagementEnabled} /> Allow subscriptions to one local exchange per agent</label>
+      <p>A reply in a subscribed exchange can advance one speech opportunity within the cooldown. Repeated triggers combine; leaving the exchange removes the subscription.</p>
       <h3>Observable activity</h3>
       <label><input type="checkbox" bind:checked={settings.activity.roomEventsEnabled} /> Record automatic room arrival and departure events</label>
-      <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Use observable emotes instead of silent waits</label>
+      <label><input type="checkbox" bind:checked={settings.activity.emotesEnabled} /> Allow observable emote opportunities</label>
       <p>Movement events are observed only by residents present at the time, including the moving agent. Turning them off prevents new movement records. Other speech and emote observations continue.</p>
       <h3>Energy</h3>
       <label><input type="checkbox" bind:checked={settings.energy.enabled} /> Enable energy and eating</label>
@@ -418,7 +459,7 @@
       <p>These sections are assembled in the order below, followed by resolved local context and enforced protocol constraints. There is no hidden behavioural fallback.</p>
       {#each Object.keys(defaultPrompts) as name}
         {@const key = name as keyof typeof defaultPrompts}
-        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance" })[key]}
+        <label>{({ framing: "Role and framing", profiles: "Profile interpretation", actionSelection: "Action selection", energy: "Energy and food guidance", reminders: "Reminders", observations: "Personal observation guidance", emotes: "Observable emote guidance", reflection: "Private reflection guidance" })[key]}
           <textarea rows="4" maxlength="8000" required={key !== "reminders"} bind:value={settings.prompts[key]}></textarea>
         </label>
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>
@@ -432,8 +473,9 @@
   <section aria-label="Prompt preview">
     <h2>Assembled prompt preview</h2>
     <label>Preview agent <select bind:value={promptAgent} on:change={() => { promptPreview = undefined; }}>{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</select></label>
-    <button disabled={!connected || busy || !promptAgent} on:click={() => perform(async () => { promptPreview = await request("prompt:preview", { agentId: promptAgent }); })}>Preview saved prompt</button>
-    <p>Preview reads current saved state without requesting a model or applying a turn. The payload shows Terrarium's instructions, input, model and output schema. It does not show provider-internal instructions or reasoning.</p>
+    <label>Preview operation <select bind:value={promptOperation} on:change={() => { promptPreview = undefined; }}><option value="reflection">Private reflection</option><option value="speech">Speech opportunity</option><option value="emote">Emote opportunity</option></select></label>
+    <button disabled={!connected || busy || !promptAgent} on:click={() => perform(async () => { promptPreview = await request("prompt:preview", { agentId: promptAgent, operation: promptOperation }); })}>Preview saved prompt</button>
+    <p>Preview reads current saved state without requesting a model or applying an operation. The payload shows Terrarium's instructions, input, model and output schema. It does not show provider-internal instructions or reasoning.</p>
     {#if promptPreview}
       <p>Model: {promptPreview.payload.model}</p>
       <h3>Instructions in request order</h3>
@@ -446,7 +488,7 @@
   </section>
   <section aria-label="Decision diagnostics">
     <h2>Decision diagnostics</h2>
-    <p>Operator-only history. Attempt 0 records scheduling and the overall turn; numbered attempts record requests. A numbered attempt without an action produced no validated action. Intention is model self-report, not a verified explanation.</p>
+    <p>Operator-only history. Attempt 0 records scheduling and the overall operation; numbered attempts record requests. Reflection can update private character state without an outward action. Intention is generated character state, not a verified explanation.</p>
     {#if diagnosticUsage}<p>Stored payloads: {(diagnosticUsage.bytes / 1048576).toFixed(2)} MiB; reserved: {(diagnosticUsage.reservedBytes / 1048576).toFixed(2)} MiB; budget: {diagnosticUsage.limitBytes / 1048576} MiB. Retained until explicitly cleared.</p>{/if}
     <form on:submit|preventDefault={() => loadDiagnostics()}>
       <label>Agent ID (empty for all; deleted IDs supported) <input bind:value={diagnosticAgent} list="diagnostic-agents" /></label>
@@ -467,10 +509,10 @@
     {/if}
     <ol aria-label="Activity records">
       {#each diagnosticPage.records as record (record.id)}
-        <li><strong>{record.agentName}</strong> · {new Date(record.scheduledAt).toLocaleString()} · {record.roomId} · attempt {record.attempt} · {record.action ?? (record.attempt === 0 ? "Scheduling summary" : "No validated action")} · {record.outcome}
-          <p>Due {new Date(record.dueAt).toLocaleString()} · started {record.startedAt ? new Date(record.startedAt).toLocaleString() : "not started"} · ended {record.endedAt ? new Date(record.endedAt).toLocaleString() : "pending"}</p>
+        <li><strong>{record.agentName}</strong> · {record.operation ?? "Legacy turn"} · {new Date(record.scheduledAt).toLocaleString()} · {record.roomId} · attempt {record.attempt} · {record.action ?? (record.attempt === 0 ? "Scheduling summary" : "No outward action")} · {record.outcome}
+          <p>Requested {new Date(record.requestedAt ?? record.scheduledAt).toLocaleString()} · scheduled {new Date(record.scheduledAt).toLocaleString()} · due {new Date(record.dueAt).toLocaleString()} · started {record.startedAt ? new Date(record.startedAt).toLocaleString() : "not started"} · ended {record.endedAt ? new Date(record.endedAt).toLocaleString() : "pending"}</p>
           <details on:toggle={event => { if ((event.currentTarget as HTMLDetailsElement).open) void perform(async () => { diagnosticDetails = { ...diagnosticDetails, [record.id]: await request<DiagnosticRecord>("diagnostics:get", { id: record.id }) }; }); }}>
-            <summary>Inspect turn {record.turnId}, attempt {record.attempt}</summary>
+            <summary>Inspect operation {record.turnId}, attempt {record.attempt}</summary>
             {#if diagnosticDetails[record.id]}
               {@const detail = diagnosticDetails[record.id].details}
               {#if detail?.energySeen !== undefined}<p>Energy seen by model: {detail.energySeen}. Before action: {detail.energyBefore ?? "not applied"}. After action: {detail.energyAfter ?? "not applied"}.</p>{/if}

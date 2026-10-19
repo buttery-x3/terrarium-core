@@ -26,7 +26,7 @@ import {
   type LmProvider,
 } from '@terrarium/lm-providers';
 import { Scheduler } from './scheduler.js';
-import { performTurn, previewPrompt } from './turns.js';
+import { performDecision, previewDecision } from './reflection.js';
 
 function conversationMarkdown(snapshot: ConversationExport) {
   const label = (value: string) => value
@@ -94,12 +94,15 @@ export async function createApplication(options: {
       throw new Error('Configuration import is in progress. Try again when it finishes.');
   };
   const publishMessage = (message: ConversationMessage) => {
+    scheduler.observe(message);
     config.emit('conversation:message', message);
     terrain.emit('conversation:message', message);
+    config.emit('reflection:changed');
   };
   const publishWorld = async () => {
     const state = await world.state();
     config.emit('world:state', state);
+    config.emit('reflection:changed');
     terrain.emit(
       'rooms:list',
       state.rooms.map((room) => room.id),
@@ -107,8 +110,8 @@ export async function createApplication(options: {
   };
   const scheduler = new Scheduler(
     world,
-    (agent, signal, current, applied, attemptId) =>
-      performTurn(
+    async (agent, signal, current, applied, attemptId, opportunity) => {
+      const result = await performDecision(
         world,
         agent,
         options.provider,
@@ -118,7 +121,11 @@ export async function createApplication(options: {
         publishWorld,
         applied,
         attemptId,
-      ),
+        opportunity!,
+      );
+      config.emit('reflection:changed');
+      return result;
+    },
     (state) => { config.emit('run:state', state); config.emit('diagnostics:changed'); },
   );
   scheduler.watch();
@@ -189,6 +196,7 @@ export async function createApplication(options: {
       try {
         const result = await world.clearHistory(input);
         config.emit('conversation:cleared', result);
+        config.emit('reflection:changed');
         terrain.emit('conversation:cleared', result);
         return result;
       } finally {
@@ -225,10 +233,12 @@ export async function createApplication(options: {
       try { const saved = await world.saveSettings(input); await publishWorld(); return saved; }
       finally { importingConfiguration = false; }
     });
-    command('prompt:preview', z.object({ agentId: z.string().min(1) }).strict(), async input => {
+    command('reflection:list', z.object({}).strict(), () => world.reflections());
+    command('prompt:preview', z.object({ agentId: z.string().min(1), operation: z.enum(['reflection', 'speech', 'emote']).optional() }).strict(), async input => {
       const agent = await world.agent(input.agentId);
       if (!agent) throw new Error('Agent does not exist.');
-      return previewPrompt(world, agent);
+      const operation = input.operation ?? 'reflection';
+      return previewDecision(world, agent, { reflection: operation === 'reflection', speech: operation === 'speech', emote: operation === 'emote', requestedAt: Date.now(), reason: 'cadence' });
     });
     command('diagnostics:list', diagnosticFilterSchema, input => world.diagnostics(input));
     command('diagnostics:export', diagnosticFilterSchema, input => world.diagnostics(input, true));
@@ -272,7 +282,7 @@ export async function createApplication(options: {
         throw new Error('Connect ChatGPT before starting agents.');
       if (input === 'start') await scheduler.start();
       else if (input === 'pause') scheduler.pause();
-      else await scheduler.stop();
+      else { await scheduler.stop(); config.emit('reflection:changed'); }
       return scheduler.snapshot();
     });
     command('auth:models', z.object({}).strict(), async () => {

@@ -60,6 +60,24 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('updates private reflection through a running decision without publishing room activity', async () => {
+    const complete = vi.fn(async () => ({ content: JSON.stringify({ reflection: { reaction: 'Listening with interest.', intention: null },
+      speechPlan: null, requestEmote: false, engagement: null, action: { type: 'wait' } }) }));
+    const url = await setup({ name: 'fake', complete }), config = connect(url), terrain = connect(url, 'terrain');
+    await Promise.all([ready(config), ready(terrain)]);
+    const saved = await request(config, 'agents:save', { name: 'Listener', instructions: 'Observe', roomId: 'room-1',
+      provider: 'chatgpt', model: 'fake', enabled: true, minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 });
+    const publicMessage = vi.fn(), changed = vi.fn();
+    terrain.on('conversation:message', publicMessage); config.on('reflection:changed', changed);
+    await request(config, 'run:control', 'start');
+    await vi.waitFor(async () => expect((await request(config, 'reflection:list', {})).value)
+      .toEqual([expect.objectContaining({ agentId: saved.value.id, reaction: 'Listening with interest.' })]));
+    await request(config, 'run:control', 'stop');
+    expect(complete).toHaveBeenCalledOnce(); expect(changed).toHaveBeenCalled(); expect(publicMessage).not.toHaveBeenCalled();
+    expect((await request(config, 'history:get', { roomId: 'room-1' })).value.messages).toEqual([]);
+    expect((await request(config, 'prompt:preview', { agentId: saved.value.id, operation: 'speech' })).value.context.privateState.reaction)
+      .toBe('Listening with interest.');
+  });
   it('broadcasts typed movement and emotes once, recovers both views, and exports distinct activity with personal previews', async () => {
     const url = await setup(), config = connect(url), terrain = connect(url, 'terrain');
     await Promise.all([ready(config), ready(terrain)]);
@@ -88,7 +106,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(3);
+    expect(exported.version).toBe(4);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -357,7 +375,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 3,
+      version: 4,
       agents: [],
     });
     const configuration = {
@@ -443,7 +461,7 @@ describe('web conversation contract', () => {
     config.on('world:state', worldChanged);
     for (const configuration of [
       null,
-      { ...original, version: 4 },
+      { ...original, version: 99 },
       { ...original, rooms: [{ name: 'Missing ID' }] },
     ]) {
       expect(

@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Kysely, SqliteDialect, type Generated } from 'kysely';
-import { defaultSettings, settingsSchema, upgradeLegacySettings, type ConversationMessage } from '@terrarium/shared';
+import { defaultSettings, settingsSchema, upgradeLegacySettings, upgradeReflectionSettings, type ConversationMessage } from '@terrarium/shared';
 
 export interface DB {
   rooms: {
@@ -27,6 +27,7 @@ export interface DB {
     motivations: Generated<string>;
     intention: Generated<string>;
     energy: Generated<number>;
+    timing_overrides: Generated<string>;
   };
   messages: {
     id: string;
@@ -36,6 +37,13 @@ export interface DB {
     content: string;
     speaker_name: string;
     type: Generated<ConversationMessage['type']>;
+    reply_to_id: Generated<string | null>;
+    conversation_id: Generated<string | null>;
+  };
+  reflections: {
+    agent_id: string; reflected_at: string | null; reaction: string | null; intention: string | null;
+    last_speech_at: string | null; last_emote_at: string | null;
+    engagement_room_id: string | null; engagement_root_message_id: string | null; engagement_target_agent_id: string | null;
   };
   observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
@@ -45,6 +53,7 @@ export interface DB {
     scheduled_at: string; due_at: string; started_at: string | null; ended_at: string | null;
     attempt: number; model: string; action: string | null; outcome: string; details: string;
     bytes: number; reserved_bytes: number;
+    operation: Generated<string>; requested_at: Generated<string | null>;
   };
 }
 
@@ -154,6 +163,22 @@ export const ensureTables = async (db: Kysely<DB>) => {
     await db.updateTable('settings').set({ value: JSON.stringify(settings.success ? settings.data : upgradeLegacySettings(value)), version: saved.version + 1 }).where('id', '=', 1).execute();
     // INVARIANT: existing archives do not establish personally witnessed observations.
     await db.insertInto('schema_migrations').values({ version: 3 }).execute();
+  }
+  if (!applied.some(row => row.version === 4)) {
+    await db.schema.alterTable('agents').addColumn('timing_overrides', 'text', column => column.notNull().defaultTo('{}')).execute();
+    await db.schema.alterTable('messages').addColumn('reply_to_id', 'text').execute();
+    await db.schema.alterTable('messages').addColumn('conversation_id', 'text').execute();
+    await db.schema.alterTable('decisions').addColumn('operation', 'text', column => column.notNull().defaultTo('action')).execute();
+    await db.schema.alterTable('decisions').addColumn('requested_at', 'text').execute();
+    await db.schema.createTable('reflections').addColumn('agent_id', 'text', column => column.primaryKey())
+      .addColumn('reflected_at', 'text').addColumn('reaction', 'text').addColumn('intention', 'text')
+      .addColumn('last_speech_at', 'text').addColumn('last_emote_at', 'text')
+      .addColumn('engagement_room_id', 'text').addColumn('engagement_root_message_id', 'text')
+      .addColumn('engagement_target_agent_id', 'text').execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const value = JSON.parse(saved.value), settings = settingsSchema.safeParse(value);
+    await db.updateTable('settings').set({ value: JSON.stringify(settings.success ? settings.data : upgradeReflectionSettings(value)), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 4 }).execute();
   }
   });
 };
