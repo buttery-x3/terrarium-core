@@ -261,7 +261,7 @@ export async function createApplication(options: {
       checkConfigurationWrite();
       if (scheduler.snapshot().state !== 'stopped') throw new Error('Configuration settings require a stopped run. Choose Stop first.');
       importingConfiguration = true;
-      try { const saved = await world.saveSettings(input); await publishWorld(); return saved; }
+      try { const saved = await world.saveSettings(input); await publishWorld(); await scheduler.maintainDiagnostics(); return saved; }
       finally { importingConfiguration = false; }
     });
     command('reflection:list', z.object({}).strict(), () => world.reflections());
@@ -332,6 +332,7 @@ export async function createApplication(options: {
         );
         await scheduler.changed();
         await publishWorld();
+        await scheduler.maintainDiagnostics();
         return result;
       } finally {
         importingConfiguration = false;

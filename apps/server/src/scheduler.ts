@@ -43,6 +43,9 @@ export class Scheduler {
   private newsError?: string;
   private ticking = false;
   private timer?: ReturnType<typeof setInterval>;
+  private retentionTimer?: ReturnType<typeof setInterval>;
+  private retentionContinuation?: ReturnType<typeof setTimeout>;
+  private retentionWork?: Promise<void>;
   private error?: string;
   private pausedAt?: number;
   private pending = new Set<Promise<void>>();
@@ -112,8 +115,31 @@ export class Scheduler {
     this.activity.set(id, { agentId: id, state: error ? 'error' : 'scheduled',
       dueAt: Math.min(this.due(schedule), this.nextSummary(id)?.dueAt ?? Infinity, this.votes.get(id)?.requestedAt ?? Infinity), ...(error ? { error } : {}) });
   }
-  watch() { this.timer ??= setInterval(() => { void this.tick(); }, 500); }
-  close() { if (this.timer) clearInterval(this.timer); this.timer = undefined; return this.stop(); }
+  watch() {
+    this.timer ??= setInterval(() => { void this.tick(); }, 500);
+    this.retentionTimer ??= setInterval(() => { void this.maintainDiagnostics().catch(() => {}); }, 30000);
+    void this.maintainDiagnostics().catch(() => {});
+  }
+  async maintainDiagnostics() {
+    if (this.retentionWork) return this.retentionWork;
+    this.retentionWork = this.world.pruneDiagnostics().then(result => {
+      if (result.deletedRecords) this.emit();
+      if (result.hasMore && this.retentionTimer && !this.retentionContinuation) this.retentionContinuation = setTimeout(() => {
+        this.retentionContinuation = undefined; void this.maintainDiagnostics().catch(() => {});
+      }, 100);
+    })
+      .catch(error => { this.fail(error); throw error; }).finally(() => { this.retentionWork = undefined; });
+    return this.retentionWork;
+  }
+  async close() {
+    if (this.timer) clearInterval(this.timer);
+    if (this.retentionTimer) clearInterval(this.retentionTimer);
+    if (this.retentionContinuation) clearTimeout(this.retentionContinuation);
+    this.retentionContinuation = undefined;
+    this.timer = undefined; this.retentionTimer = undefined;
+    await this.retentionWork?.catch(() => {});
+    await this.stop();
+  }
 
   async start() {
     if (this.state === 'running') return;
@@ -321,7 +347,8 @@ export class Scheduler {
       });
       const handler = this.newsHandler!(signal, current, () => {}, active.dueAt, active.requestedAt);
       this.flights.set(newsFlightKey, handler);
-      const settledHandler = handler.finally(() => { if (this.flights.get(newsFlightKey) === handler) this.flights.delete(newsFlightKey); });
+      const settledHandler = handler.catch(error => { if (error instanceof DiagnosticError) this.fail(error); throw error; })
+        .finally(() => { if (this.flights.get(newsFlightKey) === handler) this.flights.delete(newsFlightKey); });
       await Promise.race([settledHandler, aborted]);
     } catch (error) {
       if (error instanceof DiagnosticError) this.fail(error);
@@ -343,7 +370,7 @@ export class Scheduler {
     const current = () => this.epoch === active.epoch && !active.controller.signal.aborted && this.state !== 'stopped';
     try {
       for (let attempt = 0; attempt <= this.options.retries; attempt++) {
-        let applied = false, settled = false;
+        let applied = false, settled = false, handlerStarted = false;
         active.controller.signal.throwIfAborted();
         const attemptId = await this.world.startAttempt(active.turnId, attempt + 1, agent);
         const attemptController = new AbortController();
@@ -362,8 +389,11 @@ export class Scheduler {
               ? this.summaryHandler!(agent, active.summaryTargetId, signal, () => current() && !signal.aborted, onApplied, attemptId)
               : this.handler(agent, signal, () => current() && !signal.aborted, onApplied, attemptId, active.opportunity);
           this.flights.set(agent.id, handler);
-          const settledHandler = handler.finally(() => {
-            settled = true; if (this.flights.get(agent.id) === handler) this.flights.delete(agent.id);
+          handlerStarted = true;
+          const settledHandler = handler.finally(async () => {
+            try { await this.world.settleAttempt(attemptId); }
+            catch (error) { this.fail(error); throw error; }
+            finally { settled = true; if (this.flights.get(agent.id) === handler) this.flights.delete(agent.id); }
           });
           const result = await Promise.race([settledHandler, aborted]);
           requestedEmote = Boolean(result?.reflectionProcessed && result.requestEmote);
@@ -386,7 +416,10 @@ export class Scheduler {
           if (applied || outcome === 'stale' || active.ballotId) break;
           if (attempt < this.options.retries) await delay(this.options.backoffMs * 2 ** attempt, undefined, { signal: active.controller.signal });
           if (!settled) break;
-        } finally { clearTimeout(timeout); if (cancel) signal.removeEventListener('abort', cancel); }
+        } finally {
+          clearTimeout(timeout); if (cancel) signal.removeEventListener('abort', cancel);
+          if (!handlerStarted) await this.world.settleAttempt(attemptId);
+        }
       }
     } catch (error) {
       if (error instanceof DiagnosticError) { outcome = 'diagnostic-failure'; this.fail(error); }

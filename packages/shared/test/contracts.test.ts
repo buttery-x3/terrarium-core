@@ -21,6 +21,23 @@ describe('runtime contracts', () => {
     expect(destinations()).toEqual({ type: 'string', minLength: 1 });
     expect(destinations([])).toBeUndefined();
   });
+  it('validates explicit retention policies and preserves manual retention in legacy imports', () => {
+    expect(defaultSettings.diagnostics).toEqual({ retention: 'rolling-time', maxAgeMinutes: 30, maxPayloadMiB: 256 });
+    const settings = { ...defaultSettings, diagnostics: { retention: 'manual', maxPayloadMiB: 128 },
+      prompts: { ...defaultSettings.prompts, framing: 'Keep my authored prompt.' } };
+    for (const version of [2, 3, 4, 5, 6, 7]) {
+      const imported = configurationSchema.parse({ format: 'terrarium-config', version, rooms: [], agents: [], settings });
+      expect(imported.settings).toMatchObject({ diagnostics: { retention: 'manual', maxPayloadMiB: 128, maxAgeMinutes: 30 },
+        prompts: { framing: 'Keep my authored prompt.' } });
+    }
+    expect(configurationSchema.safeParse({ format: 'terrarium-config', version: 8, rooms: [], agents: [], settings }).success).toBe(false);
+    for (const retention of ['manual', 'rolling-time', 'rolling-size']) {
+      expect(settingsSchema.parse({ ...defaultSettings, diagnostics: { retention, maxAgeMinutes: 45, maxPayloadMiB: 512 } }).diagnostics.retention).toBe(retention);
+    }
+    for (const diagnostics of [{ ...defaultSettings.diagnostics, retention: 'unknown' }, { ...defaultSettings.diagnostics, maxAgeMinutes: 0 },
+      { ...defaultSettings.diagnostics, maxAgeMinutes: 1.5 }, { ...defaultSettings.diagnostics, maxPayloadMiB: 31 }])
+      expect(settingsSchema.safeParse({ ...defaultSettings, diagnostics }).success).toBe(false);
+  });
   it('validates bounded emotes and typed activity, excluding fabricated arrival actions and extra state mutations', () => {
     expect(actionSchema.parse({ type: 'emote', message: '  A watches.  ' })).toEqual({ type: 'emote', message: 'A watches.' });
     for (const action of [{ type: 'emote', message: 'x'.repeat(241) }, { type: 'emote', message: ' ' },

@@ -176,7 +176,8 @@ export const settingsSchema = z.object({
   media: z.object({ enabled: z.boolean(), roomId: roomIdSchema, programmeDurationMs: z.number().int().positive().max(2147483647),
     ballotDurationMs: z.number().int().positive().max(2147483647), proposalCooldownMs: z.number().int().nonnegative().max(2147483647) }).strict(),
   activity: z.object({ roomEventsEnabled: z.boolean(), emotesEnabled: z.boolean() }).strict(),
-  diagnostics: z.object({ maxPayloadMiB: z.number().int().min(32).max(16384), retention: z.literal('manual') }).strict(),
+  diagnostics: z.object({ maxPayloadMiB: z.number().int().min(32).max(16384),
+    retention: z.enum(['manual', 'rolling-size', 'rolling-time']), maxAgeMinutes: z.number().int().min(1).max(525600) }).strict(),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
 export function canEat(energy: Settings['energy'], currentEnergy: number, isFoodSource: boolean): boolean {
@@ -192,9 +193,16 @@ export const defaultSettings: Settings = {
     topics: ['sport and upcoming events', 'science', 'nature', 'technology', 'entertainment', 'food', 'human interest', 'major world news'], recentHeadlineLimit: 12 },
   media: { enabled: false, roomId: 'media-room', programmeDurationMs: 600000, ballotDurationMs: 120000, proposalCooldownMs: 300000 },
   activity: { roomEventsEnabled: true, emotesEnabled: true },
-  diagnostics: { maxPayloadMiB: 256, retention: 'manual' },
+  diagnostics: { maxPayloadMiB: 256, retention: 'rolling-time', maxAgeMinutes: 30 },
 };
-const version6SettingsSchema = settingsSchema.omit({ media: true }).extend({
+const version7SettingsSchema = settingsSchema.extend({
+  diagnostics: z.union([settingsSchema.shape.diagnostics,
+    z.object({ maxPayloadMiB: z.number().int().min(32).max(16384), retention: z.literal('manual') }).strict()]),
+});
+export function upgradeDiagnosticSettings(value: z.infer<typeof version7SettingsSchema>): Settings {
+  return { ...value, diagnostics: { ...value.diagnostics, maxAgeMinutes: 'maxAgeMinutes' in value.diagnostics ? value.diagnostics.maxAgeMinutes : 30 } };
+}
+const version6SettingsSchema = version7SettingsSchema.omit({ media: true }).extend({
   prompts: promptSettingsSchema.omit({ mediaParticipation: true, mediaVote: true }),
 });
 const version5SettingsSchema = version6SettingsSchema.omit({ news: true }).extend({
@@ -218,8 +226,8 @@ export function upgradeNewsSettings(value: z.infer<typeof version5SettingsSchema
     prompts: { ...value.prompts, newsSelection: defaultPrompts.newsSelection } });
 }
 export function upgradeMediaSettings(value: z.infer<typeof version6SettingsSchema>): Settings {
-  return { ...value, media: { ...defaultSettings.media },
-    prompts: { ...value.prompts, mediaParticipation: defaultPrompts.mediaParticipation, mediaVote: defaultPrompts.mediaVote } };
+  return upgradeDiagnosticSettings({ ...value, media: { ...defaultSettings.media },
+    prompts: { ...value.prompts, mediaParticipation: defaultPrompts.mediaParticipation, mediaVote: defaultPrompts.mediaVote } });
 }
 export function upgradeReflectionSettings(value: z.infer<typeof version3SettingsSchema>): Settings {
   const previousActionSelection = 'Choose one available action first. Formulate speech only if you choose speak. Moving, eating, changing subject and remaining quietly content are valid choices. When emotes are enabled, choose emote instead of wait for a quiet turn; otherwise wait silently. You need not continue a conversation, maintain consensus or complete another person\'s project. Silence does not imply boredom; interpret repetition through your preferences.';
@@ -245,16 +253,17 @@ const configurationFields = z.object({
   rooms: z.array(roomInputSchema.extend({ id: roomIdSchema })),
   agents: z.array(agentInputSchema.and(z.object({ id: z.string().min(1) }))),
 }).strict();
-const importedSettingsSchema = z.union([settingsSchema, version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings), legacySettingsSchema.transform(upgradeLegacySettings)]);
+const importedSettingsSchema = z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings), legacySettingsSchema.transform(upgradeLegacySettings)]);
 export function upgradeSavedSettings(value: unknown): Settings { return importedSettingsSchema.parse(value); }
 export const configurationSchema = z.discriminatedUnion('version', [
   configurationFields.extend({ version: z.literal(1), settings: importedSettingsSchema.optional() }),
   configurationFields.extend({ version: z.literal(2), settings: importedSettingsSchema }),
-  configurationFields.extend({ version: z.literal(3), settings: z.union([settingsSchema, version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings)]) }),
-  configurationFields.extend({ version: z.literal(4), settings: z.union([settingsSchema, version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings)]) }),
-  configurationFields.extend({ version: z.literal(5), settings: z.union([settingsSchema, version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings)]) }),
-  configurationFields.extend({ version: z.literal(6), settings: z.union([settingsSchema, version6SettingsSchema.transform(upgradeMediaSettings)]) }),
-  configurationFields.extend({ version: z.literal(7), settings: settingsSchema }),
+  configurationFields.extend({ version: z.literal(3), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings), version3SettingsSchema.transform(upgradeReflectionSettings)]) }),
+  configurationFields.extend({ version: z.literal(4), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings), version4SettingsSchema.transform(upgradeRelationshipSettings)]) }),
+  configurationFields.extend({ version: z.literal(5), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings), version5SettingsSchema.transform(upgradeNewsSettings)]) }),
+  configurationFields.extend({ version: z.literal(6), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings)]) }),
+  configurationFields.extend({ version: z.literal(7), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings)]) }),
+  configurationFields.extend({ version: z.literal(8), settings: settingsSchema }),
 ]).superRefine((value, context) => {
   if (value.version >= 2) {
     value.rooms.forEach((room, index) => {
@@ -428,4 +437,6 @@ export type DiagnosticRecord = {
   operation?: string; requestedAt?: string;
 };
 export type DiagnosticPage = { records: DiagnosticRecord[]; hasMore: boolean; next?: number };
-export type DiagnosticUsage = { bytes: number; reservedBytes: number; limitBytes: number; retention: 'manual' };
+export type DiagnosticUsage = { bytes: number; reservedBytes: number; limitBytes: number; retention: Settings['diagnostics']['retention'];
+  maxAgeMinutes: number; protectedBytes: number; pruneGeneration: number };
+export type DiagnosticPruneResult = { deletedTurns: number; deletedRecords: number; freedBytes: number; hasMore: boolean };

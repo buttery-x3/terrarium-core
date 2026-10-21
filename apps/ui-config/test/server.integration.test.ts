@@ -60,6 +60,29 @@ afterEach(async () => {
 });
 
 describe('web conversation contract', () => {
+  it('applies retention through stopped settings and reports expired details without losing conversation history', async () => {
+    const complete = vi.fn(async () => ({ content: '{}' }));
+    const url = await setup({ name: 'fake', complete }), config = connect(url); await ready(config);
+    const current = (await application.world.settings()).value;
+    expect((await request(config, 'settings:save', { ...current, diagnostics: { ...current.diagnostics, retention: 'manual' } })).ok).toBe(true);
+    const agent = await application.world.saveAgent({ name: 'Observer', instructions: 'Observe.', roomId: 'room-1', provider: 'chatgpt', model: 'fake', enabled: true,
+      minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 });
+    await application.world.speak('room-1', 'Retain this conversation.');
+    const turn = await application.world.scheduleTurn(agent, Date.now()), attempt = await application.world.startAttempt(turn, 1, agent);
+    await application.world.updateDiagnostic(attempt, { output: 'Old diagnostic evidence' }, 'completed'); await application.world.settleAttempt(attempt);
+    await application.world.endTurn(turn, 'completed');
+    await db.updateTable('decisions').set({ ended_at: '2000-01-01T00:00:00.000Z' }).where('turn_id', '=', turn).execute();
+    expect((await request(config, 'diagnostics:export', { limit: 1 })).value).toMatchObject({ hasMore: true, records: [{ details: { output: 'Old diagnostic evidence' } }] });
+    expect((await request(config, 'settings:save', current)).ok).toBe(true);
+    expect((await request(config, 'diagnostics:get', { id: attempt }))).toMatchObject({ ok: false, error: expect.stringContaining('no longer retained') });
+    expect((await request(config, 'diagnostics:list', {})).value.records).toEqual([]);
+    expect((await request(config, 'diagnostics:export', {})).value.records).toEqual([]);
+    expect((await request(config, 'diagnostics:usage', {})).value).toMatchObject({ retention: 'rolling-time', maxAgeMinutes: 30, bytes: 0, pruneGeneration: 1 });
+    expect((await request(config, 'history:get', { roomId: 'room-1' })).value.messages[0].content).toBe('Retain this conversation.');
+    await request(config, 'run:control', 'start');
+    expect((await request(config, 'settings:save', current))).toMatchObject({ ok: false });
+    await request(config, 'run:control', 'stop'); expect(complete).not.toHaveBeenCalled();
+  });
   it('starts idle media directly and requests genuine replacement votes independently of speech', async () => {
     const votes: string[] = [];
     const url = await setup({ name: 'fake', complete: async request => {
@@ -176,7 +199,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(7);
+    expect(exported.version).toBe(8);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -445,7 +468,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 7,
+      version: 8,
       agents: [],
     });
     const configuration = {

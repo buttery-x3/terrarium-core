@@ -73,11 +73,13 @@ export interface DB {
   observations: { sequence: Generated<number>; agent_id: string; message_id: string };
   schema_migrations: { version: number };
   settings: { id: number; version: number; value: string };
+  diagnostic_retention: { id: number; generation: number };
   decisions: {
     sequence: Generated<number>; id: string; turn_id: string; agent_id: string; agent_name: string; room_id: string;
     scheduled_at: string; due_at: string; started_at: string | null; ended_at: string | null;
     attempt: number; model: string; action: string | null; outcome: string; details: string;
     bytes: number; reserved_bytes: number;
+    execution_pending: Generated<number>;
     operation: Generated<string>; requested_at: Generated<string | null>;
   };
 }
@@ -265,6 +267,16 @@ export const ensureTables = async (db: Kysely<DB>) => {
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
     await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     await db.insertInto('schema_migrations').values({ version: 7 }).execute();
+  }
+  if (!applied.some(row => row.version === 8)) {
+    await db.schema.alterTable('decisions').addColumn('execution_pending', 'integer', column => column.notNull().defaultTo(0)).execute();
+    await db.schema.createIndex('decisions_retention').on('decisions').columns(['attempt', 'ended_at', 'sequence']).execute();
+    await db.schema.createTable('diagnostic_retention').addColumn('id', 'integer', column => column.primaryKey())
+      .addColumn('generation', 'integer', column => column.notNull()).execute();
+    await db.insertInto('diagnostic_retention').values({ id: 1, generation: 0 }).execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 8 }).execute();
   }
   });
 };

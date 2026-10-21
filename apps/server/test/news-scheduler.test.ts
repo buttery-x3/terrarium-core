@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createDb, ensureTables, World } from '@terrarium/persistence';
+import { createDb, ensureTables, World, DiagnosticError } from '@terrarium/persistence';
 import { defaultSettings, type AgentInput, type NewsItem } from '@terrarium/shared';
 import { Scheduler } from '../src/scheduler.js';
 
@@ -28,6 +28,15 @@ afterEach(async () => {
 });
 
 describe('shared news scheduling', () => {
+  it('reports a late diagnostic write failure after a news timeout has already released its active operation', async () => {
+    await enableNews(); const pending = deferred();
+    const scheduler = createScheduler(async () => { await pending.promise; throw new DiagnosticError('Late diagnostic write failed'); }, async () => {}, 10);
+    await scheduler.start(); await scheduler.tick();
+    await vi.waitFor(() => expect(scheduler.snapshot().newsError).toContain('timed out'));
+    pending.resolve();
+    await vi.waitFor(() => expect(scheduler.snapshot()).toMatchObject({ state: 'paused', error: expect.stringContaining('Late diagnostic write failed') }));
+    expect(scheduler.hasActiveWork()).toBe(false);
+  });
   it('runs immediately only when enabled without a current display and creates no resident entry', async () => {
     let now = 1000000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);

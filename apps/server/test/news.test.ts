@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createDb, ensureTables, World } from '@terrarium/persistence';
+import { createDb, ensureTables, World, DiagnosticError } from '@terrarium/persistence';
 import { createChatGptPayload, type LmProvider } from '@terrarium/lm-providers';
 import { performNews, previewNews } from '../src/news.js';
 
@@ -20,6 +20,14 @@ beforeEach(async () => {
 afterEach(async () => { await db.destroy(); });
 
 describe('shared searched news', () => {
+  it('still closes the completed news turn if cleanup fails while releasing its execution pin', async () => {
+    vi.spyOn(world, 'pruneDiagnostics').mockRejectedValueOnce(new DiagnosticError('Cleanup failed'));
+    await expect(select()).rejects.toThrow('Cleanup failed');
+    const rows = await db.selectFrom('decisions').selectAll().execute();
+    expect(rows).toHaveLength(2);
+    expect(rows.every(row => row.ended_at !== null && row.execution_pending === 0)).toBe(true);
+    expect(rows.find(row => row.attempt === 1)?.outcome).toBe('applied');
+  });
   it('previews the real search-enabled request using only shared news context', async () => {
     const agent = await world.saveAgent({ name: 'Private resident', instructions: 'SECRET PROFILE', roomId: 'room-1',
       provider: 'chatgpt', model: 'fake', enabled: true, minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 });

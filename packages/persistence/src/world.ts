@@ -17,7 +17,7 @@ import type {
   HistoryPage,
   RoomInput,
   WorldState,
-  Settings, AttemptDetails, DiagnosticFilter, DiagnosticRecord, DiagnosticPage, DiagnosticUsage,
+  Settings, AttemptDetails, DiagnosticFilter, DiagnosticRecord, DiagnosticPage, DiagnosticUsage, DiagnosticPruneResult,
   ReflectionState,
   AppraisalProposal, AppraisalRecord, RelationshipState, RelationshipSummary, RelationshipSummaryInput, RelationshipSummaryProposal,
   RelationshipContext, RelationshipFilter, RelationshipPage, AppraisalPage, RelationshipSummaryPage,
@@ -163,7 +163,7 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 7,
+        version: 8,
         settings: state.settings,
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
@@ -218,7 +218,9 @@ export class World {
     if (configuration.version < 5) defaults.push('Older settings use default optional appraisal capacity and relationship-summary timing. Runtime appraisals and summaries are not imported.');
     if (configuration.version < 6) defaults.push('News is disabled by default for older settings. Existing room names, archives and runtime news history are preserved.');
     if (configuration.version < 7) defaults.push('Media is disabled by default for older settings. Runtime programmes and ballots are not imported.');
+    if (configuration.version < 8) defaults.push('Existing explicit manual diagnostic retention is preserved; the rolling time setting defaults to 30 minutes.');
     const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
+    if (settings.diagnostics.retention !== 'manual') defaults.push('Rolling diagnostic retention automatically deletes eligible completed turn records, including existing records. Downloaded exports and world history are retained.');
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
     if (settings.news.enabled && !mergedRooms.has(settings.news.roomId)) throw new Error('News requires an existing assigned room before it can be enabled.');
@@ -1210,22 +1212,63 @@ export class World {
     const totals = await this.db.selectFrom('decisions').select(({ fn }) => [
       fn.sum<number>('bytes').as('bytes'), fn.sum<number>('reserved_bytes').as('reserved'),
     ]).executeTakeFirstOrThrow();
+    const policy = (await this.settings()).value.diagnostics;
+    const protectedUsage = await sql<{ bytes: number }>`select coalesce(sum(bytes), 0) as bytes from decisions
+      where turn_id in (select turn_id from decisions where ended_at is null or execution_pending <> 0)`.execute(this.db);
+    const state = await this.db.selectFrom('diagnostic_retention').select('generation').where('id', '=', 1).executeTakeFirstOrThrow();
     return { bytes: Number(totals.bytes ?? 0), reservedBytes: Number(totals.reserved ?? 0),
-      limitBytes: (await this.settings()).value.diagnostics.maxPayloadMiB * 1024 * 1024, retention: 'manual' };
+      limitBytes: policy.maxPayloadMiB * 1024 * 1024, retention: policy.retention, maxAgeMinutes: policy.maxAgeMinutes,
+      protectedBytes: Number(protectedUsage.rows[0].bytes), pruneGeneration: state.generation };
+  }
+
+  private async pruneDiagnosticBatch(now: number): Promise<DiagnosticPruneResult> {
+    const policy = (await this.settings()).value.diagnostics;
+    const result = { deletedTurns: 0, deletedRecords: 0, freedBytes: 0, hasMore: false };
+    if (policy.retention === 'manual') return result;
+    const usage = await this.db.selectFrom('decisions').select(({ fn }) => fn.sum<number>('bytes').as('bytes')).executeTakeFirstOrThrow();
+    let bytes = Number(usage.bytes ?? 0);
+    const limit = policy.maxPayloadMiB * 1024 * 1024;
+    if (policy.retention === 'rolling-size' && bytes <= limit) return result;
+    const cutoff = new Date(now - policy.maxAgeMinutes * 60000).toISOString();
+    // INVARIANT: a terminal attempt remains protected until its underlying handler settles.
+    const groups = await sql<{ turn_id: string; bytes: number; records: number }>`select turn_id, sum(bytes) as bytes, count(*) as records
+      from decisions group by turn_id
+      having sum(case when attempt = 0 then 1 else 0 end) > 0
+        and sum(case when ended_at is null or execution_pending <> 0 then 1 else 0 end) = 0
+        ${policy.retention === 'rolling-time' ? sql`and max(ended_at) <= ${cutoff}` : sql``}
+      order by max(ended_at), min(sequence) limit 101`.execute(this.db);
+    for (const group of groups.rows.slice(0, 100)) {
+      if (policy.retention === 'rolling-size' && bytes <= limit) break;
+      await this.db.deleteFrom('decisions').where('turn_id', '=', group.turn_id).execute();
+      result.deletedTurns++; result.deletedRecords += Number(group.records); result.freedBytes += Number(group.bytes);
+      bytes -= Number(group.bytes);
+    }
+    result.hasMore = groups.rows.length > 100 && (policy.retention === 'rolling-time' || bytes > limit);
+    if (result.deletedTurns) await this.db.updateTable('diagnostic_retention').set(eb => ({ generation: eb.eb('generation', '+', 1) })).where('id', '=', 1).execute();
+    return result;
+  }
+
+  async pruneDiagnostics(now = Date.now()): Promise<DiagnosticPruneResult> {
+    try { return await this.db.transaction().execute(db => new World(db).pruneDiagnosticBatch(now)); }
+    catch (error) { throw new DiagnosticError(`Diagnostic retention could not be saved: ${error instanceof Error ? error.message : 'write failed'}`); }
   }
 
   async scheduleTurn(agent: Agent, dueAt: number, operation = 'action', requestedAt = Date.now()) {
     try {
-      const id = randomUUID();
-      const usage = await this.diagnosticUsage();
-      if (usage.bytes + usage.reservedBytes + 4096 > usage.limitBytes) throw new Error('Diagnostic capacity reached. Export/clear diagnostics or increase the budget while stopped.');
-      await this.db.insertInto('decisions').values({
-        id, turn_id: id, agent_id: agent.id, agent_name: agent.name, room_id: agent.roomId,
-        scheduled_at: new Date().toISOString(), due_at: new Date(dueAt).toISOString(), started_at: null, ended_at: null,
-        attempt: 0, model: agent.model, action: null, outcome: 'scheduled', details: '{}', bytes: 1024, reserved_bytes: 0,
-        operation, requested_at: new Date(requestedAt).toISOString(),
-      }).execute();
-      return id;
+      return await this.db.transaction().execute(async db => {
+        const world = new World(db);
+        await world.pruneDiagnosticBatch(Date.now());
+        const id = randomUUID();
+        const usage = await world.diagnosticUsage();
+        if (usage.retention === 'manual' && usage.bytes + usage.reservedBytes + 4096 > usage.limitBytes) throw new Error('Diagnostic capacity reached. Export/clear diagnostics or increase the budget while stopped.');
+        await db.insertInto('decisions').values({
+          id, turn_id: id, agent_id: agent.id, agent_name: agent.name, room_id: agent.roomId,
+          scheduled_at: new Date().toISOString(), due_at: new Date(dueAt).toISOString(), started_at: null, ended_at: null,
+          attempt: 0, model: agent.model, action: null, outcome: 'scheduled', details: '{}', bytes: 1024, reserved_bytes: 0,
+          operation, requested_at: new Date(requestedAt).toISOString(),
+        }).execute();
+        return id;
+      });
     } catch (error) { throw new DiagnosticError(`Diagnostics could not schedule a turn: ${error instanceof Error ? error.message : 'write failed'}`); }
   }
 
@@ -1233,14 +1276,15 @@ export class World {
     try {
       return await this.db.transaction().execute(async db => {
         const world = new World(db);
+        await world.pruneDiagnosticBatch(Date.now());
         const usage = await world.diagnosticUsage();
-        const reserved = 8 * 1024 * 1024;
-        if (usage.bytes + usage.reservedBytes + reserved > usage.limitBytes)
+        const reserved = usage.retention === 'manual' ? 8 * 1024 * 1024 : 0;
+        if (usage.retention === 'manual' && usage.bytes + usage.reservedBytes + reserved > usage.limitBytes)
           throw new Error('Diagnostic capacity reached. Export/clear diagnostics or increase the budget while stopped.');
         const turn = await db.selectFrom('decisions').selectAll().where('id', '=', turnId).executeTakeFirstOrThrow();
         const id = randomUUID(), started = new Date().toISOString();
         await db.insertInto('decisions').values({ ...turn, sequence: undefined, id, room_id: agent.roomId,
-          started_at: started, ended_at: null, attempt: number, outcome: 'running', reserved_bytes: reserved }).execute();
+          started_at: started, ended_at: null, attempt: number, outcome: 'running', reserved_bytes: reserved, execution_pending: 1 }).execute();
         await db.updateTable('decisions').set({ started_at: turn.started_at ?? started, outcome: 'running' }).where('id', '=', turnId).execute();
         return id;
       });
@@ -1254,7 +1298,7 @@ export class World {
       if (row.ended_at && !(row.outcome.startsWith('applied') && outcome === 'applied-notification-failure')) return;
       const details = JSON.stringify({ ...JSON.parse(row.details), ...additions });
       const bytes = Buffer.byteLength(details) + 1024;
-      if (row.reserved_bytes && bytes > row.reserved_bytes)
+      if ((await this.settings()).value.diagnostics.retention === 'manual' && row.reserved_bytes && bytes > row.reserved_bytes)
         throw new Error('Attempt exceeded its reserved diagnostic capacity; request was not submitted/applied.');
       await this.db.updateTable('decisions').set({ details, bytes,
         ...(action ? { action } : {}),
@@ -1268,12 +1312,21 @@ export class World {
     try {
       await this.db.updateTable('decisions').set({ outcome, ended_at: new Date().toISOString() })
         .where('id', '=', turnId).where('ended_at', 'is', null).execute();
+      await this.pruneDiagnostics();
     } catch { throw new DiagnosticError('Diagnostics could not finish the turn.'); }
+  }
+
+  async settleAttempt(id: string) {
+    try {
+      await this.db.updateTable('decisions').set({ execution_pending: 0 }).where('id', '=', id).execute();
+      await this.pruneDiagnostics();
+    } catch (error) { throw new DiagnosticError(`Diagnostics could not settle an attempt: ${error instanceof Error ? error.message : 'write failed'}`); }
   }
 
   async interruptUnfinished() {
     await this.db.updateTable('decisions').set({ outcome: 'interrupted', ended_at: new Date().toISOString(), reserved_bytes: 0 })
       .where('ended_at', 'is', null).execute();
+    await this.db.updateTable('decisions').set({ execution_pending: 0 }).where('execution_pending', '<>', 0).execute();
     await this.clearEngagements();
     await this.db.updateTable('media_state').set({ clock_at: null }).where('id', '=', 1).execute();
     await this.cancelMediaBallots('The server restarted before the vote concluded.');
@@ -1297,7 +1350,7 @@ export class World {
     return { records, hasMore: rows.length > filter.limit, next: records.at(-1)?.sequence };
   }
 
-  private diagnosticRecord(row: Omit<Selectable<DB['decisions']>, 'bytes' | 'reserved_bytes' | 'details'> & { details?: string }): DiagnosticRecord {
+  private diagnosticRecord(row: Omit<Selectable<DB['decisions']>, 'bytes' | 'reserved_bytes' | 'details' | 'execution_pending'> & { details?: string }): DiagnosticRecord {
     return { sequence: row.sequence, id: row.id, turnId: row.turn_id, agentId: row.agent_id, agentName: row.agent_name,
       roomId: row.room_id, scheduledAt: row.scheduled_at, dueAt: row.due_at, startedAt: row.started_at, endedAt: row.ended_at,
       attempt: row.attempt, model: row.model, action: row.action, outcome: row.outcome,
@@ -1306,10 +1359,16 @@ export class World {
   }
 
   async diagnostic(id: string) {
-    return this.diagnosticRecord(await this.db.selectFrom('decisions').selectAll().where('id', '=', id).executeTakeFirstOrThrow());
+    const row = await this.db.selectFrom('decisions').selectAll().where('id', '=', id).executeTakeFirst();
+    if (!row) throw new Error('Diagnostics: this record is no longer retained. Refresh the list.');
+    return this.diagnosticRecord(row);
   }
 
   async clearDiagnostics() {
-    return this.db.deleteFrom('decisions').executeTakeFirstOrThrow().then(result => Number(result.numDeletedRows));
+    return this.db.transaction().execute(async db => {
+      const result = await db.deleteFrom('decisions').executeTakeFirstOrThrow();
+      await db.updateTable('diagnostic_retention').set(eb => ({ generation: eb.eb('generation', '+', 1) })).where('id', '=', 1).execute();
+      return Number(result.numDeletedRows);
+    });
   }
 }

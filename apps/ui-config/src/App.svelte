@@ -267,6 +267,7 @@
   async function exportDiagnostics() {
     const records: DiagnosticRecord[] = [];
     const filter = diagnosticFilter();
+    const retentionAtStart = await request<DiagnosticUsage>("diagnostics:usage", {});
     let before: number | undefined;
     while (true) {
       const page = await request<DiagnosticPage>("diagnostics:export", { ...filter, limit: 10, ...(before ? { before } : {}) });
@@ -274,10 +275,24 @@
       if (!page.hasMore) break;
       before = page.next;
     }
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ format: "terrarium-diagnostics", version: 1, exportedAt: new Date().toISOString(), filter, records }, null, 2)], { type: "application/json" }));
+    const retentionAtEnd = await request<DiagnosticUsage>("diagnostics:usage", {});
+    const retentionChangedDuringExport = retentionAtStart.pruneGeneration !== retentionAtEnd.pruneGeneration ||
+      retentionAtStart.retention !== retentionAtEnd.retention || retentionAtStart.maxAgeMinutes !== retentionAtEnd.maxAgeMinutes ||
+      retentionAtStart.limitBytes !== retentionAtEnd.limitBytes;
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ format: "terrarium-diagnostics", version: 1, exportedAt: new Date().toISOString(),
+      filter, retentionAtStart, retentionAtEnd, retentionChangedDuringExport, records }, null, 2)], { type: "application/json" }));
     const link = document.createElement("a"); link.href = url; link.download = "terrarium-diagnostics.json";
     document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-    notice = `Exported ${records.length} diagnostic records. Exported files retain their conversation snapshots independently.`;
+    notice = `Exported ${records.length} diagnostic records. ${retentionChangedDuringExport ? "Retention changed during export; records may have expired between pages, so this is not a complete snapshot. " : ""}Exported files retain their conversation snapshots independently.`;
+  }
+  async function loadDiagnostic(id: string) {
+    try { diagnosticDetails = { ...diagnosticDetails, [id]: await request<DiagnosticRecord>("diagnostics:get", { id }) }; }
+    catch (failure) {
+      if (failure instanceof Error && failure.message.includes("no longer retained")) {
+        notice = failure.message;
+        await loadDiagnostics(diagnosticBefore);
+      } else throw failure;
+    }
   }
   onMount(() => {
     socket.on("connect", () => {
@@ -308,7 +323,7 @@
       const energy = new Map(values.map(item => [item.id, item.energy]));
       agents = agents.map(agent => ({ ...agent, energy: energy.get(agent.id) ?? agent.energy }));
     });
-    socket.on("diagnostics:changed", () => { if (!diagnosticBefore) void loadDiagnostics(); });
+    socket.on("diagnostics:changed", () => { void loadDiagnostics(diagnosticBefore); });
     socket.on("reflection:changed", () => { void loadReflections(); });
     socket.on("relationships:changed", () => { relationshipVersion++; });
     socket.on("news:changed", () => { newsVersion++; });
@@ -365,7 +380,7 @@
           {#each importPreview.rooms as room}<li>{room.operation === "add" ? "Add" : "Update"} room: {room.name} ({room.id})</li>{/each}
           {#each importPreview.agents as agent}<li>{agent.operation === "add" ? "Add" : "Update"} agent: {agent.name} ({agent.id})</li>{/each}
           {#each importPreview.defaults as detail}<li>{detail}</li>{/each}
-          <li>Shared settings: {importPreview.settingsChanged ? "will update" : "unchanged"}. Existing current energy and diagnostic history are preserved.</li>
+          <li>Shared settings: {importPreview.settingsChanged ? "will update" : "unchanged"}. Existing current energy is preserved. Diagnostic retention may remove eligible completed records.</li>
         </ul>
         <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => perform(applyConfiguration)}>Apply import</button>
       {:else}
@@ -539,8 +554,19 @@
         <button type="button" on:click={() => { settings.prompts[key] = defaultPrompts[key]; }}>Restore default {key}</button>
       {/each}
       <h3>Diagnostic retention</h3>
-      <label>Diagnostic payload budget (MiB) <input type="number" min="32" max="16384" step="1" bind:value={settings.diagnostics.maxPayloadMiB} required /></label>
-      <p>Records are retained until explicitly cleared. No automatic pruning. Capacity is reserved for active attempts; the run pauses before admitting work beyond the budget. This measures diagnostic payloads and row allowance, not total database file size.</p>
+      <label>Diagnostic retention <select bind:value={settings.diagnostics.retention}><option value="rolling-time">Keep recent history</option><option value="rolling-size">Keep within a size target</option><option value="manual">Keep everything; pause at capacity</option></select></label>
+      {#if settings.diagnostics.retention === "rolling-time"}
+        <label>Keep completed history for (minutes) <input type="number" min="1" max="525600" step="1" bind:value={settings.diagnostics.maxAgeMinutes} required /></label>
+        <p>Default: 30 minutes after a whole turn finishes, using wall-clock time including Pause and Stop. The size budget does not apply.</p>
+      {:else}
+        <label>Diagnostic payload {settings.diagnostics.retention === "manual" ? "budget" : "target"} (MiB) <input type="number" min="32" max="16384" step="1" bind:value={settings.diagnostics.maxPayloadMiB} required /></label>
+      {/if}
+      {#if settings.diagnostics.retention === "manual"}
+        <p>No automatic deletion. Each active attempt reserves 8 MiB; the run pauses when the budget or an attempt's reservation is exceeded.</p>
+      {:else}
+        <p>Saving this policy allows automatic deletion of eligible existing records. Export anything you want to keep first. Cleanup removes whole completed turns, including all retries. Active requests keep their full evidence until they actually finish, even after cancellation; the size target may temporarily be exceeded. Diagnostic limits do not pause the simulation. A storage write failure can still pause it.</p>
+      {/if}
+      <p>Size measures saved diagnostic payloads plus a row allowance, not total database file size. Retention does not remove conversation history or downloaded exports.</p>
       <button disabled={!connected || busy || runState.state !== "stopped"}>Save shared settings</button>
     </form>
   </section>
@@ -563,7 +589,13 @@
   <section aria-label="Decision diagnostics">
     <h2>Decision diagnostics</h2>
     <p>Operator-only history. Attempt 0 records scheduling and the overall operation; numbered attempts record requests. Reflection can update private character state without an outward action. Intention is generated character state, not a verified explanation.</p>
-    {#if diagnosticUsage}<p>Stored payloads: {(diagnosticUsage.bytes / 1048576).toFixed(2)} MiB; reserved: {(diagnosticUsage.reservedBytes / 1048576).toFixed(2)} MiB; budget: {diagnosticUsage.limitBytes / 1048576} MiB. Retained until explicitly cleared.</p>{/if}
+    {#if diagnosticUsage}
+      <p>Stored payloads: {(diagnosticUsage.bytes / 1048576).toFixed(2)} MiB; protected active history: {(diagnosticUsage.protectedBytes / 1048576).toFixed(2)} MiB.
+        {#if diagnosticUsage.retention === "manual"}Reserved: {(diagnosticUsage.reservedBytes / 1048576).toFixed(2)} MiB; budget: {diagnosticUsage.limitBytes / 1048576} MiB. Retained until explicitly cleared.
+        {:else if diagnosticUsage.retention === "rolling-time"}Completed turns expire after {diagnosticUsage.maxAgeMinutes} wall-clock minutes, including while paused or stopped.
+        {:else}Target: {diagnosticUsage.limitBytes / 1048576} MiB. Oldest completed turns are removed first; protected history can temporarily exceed the target.{/if}
+      </p>
+    {/if}
     <form on:submit|preventDefault={() => loadDiagnostics()}>
       <label>Agent ID (empty for all; deleted IDs supported) <input bind:value={diagnosticAgent} list="diagnostic-agents" /></label>
       <datalist id="diagnostic-agents">{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</datalist>
@@ -575,6 +607,7 @@
       <button disabled={!connected || diagnosticLoading}>Apply filters / latest page</button>
     </form>
     <button disabled={!connected || busy} on:click={() => perform(exportDiagnostics)}>Export filtered diagnostics</button>
+    <p>Export retrieves pages as they are available. Automatic retention continues during Pause, Stop and export; the download reports if cleanup changed the records during export. To keep a stable completed history, Stop and select “Keep everything” before exporting. Requests still finishing may update their records.</p>
     <button disabled={!connected || busy || runState.state !== "stopped"} on:click={() => { confirmDiagnosticClear = true; }}>Clear diagnostics</button>
     {#if confirmDiagnosticClear}
       <p>Permanently delete all stored diagnostic records and prompt/response snapshots? Conversation history and downloaded files remain. This cannot be undone.</p>
@@ -585,7 +618,7 @@
       {#each diagnosticPage.records as record (record.id)}
         <li><strong>{record.agentName}</strong> · {record.operation ?? "Legacy turn"} · {new Date(record.scheduledAt).toLocaleString()} · {record.roomId} · attempt {record.attempt} · {record.action ?? (record.attempt === 0 ? "Scheduling summary" : "No outward action")} · {record.outcome}
           <p>Requested {new Date(record.requestedAt ?? record.scheduledAt).toLocaleString()} · scheduled {new Date(record.scheduledAt).toLocaleString()} · due {new Date(record.dueAt).toLocaleString()} · started {record.startedAt ? new Date(record.startedAt).toLocaleString() : "not started"} · ended {record.endedAt ? new Date(record.endedAt).toLocaleString() : "pending"}</p>
-          <details on:toggle={event => { if ((event.currentTarget as HTMLDetailsElement).open) void perform(async () => { diagnosticDetails = { ...diagnosticDetails, [record.id]: await request<DiagnosticRecord>("diagnostics:get", { id: record.id }) }; }); }}>
+          <details on:toggle={event => { if ((event.currentTarget as HTMLDetailsElement).open) void perform(() => loadDiagnostic(record.id)); }}>
             <summary>Inspect operation {record.turnId}, attempt {record.attempt}</summary>
             {#if diagnosticDetails[record.id]}
               {@const detail = diagnosticDetails[record.id].details}

@@ -63,7 +63,7 @@ describe('persisted world', () => {
   });
   it('reserves capacity before requests and preserves terminal cancellation against late writes', async () => {
     const world = await fixture(), agent = await world.saveAgent(agentInput);
-    await world.saveSettings({ ...defaultSettings, diagnostics: { retention: 'manual', maxPayloadMiB: 32 } });
+    await world.saveSettings({ ...defaultSettings, diagnostics: { retention: 'manual', maxPayloadMiB: 32, maxAgeMinutes: 30 } });
     const turn = await world.scheduleTurn(agent, Date.now());
     const attempts = [];
     for (let index = 1; index <= 3; index++) attempts.push(await world.startAttempt(turn, index, agent));
@@ -612,7 +612,7 @@ describe('persisted world', () => {
     });
     expect(
       await db.selectFrom('schema_migrations').selectAll().execute(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     expect(await world.memory('old-agent')).toEqual([]);
     const unchanged = new Database(legacy, { readonly: true });
     expect(unchanged.prepare('PRAGMA table_info(agents)').all()).toHaveLength(

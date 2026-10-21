@@ -82,5 +82,8 @@ export async function performNews(world: World, provider: LmProvider, signal: Ab
       ...(applied ? { notificationError: message } : { error: message }) }, outcome);
     if (!applied && stillCurrent()) await world.recordNewsFailure(message, context.settingsVersion, stillCurrent);
     throw new TurnError(outcome, message);
-  } finally { await world.endTurn(turnId, outcome); }
+  } finally {
+    try { if (attemptId) await world.settleAttempt(attemptId); }
+    finally { await world.endTurn(turnId, outcome); }
+  }
 }
