@@ -13,6 +13,14 @@ import {
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('restricts movement to the supplied room IDs without changing other requests', () => {
+    const destinations = (ids?: readonly string[]) => actionJsonSchema(true, false, false, ids).properties.action.anyOf
+      .find(option => option.properties.type.enum[0] === 'move')?.properties.roomId;
+    expect(destinations(['news-room', 'room-4'])).toEqual({ type: 'string', minLength: 1, enum: ['news-room', 'room-4'] });
+    expect(destinations(['forum'])).toEqual({ type: 'string', minLength: 1, enum: ['forum'] });
+    expect(destinations()).toEqual({ type: 'string', minLength: 1 });
+    expect(destinations([])).toBeUndefined();
+  });
   it('validates bounded emotes and typed activity, excluding fabricated arrival actions and extra state mutations', () => {
     expect(actionSchema.parse({ type: 'emote', message: '  A watches.  ' })).toEqual({ type: 'emote', message: 'A watches.' });
     for (const action of [{ type: 'emote', message: 'x'.repeat(241) }, { type: 'emote', message: ' ' },

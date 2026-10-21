@@ -1,5 +1,11 @@
 # Terrarium Core local development
 
+## Room directory and movement
+
+Resident requests list each room's exact ID, name, authored description, food-source flag and enabled news/media facility flags. The public directory never includes occupants, current headlines, playing programme titles/descriptions, ballots or remote conversation. Current occupants and displays are supplied only for the resident's own room; previously witnessed events remain personal memory. Ordinary and reflection requests, including previews, enumerate the actual directory IDs as the available move destinations. The final world validation still rejects unknown IDs.
+
+The approved current-world IDs are `news-room`, `commons`, `canteen`, `forum`, `quiet-corner`, `garden` and `media-room`. This is a saved-world configuration change, not a global migration that renames other installations. Historical diagnostic requests and responses retain their original room IDs for exact audit evidence; use all-room diagnostics or an old-ID filter for records from before the change.
+
 ## Start and validate
 
 Use Node 24 (tested with 24.15.0), pnpm 10.26.2, and Windows for ChatGPT credential storage. From the repository root:

@@ -23,6 +23,19 @@ beforeEach(async () => {
 afterEach(async () => { await db.destroy(); vi.restoreAllMocks(); });
 
 describe('private reflection decisions', () => {
+  it.each([true, false])('uses exact custom destinations in preview and actual request when reflection=%s', async reflection => {
+    await db.insertInto('rooms').values({ id: 'news-room', name: 'News Room', description: 'A shared display.', is_food_source: 0 }).execute();
+    const agent = await world.saveAgent(input), offered = { ...opportunity, reflection };
+    const preview = await previewDecision(world, agent, offered);
+    await performDecision(world, agent, { name: 'fake', complete: async request => {
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      const schema = request.responseFormat!.schema as ReturnType<typeof decisionJsonSchema>;
+      expect(schema.properties.action.anyOf.find(option => option.properties.type.enum[0] === 'move')?.properties.roomId)
+        .toEqual({ type: 'string', minLength: 1, enum: preview.context.directory.map(room => room.id) });
+      return { content: JSON.stringify({ ...(reflection ? quiet : { intention: null }), action: { type: 'move', roomId: 'news-room' } }) };
+    } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);
+    expect((await world.agent(agent.id))?.roomId).toBe('news-room');
+  });
   it('allows genuine inactivity while observations and elapsed energy continue', async () => {
     let now = 1000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -108,7 +121,7 @@ describe('private reflection decisions', () => {
     const response = { ...quiet, reflection: { reaction: 'Interested.', intention: 'Consider a question.' },
       speechPlan: { delayMs: 35000, replyToId: null, targetAgentId: null } };
     const result = await performDecision(world, agent, { name: 'fake', complete: async request => {
-      expect(request.responseFormat?.schema).toEqual(decisionJsonSchema(opportunity, true));
+      expect(request.responseFormat?.schema).toEqual(decisionJsonSchema(opportunity, true, 2, false, false, preview.context.directory.map(room => room.id)));
       expect(request.messages[0].content).toContain('CUSTOM REFLECTION PROMPT');
       await request.onRequest?.(createChatGptPayload(request));
       return { content: JSON.stringify(response), responseId: 'response-private', requestId: 'request-private' };
@@ -205,7 +218,7 @@ describe('private reflection decisions', () => {
     const preview = await previewDecision(world, agent, offered);
     const action = type === 'speak' ? { type, message: 'Yes, that interests me.' } : { type };
     const result = await performDecision(world, agent, { name: 'fake', complete: async request => {
-      expect(request.responseFormat?.schema).toEqual(decisionJsonSchema(offered, true));
+      expect(request.responseFormat?.schema).toEqual(decisionJsonSchema(offered, true, 2, false, false, preview.context.directory.map(room => room.id)));
       expect(request.messages[1].content).toContain('A fresh question.');
       expect(createChatGptPayload(request)).toEqual(preview.payload);
       return { content: JSON.stringify({ action }) };

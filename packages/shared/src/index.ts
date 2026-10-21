@@ -108,11 +108,15 @@ export const actionResponseJsonSchema = {
   required: ['action', 'intention'],
   additionalProperties: false,
 };
-export function actionJsonSchema(emotesEnabled: boolean, mediaEnabled = false, eatEligible = false) {
+export function actionJsonSchema(emotesEnabled: boolean, mediaEnabled = false, eatEligible = false, destinationRoomIds?: readonly string[]) {
   return { ...actionResponseJsonSchema, properties: { ...actionResponseJsonSchema.properties,
     action: { anyOf: actionResponseJsonSchema.properties.action.anyOf.filter(option =>
       (emotesEnabled || option.properties.type.enum[0] !== 'emote') && (mediaEnabled || option.properties.type.enum[0] !== 'propose-media') &&
-      (eatEligible || option.properties.type.enum[0] !== 'eat')) },
+      (eatEligible || option.properties.type.enum[0] !== 'eat') &&
+      (destinationRoomIds?.length !== 0 || option.properties.type.enum[0] !== 'move'))
+      .map(option => option.properties.type.enum[0] === 'move' && destinationRoomIds
+        ? { ...option, properties: { ...option.properties, roomId: { type: 'string', minLength: 1, enum: [...destinationRoomIds] } } }
+        : option) },
   } };
 }
 export const cursorSchema = z.object({ createdAt: z.string().datetime(), id: z.string().min(1) }).strict();

@@ -1,5 +1,17 @@
 # Terrarium Core development plan
 
+## Approved FLAME-148 room, retention and reasoning follow-up
+
+The user approved this follow-up on 22 October 2026, with parallel sub-agents for independent implementation. Integrate the features in this order, preserving a branch at each stage:
+
+| Branch | Approved scope |
+| --- | --- |
+| `codex/flame-148-room-discovery` | Exact destination IDs in ordinary/reflection schemas and previews; static facility labels without remote occupants or current news/media content; readable IDs matching the current world's room names. |
+| `codex/flame-148-diagnostic-retention` | Manual pause-at-size, rolling-size and rolling-time policies; default rolling-time 30 minutes; retain complete active evidence, evict completed groups, and remove diagnostic-capacity pauses in rolling modes. |
+| `codex/flame-148-reasoning-controls` | Model-specific SIWC reasoning choices beside resident/news model selection, nullable Model default, persistence/import/export, actual/preview parity and supported-choice validation. |
+
+Rolling time uses wall-clock completion age, including Pause/Stop. Rolling size permits protected active groups to exceed its target temporarily and evicts a completed oversized group whole. Genuine database failures still surface. Legacy explicit manual settings remain supported; the current world is explicitly switched to the new 30-minute policy after validation. No live inference is required for this follow-up. Use isolated data for development and functional checks, preserve a backup before current-world changes, and verify profiles, conversation histories and personal observation links survive the room-ID remap.
+
 Extend the existing prototype in three stages: reliable foundations, one complete agent loop, and an observable web experience. Keep the existing stack and package layout. The [project scope](project-scope.md) distinguishes implemented behavior, the next release, and deferred work.
 
 ## Review and delivery

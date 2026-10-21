@@ -8,6 +8,7 @@ import { Scheduler } from '../src/scheduler.js';
 import { createChatGptPayload, type LmCompletionRequest } from '@terrarium/lm-providers';
 import { assembleContext, performTurn, previewPrompt } from '../src/turns.js';
 import { defaultSettings } from '@terrarium/shared';
+import { previewDecision } from '../src/reflection.js';
 
 let db: ReturnType<typeof createDb>, world: World;
 const schedulers: Scheduler[] = [];
@@ -50,6 +51,52 @@ afterEach(async () => {
 });
 
 describe('agent turns and scheduling', () => {
+  it('offers exact destination IDs in preview and request and rejects a room name used as an ID', async () => {
+    await world.saveRoom({ id: 'room-4', name: 'Forum', description: 'Exchange opinions.', isFoodSource: false });
+    const agent = await world.saveAgent(input), preview = await previewPrompt(world, agent);
+    const complete = vi.fn(async (request: LmCompletionRequest) => {
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      const schema = request.responseFormat!.schema as ReturnType<typeof actionJsonSchema>;
+      expect(schema.properties.action.anyOf.find(option => option.properties.type.enum[0] === 'move')?.properties.roomId)
+        .toMatchObject({ enum: expect.arrayContaining(['room-1', 'room-4']) });
+      return { content: '{"action":{"type":"move","roomId":"forum"}}' };
+    });
+    await expect(performTurn(world, agent, { name: 'fake', complete }, new AbortController().signal,
+      () => true, () => {}, async () => {})).rejects.toThrow('Destination room does not exist');
+    expect((await world.agent(agent.id))?.roomId).toBe('room-1');
+    await performTurn(world, agent, { name: 'fake', complete: async () => ({ content: '{"action":{"type":"move","roomId":"room-4"}}' }) },
+      new AbortController().signal, () => true, () => {}, async () => {});
+    expect((await world.agent(agent.id))?.roomId).toBe('room-4');
+  });
+
+  it('advertises facilities without remote occupants, headlines or playing programmes in either decision context', async () => {
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, enabled: true, roomId: 'room-2' },
+      media: { ...defaultSettings.media, enabled: true, roomId: 'room-3' } });
+    const agent = await world.saveAgent(input);
+    const viewer = await world.saveAgent({ ...input, name: 'REMOTE VIEWER', roomId: 'room-3' });
+    await world.saveAgent({ ...input, name: 'REMOTE READER', roomId: 'room-2' });
+    await world.applyAction(viewer.id, viewer.revision, { type: 'propose-media', title: 'REMOTE PROGRAMME', description: 'REMOTE SYNOPSIS' }, () => true);
+    await world.publishNews({ headline: 'REMOTE HEADLINE', description: 'REMOTE NEWS DESCRIPTION', category: 'nature',
+      publishedAt: null, sourceUrls: ['https://example.org/private-display'] }, ['https://example.org/private-display'],
+      (await world.settings()).version, () => true);
+    const opportunity: DecisionOpportunity = { reflection: true, speech: false, emote: false, requestedAt: 1000, reason: 'cadence' };
+    for (const preview of [await previewPrompt(world, agent), await previewDecision(world, agent, opportunity)]) {
+      expect(preview.context.newsDisplay).toBeNull(); expect(preview.context.mediaDisplay).toBeNull();
+      expect(preview.context.presentAgents).toEqual([]);
+      expect(preview.context.directory.find(room => room.id === 'room-2')?.capabilities).toEqual({ newsDisplay: true, mediaScreen: false });
+      expect(preview.context.directory.find(room => room.id === 'room-3')?.capabilities).toEqual({ newsDisplay: false, mediaScreen: true });
+      for (const room of preview.context.directory) expect(Object.keys(room).sort()).toEqual(['capabilities', 'description', 'id', 'isFoodSource', 'name']);
+      for (const secret of ['REMOTE VIEWER', 'REMOTE READER', 'REMOTE PROGRAMME', 'REMOTE SYNOPSIS', 'REMOTE HEADLINE', 'REMOTE NEWS DESCRIPTION'])
+        expect(JSON.stringify(preview.payload)).not.toContain(secret);
+    }
+    expect((await previewPrompt(world, viewer)).context.mediaDisplay?.current?.title).toBe('REMOTE PROGRAMME');
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, enabled: true, roomId: 'room-1' } });
+    const changed = await previewPrompt(world, agent);
+    expect(changed.context.newsDisplay?.headline).toBe('REMOTE HEADLINE');
+    expect(changed.context.directory.find(room => room.id === 'room-1')?.capabilities).toEqual({ newsDisplay: true, mediaScreen: false });
+    expect(changed.context.directory.find(room => room.id === 'room-2')?.capabilities.newsDisplay).toBe(false);
+    expect(changed.context.directory.every(room => !room.capabilities.mediaScreen)).toBe(true);
+  });
   it.each(['cancelled', 'stale'])('does not record or broadcast a %s movement proposal', async kind => {
     const a = await world.saveAgent(input), pending = deferred(), requested = deferred(), notify = vi.fn();
     const controller = new AbortController();
@@ -90,7 +137,7 @@ describe('agent turns and scheduling', () => {
     const attempt = await world.startAttempt(await world.scheduleTurn(a, Date.now()), 1, a);
     const notify = vi.fn();
     const provider = { name: 'fake', complete: async (request: LmCompletionRequest) => {
-      expect(request.responseFormat?.schema).toEqual(actionJsonSchema(true));
+      expect(request.responseFormat?.schema).toEqual(actionJsonSchema(true, false, false, preview.context.directory.map(room => room.id)));
       expect(request.messages[0].content).toContain('CUSTOM OBSERVATIONS');
       expect(request.messages[0].content).toContain('CUSTOM EMOTES');
       await request.onRequest?.(createChatGptPayload(request));
@@ -329,7 +376,7 @@ describe('agent turns and scheduling', () => {
     const request = complete.mock.calls[0];
     expect(request[0].responseFormat).toEqual({
       name: 'terrarium_action',
-      schema: actionJsonSchema(false),
+      schema: actionJsonSchema(false, false, false, (await world.rooms()).map(room => room.id)),
     });
     expect(JSON.parse(request[0].messages[1].content)).toHaveLength(50);
     expect(
