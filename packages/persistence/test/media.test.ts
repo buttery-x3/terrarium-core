@@ -187,7 +187,7 @@ describe('shared media programme and required votes', () => {
     expect((await world.rooms()).some(room => room.id === 'media-room')).toBe(false);
     expect((await world.reflection(a.id)).reaction).toBe('Private state'); expect((await world.agent(a.id))?.intention).toBe('Authored intention');
     await expect(world.saveSettings({ ...(await world.settings()).value, media: { ...media, enabled: true } })).rejects.toThrow('existing assigned room');
-    const configuration = await world.exportConfiguration(); expect(configuration.version).toBe(8);
+    const configuration = await world.exportConfiguration(); expect(configuration.version).toBe(9);
     configuration.settings!.media.enabled = true;
     configuration.rooms.push({ id: 'media-room', name: 'Media Room', description: 'Movie and television choices', isFoodSource: false });
     await world.importConfiguration(configuration, (await world.previewConfiguration(configuration)).token);

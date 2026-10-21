@@ -107,7 +107,7 @@ describe('shared current news', () => {
     await expect(publish({ ...item, sourceUrls: ['https://example.org/science/marine-species?gclid=another'] })).rejects.toThrow('repeats');
     expect((await world.history({ roomId: 'room-1' })).messages).toEqual([]);
     const exported = await world.exportConfiguration();
-    expect(exported.version).toBe(8); expect(JSON.stringify(exported)).not.toContain(item.headline);
+    expect(exported.version).toBe(9); expect(JSON.stringify(exported)).not.toContain(item.headline);
   });
 
   it('upgrades version 5 without renaming rooms or changing existing private state and validates explicit room assignment', async () => {

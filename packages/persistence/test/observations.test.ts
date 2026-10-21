@@ -188,7 +188,7 @@ describe('private reflection and local exchanges', () => {
     const restarted = new World(db);
     await restarted.interruptUnfinished();
     expect(await restarted.reflection(a.id)).toEqual({ ...saved, engagement: null });
-    expect((await world.exportConfiguration()).version).toBe(8);
+    expect((await world.exportConfiguration()).version).toBe(9);
   });
 });
 const act = async (id: string, action: AgentAction) => {
@@ -319,7 +319,7 @@ describe('personal observations', () => {
     await world.speak('room-2', 'After migration');
     const memories = [await world.memory(a.id), await world.memory(b.id)];
     const configuration = await world.exportConfiguration();
-    expect(configuration.version).toBe(8);
+    expect(configuration.version).toBe(9);
     expect(JSON.stringify(configuration)).not.toContain('After migration');
     await db.destroy(); db = createDb(path); await ensureTables(db); world = new World(db);
     expect([await world.memory(a.id), await world.memory(b.id)]).toEqual(memories);

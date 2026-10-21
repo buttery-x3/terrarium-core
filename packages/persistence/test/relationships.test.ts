@@ -195,7 +195,7 @@ describe('evidence-based relationship memory', () => {
     expect((await world.reflection(a.id)).reaction).toBe('Private reaction');
     const saved = (await appraise(a, source.id)).acceptedAppraisals[0];
     const configuration = await world.exportConfiguration();
-    expect(configuration.version).toBe(8);
+    expect(configuration.version).toBe(9);
     expect(JSON.stringify(configuration)).not.toContain(saved.reason);
     await db.destroy(); db = createDb(path); await ensureTables(db); world = new World(db); await world.interruptUnfinished();
     expect((await appraise(a, source.id)).duplicateAppraisalIds).toEqual([saved.id]);
