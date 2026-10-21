@@ -31,6 +31,12 @@ export class ActionError extends Error {
   constructor(readonly category: 'stale' | 'world-validation' | 'persistence', message: string) { super(message); }
 }
 
+function configurationSettings(configuration: Configuration, state: WorldState): Settings {
+  const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
+  return { ...settings, news: { ...settings.news, reasoningEffort: settings.news.reasoningEffort !== undefined
+    ? settings.news.reasoningEffort : settings.news.model === state.settings.news.model ? state.settings.news.reasoningEffort ?? null : null } };
+}
+
 const agentRecord = (row: Selectable<DB['agents']>): Agent => ({
   id: row.id,
   name: row.name,
@@ -38,6 +44,7 @@ const agentRecord = (row: Selectable<DB['agents']>): Agent => ({
   roomId: row.room_id,
   provider: 'chatgpt',
   model: row.model,
+  reasoningEffort: row.reasoning_effort,
   enabled: Boolean(row.enabled),
   minIntervalMs: row.min_interval_ms,
   maxIntervalMs: row.max_interval_ms,
@@ -119,11 +126,16 @@ export class World {
 
   async settings() {
     const row = await this.db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
-    return { value: settingsSchema.parse(JSON.parse(row.value)), version: row.version };
+    const value = settingsSchema.parse(JSON.parse(row.value));
+    value.news.reasoningEffort ??= null;
+    return { value, version: row.version };
   }
 
   async validateSettings(value: Settings) {
     const settings = settingsSchema.parse(value);
+    const previous = (await this.settings()).value.news;
+    settings.news.reasoningEffort = settings.news.reasoningEffort !== undefined ? settings.news.reasoningEffort
+      : settings.news.model === previous.model ? previous.reasoningEffort ?? null : null;
     if (settings.news.enabled && !(await this.rooms()).some(room => room.id === settings.news.roomId))
       throw new Error('News requires an existing assigned room before it can be enabled.');
     if (settings.media.enabled && !(await this.rooms()).some(room => room.id === settings.media.roomId))
@@ -163,8 +175,8 @@ export class World {
       const state = await new World(db).state();
       return configurationSchema.parse({
         format: 'terrarium-config',
-        version: 8,
-        settings: state.settings,
+        version: 9,
+        settings: { ...state.settings, news: { ...state.settings.news, reasoningEffort: state.settings.news.reasoningEffort ?? null } },
         rooms: state.rooms,
         agents: state.agents.map(({ revision, energy, ...agent }) => agent),
       });
@@ -219,7 +231,8 @@ export class World {
     if (configuration.version < 6) defaults.push('News is disabled by default for older settings. Existing room names, archives and runtime news history are preserved.');
     if (configuration.version < 7) defaults.push('Media is disabled by default for older settings. Runtime programmes and ballots are not imported.');
     if (configuration.version < 8) defaults.push('Existing explicit manual diagnostic retention is preserved; the rolling time setting defaults to 30 minutes.');
-    const settings = configuration.version >= 2 ? configuration.settings! : state.settings;
+    if (configuration.version < 9) defaults.push('Missing reasoning effort preserves an existing choice for the same model; new or changed models use Model default.');
+    const settings = configurationSettings(configuration, state);
     if (settings.diagnostics.retention !== 'manual') defaults.push('Rolling diagnostic retention automatically deletes eligible completed turn records, including existing records. Downloaded exports and world history are retained.');
     const mergedRooms = new Map(state.rooms.map(room => [room.id, room]));
     for (const room of configuration.rooms) mergedRooms.set(room.id, { ...room, isFoodSource: room.isFoodSource ?? mergedRooms.get(room.id)?.isFoodSource ?? false });
@@ -307,6 +320,7 @@ export class World {
           room_id: agent.roomId,
           provider: agent.provider,
           model: agent.model,
+          reasoning_effort: agent.reasoningEffort !== undefined ? agent.reasoningEffort : previous?.model === agent.model ? previous.reasoningEffort ?? null : null,
           enabled: Number(agent.enabled),
           min_interval_ms: agent.minIntervalMs,
           max_interval_ms: agent.maxIntervalMs,
@@ -328,7 +342,7 @@ export class World {
         if (previous && (previous.roomId !== agent.roomId || !agent.enabled)) await new World(db).clearEngagements(agent.id);
       }
       if (configuration.version >= 2) await db.updateTable('settings').set(({ eb }) => ({
-        value: JSON.stringify(configuration.settings), version: eb('version', '+', 1),
+        value: JSON.stringify(configurationSettings(configuration, state)), version: eb('version', '+', 1),
       })).where('id', '=', 1).execute();
       if (configuration.settings && configuration.version >= 2 && !configuration.settings.scheduling.engagementEnabled)
         await new World(db).clearEngagements();
@@ -382,6 +396,7 @@ export class World {
         room_id: input.roomId,
         provider: input.provider,
         model: input.model,
+        reasoning_effort: input.reasoningEffort !== undefined ? input.reasoningEffort : previous?.model === input.model ? previous.reasoningEffort ?? null : null,
         enabled: Number(input.enabled),
         min_interval_ms: input.minIntervalMs,
         max_interval_ms: input.maxIntervalMs,

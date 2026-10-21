@@ -74,7 +74,7 @@ export async function assembleContext(
 export async function previewPrompt(world: World, agent: Agent) {
   const context = await contextProjection(world, agent);
   return { context, constraints: protocolConstraints, payload: createChatGptPayload({
-    provider: agent.provider, model: agent.model, messages: projectedMessages(context),
+    provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: projectedMessages(context),
     responseFormat: { name: 'terrarium_action', schema: actionJsonSchema(context.activityRules.emotesEnabled, Boolean(context.mediaDisplay),
       canEat(context.energyRules, context.own.energy, Boolean(context.room?.isFoodSource)), context.directory.map(room => room.id)) },
   }) };
@@ -104,6 +104,7 @@ export async function performTurn(
   const result = await provider.complete({
     provider: agent.provider,
     model: agent.model,
+    reasoningEffort: agent.reasoningEffort,
     messages,
     responseFormat: {
       name: 'terrarium_action',

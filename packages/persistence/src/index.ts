@@ -21,6 +21,7 @@ export interface DB {
     instructions: string;
     provider: string;
     model: string;
+    reasoning_effort: Generated<string | null>;
     enabled: number;
     context_message_limit: number;
     revision: number;
@@ -277,6 +278,14 @@ export const ensureTables = async (db: Kysely<DB>) => {
     const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
     await db.updateTable('settings').set({ value: JSON.stringify(upgradeSavedSettings(JSON.parse(saved.value))), version: saved.version + 1 }).where('id', '=', 1).execute();
     await db.insertInto('schema_migrations').values({ version: 8 }).execute();
+  }
+  if (!applied.some(row => row.version === 9)) {
+    await db.schema.alterTable('agents').addColumn('reasoning_effort', 'text').execute();
+    const saved = await db.selectFrom('settings').selectAll().where('id', '=', 1).executeTakeFirstOrThrow();
+    const value = upgradeSavedSettings(JSON.parse(saved.value));
+    value.news.reasoningEffort ??= null;
+    await db.updateTable('settings').set({ value: JSON.stringify(value), version: saved.version + 1 }).where('id', '=', 1).execute();
+    await db.insertInto('schema_migrations').values({ version: 9 }).execute();
   }
   });
 };

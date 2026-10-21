@@ -135,7 +135,7 @@ describe('whole-turn diagnostic retention', () => {
     expect((await world.settings()).value).toMatchObject({ diagnostics: { retention: 'manual', maxPayloadMiB: 64, maxAgeMinutes: 30 },
       prompts: { framing: 'Authored guidance' } });
     expect((await world.diagnostic(group.ids[0])).details?.output).toBe('Evidence 1');
-    expect(await world.exportConfiguration()).toMatchObject({ version: 8, settings: { diagnostics: { retention: 'manual', maxAgeMinutes: 30 } } });
+    expect(await world.exportConfiguration()).toMatchObject({ version: 9, settings: { diagnostics: { retention: 'manual', maxAgeMinutes: 30 } } });
     expect((await world.diagnosticUsage()).pruneGeneration).toBe(0);
   });
 });

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   readResponse,
   listChatGptModels,
+  listChatGptModelCatalog,
+  validateChatGptReasoning,
   createChatGptProvider,
   createChatGptPayload,
 } from '../src/chatgpt.js';
@@ -18,6 +20,82 @@ const stream = (...events: unknown[]) =>
   );
 const auth = { token: async () => 'synthetic-token' } as ChatGptAuth;
 describe('ChatGPT integration', () => {
+  it('keeps model defaults omitted and serializes an explicit reasoning strength', () => {
+    const request = { provider: 'chatgpt', model: 'test', messages: [] };
+    expect(createChatGptPayload(request)).not.toHaveProperty('reasoning');
+    expect(createChatGptPayload({ ...request, reasoningEffort: null })).not.toHaveProperty('reasoning');
+    expect(createChatGptPayload({ ...request, reasoningEffort: 'xhigh' })).toMatchObject({ reasoning: { effort: 'xhigh' } });
+  });
+  it('retains only visible catalog capabilities, including dynamic effort names and missing metadata', async () => {
+    const connection = { token: async () => 'synthetic' } as ChatGptAuth;
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ models: [
+      { slug: 'capable', visibility: 'list', display_name: 'Capable', default_reasoning_level: 'low',
+        supports_reasoning_effort_updates: false, base_instructions: 'MUST NOT LEAK',
+        supported_reasoning_levels: [{ effort: 'low', description: 'Fast' }, { effort: 'future-effort', description: 'New option' }, { effort: 'low' }, null, { effort: 3 }] },
+      { slug: 'unknown', visibility: 'list' }, { slug: 'none', visibility: 'list', supported_reasoning_levels: [] },
+      { slug: 'hidden', visibility: 'hidden', supported_reasoning_levels: [{ effort: 'high' }] }, null,
+    ] }));
+    const catalog = await listChatGptModelCatalog(connection);
+    expect(catalog).toEqual([
+      { slug: 'capable', displayName: 'Capable', defaultReasoningEffort: 'low', supportedReasoningEfforts: [
+        { effort: 'low', description: 'Fast' }, { effort: 'future-effort', description: 'New option' }] },
+      { slug: 'unknown', displayName: 'unknown', defaultReasoningEffort: null, supportedReasoningEfforts: null },
+      { slug: 'none', displayName: 'none', defaultReasoningEffort: null, supportedReasoningEfforts: [] },
+    ]);
+    expect(JSON.stringify(catalog)).not.toContain('MUST NOT LEAK');
+    await expect(validateChatGptReasoning(connection, 'capable', 'future-effort')).resolves.toBeUndefined();
+    await expect(validateChatGptReasoning(connection, 'capable', 'high')).rejects.toThrow('does not support');
+    await expect(validateChatGptReasoning(connection, 'unknown', 'high')).rejects.toThrow('unavailable');
+    await expect(validateChatGptReasoning(connection, 'hidden', 'high')).rejects.toThrow('unavailable');
+    await expect(validateChatGptReasoning(connection, 'none', 'high')).rejects.toThrow('does not support');
+  });
+  it('validates explicit effort before capture or inference, caches capability reads, and captures the submitted effort', async () => {
+    const connection = { token: async () => 'synthetic' } as ChatGptAuth, capture = vi.fn();
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ models: [{
+      slug: 'test', visibility: 'list', supported_reasoning_levels: [{ effort: 'xhigh' }],
+    }] })).mockResolvedValueOnce(stream(
+      { type: 'response.output_text.delta', delta: '{"action":{"type":"wait"}}' },
+      { type: 'response.completed', response: { status: 'completed' } },
+    ));
+    const provider = createChatGptProvider(connection), request = { provider: 'chatgpt', model: 'test', messages: [], onRequest: capture };
+    await expect(provider.complete({ ...request, reasoningEffort: 'unsupported' })).rejects.toThrow('does not support');
+    expect(capture).not.toHaveBeenCalled(); expect(fetcher).toHaveBeenCalledTimes(1);
+    await provider.complete({ ...request, reasoningEffort: 'xhigh' });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const payload = JSON.parse(fetcher.mock.calls[1][1]!.body as string);
+    expect(payload.reasoning).toEqual({ effort: 'xhigh' });
+    expect(capture).toHaveBeenCalledWith(payload);
+  });
+  it('does not infer an effort when catalog refresh fails', async () => {
+    const connection = { token: async () => 'synthetic' } as ChatGptAuth;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Catalog offline'));
+    await expect(validateChatGptReasoning(connection, 'test', 'high')).rejects.toThrow('Catalog offline');
+    await expect(validateChatGptReasoning(connection, 'test', null)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('partitions cached and pending catalogs by credential identity without exposing credentials', async () => {
+    let identity = 'first-synthetic', resolveFirst!: (value: Response) => void;
+    const connection = { token: async () => identity } as ChatGptAuth;
+    const firstResponse = new Promise<Response>(resolve => { resolveFirst = resolve; });
+    const response = (slug: string) => Response.json({ models: [{ slug, visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }] });
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(firstResponse).mockResolvedValueOnce(response('second'));
+    const first = listChatGptModelCatalog(connection);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    identity = 'second-synthetic';
+    expect((await listChatGptModelCatalog(connection))[0].slug).toBe('second');
+    resolveFirst(response('first'));
+    expect((await first)[0].slug).toBe('first');
+    expect((await listChatGptModelCatalog(connection))[0].slug).toBe('second');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it('does not start catalog discovery or inference for an already cancelled request', async () => {
+    const connection = { token: vi.fn(async () => 'synthetic') } as unknown as ChatGptAuth;
+    const fetcher = vi.spyOn(globalThis, 'fetch'), controller = new AbortController();
+    controller.abort(new Error('Cancelled'));
+    await expect(createChatGptProvider(connection).complete({ provider: 'chatgpt', model: 'test', reasoningEffort: 'high',
+      messages: [], signal: controller.signal })).rejects.toThrow('Cancelled');
+    expect(connection.token).not.toHaveBeenCalled(); expect(fetcher).not.toHaveBeenCalled();
+  });
   it('enables search only for an explicit shared-news request', () => {
     const request = { provider: 'chatgpt', model: 'test', messages: [] };
     expect(createChatGptPayload(request)).not.toHaveProperty('tools');

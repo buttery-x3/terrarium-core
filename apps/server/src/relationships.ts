@@ -45,7 +45,7 @@ export async function previewRelationshipSummary(world: World, agent: Agent, tar
   const context = await summaryContext(world, agent, targetAgentId, true);
   if (!context) return null;
   return { context, constraints: relationshipSummaryConstraints, payload: createChatGptPayload({
-    provider: agent.provider, model: agent.model, messages: summaryMessages(context),
+    provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: summaryMessages(context),
     responseFormat: { name: 'terrarium_relationship_summary', schema: relationshipSummaryJsonSchema },
   }) };
 }
@@ -74,7 +74,7 @@ export async function performRelationshipSummary(
       agentRevision: context.agentRevision, operation: 'relationship-summary' });
     category = 'provider';
     const result = await provider.complete({
-      provider: agent.provider, model: agent.model, messages: summaryMessages(context), signal,
+      provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: summaryMessages(context), signal,
       responseFormat: { name: 'terrarium_relationship_summary', schema: relationshipSummaryJsonSchema },
       onRequest: async payload => {
         signal.throwIfAborted();

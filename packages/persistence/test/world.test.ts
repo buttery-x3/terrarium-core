@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sql } from 'kysely';
-import { defaultSettings, type Configuration } from '@terrarium/shared';
+import { configurationSchema, defaultSettings, type Configuration } from '@terrarium/shared';
 import {
   createDb,
   ensureTables,
@@ -42,6 +42,66 @@ const agentInput = {
 };
 
 describe('persisted world', () => {
+  it('persists reasoning choices, preserves older imports for unchanged models, and clears an explicit default', async () => {
+    const world = await fixture();
+    let agent = await world.saveAgent({ ...agentInput, reasoningEffort: 'xhigh' });
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, reasoningEffort: 'low' } });
+    const exported = await world.exportConfiguration();
+    expect(exported.version).toBe(9); expect(exported.agents[0].reasoningEffort).toBe('xhigh');
+    const destination = await fixture();
+    await destination.importConfiguration(exported, (await destination.previewConfiguration(exported)).token);
+    expect(await destination.exportConfiguration()).toEqual(exported);
+    for (const version of [7, 8] as const) {
+      const older = { ...exported, version, agents: exported.agents.map(({ reasoningEffort, ...value }) => value),
+        settings: { ...exported.settings!, news: { ...exported.settings!.news, reasoningEffort: undefined } } };
+      await world.importConfiguration(older, (await world.previewConfiguration(older)).token);
+      expect((await world.agent(agent.id))?.reasoningEffort).toBe('xhigh');
+      expect((await world.settings()).value.news.reasoningEffort).toBe('low');
+    }
+    agent = await world.saveAgent({ ...agentInput, id: agent.id });
+    expect(agent.reasoningEffort).toBe('xhigh');
+    agent = await world.saveAgent({ ...agentInput, id: agent.id, model: 'another' });
+    expect(agent.reasoningEffort).toBeNull();
+    agent = await world.saveAgent({ ...agentInput, id: agent.id, reasoningEffort: 'high' });
+    agent = await world.saveAgent({ ...agentInput, id: agent.id, reasoningEffort: null });
+    expect(agent.reasoningEffort).toBeNull();
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, reasoningEffort: null } });
+    expect((await world.settings()).value.news.reasoningEffort).toBeNull();
+  });
+  it.each([2, 3, 4, 5])('preserves an omitted news strength when upgrading version %s settings', async version => {
+    const world = await fixture();
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, reasoningEffort: 'low' } });
+    const older: any = await world.exportConfiguration();
+    older.version = version;
+    delete older.settings.news; delete older.settings.media;
+    delete older.settings.prompts.newsSelection; delete older.settings.prompts.mediaParticipation; delete older.settings.prompts.mediaVote;
+    if (version < 5) {
+      delete older.settings.relationships; delete older.settings.prompts.appraisals; delete older.settings.prompts.relationshipSummary;
+    }
+    if (version < 4) { delete older.settings.scheduling; delete older.settings.prompts.reflection; }
+    if (version < 3) { delete older.settings.activity; delete older.settings.prompts.observations; delete older.settings.prompts.emotes; }
+    const parsed = configurationSchema.parse(older);
+    expect(parsed.settings?.news.reasoningEffort).toBeUndefined();
+    await world.importConfiguration(parsed, (await world.previewConfiguration(parsed)).token);
+    expect((await world.settings()).value.news.reasoningEffort).toBe('low');
+    await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, model: 'different', reasoningEffort: 'high' } });
+    await world.importConfiguration(parsed, (await world.previewConfiguration(parsed)).token);
+    expect((await world.settings()).value.news.reasoningEffort).toBeNull();
+  });
+  it('migrates version 8 once without rewriting authored prompts or resident state', async () => {
+    const world = await fixture();
+    const agent = await world.saveAgent({ ...agentInput, instructions: 'UNCHANGED PROFILE' });
+    await world.saveSettings({ ...defaultSettings, prompts: { ...defaultSettings.prompts, energy: 'UNCHANGED PROMPT' } });
+    const settings = (await world.settings()).value;
+    delete settings.news.reasoningEffort;
+    await world.db.updateTable('settings').set({ value: JSON.stringify(settings) }).where('id', '=', 1).execute();
+    await world.db.schema.alterTable('agents').dropColumn('reasoning_effort').execute();
+    await world.db.deleteFrom('schema_migrations').where('version', '=', 9).execute();
+    await ensureTables(world.db); await ensureTables(world.db);
+    expect(await world.agent(agent.id)).toEqual({ ...agent, reasoningEffort: null });
+    expect((await world.settings()).value).toEqual({ ...settings, news: { ...settings.news, reasoningEffort: null } });
+    expect((await world.db.selectFrom('schema_migrations').selectAll().where('version', '=', 9).execute())).toHaveLength(1);
+  });
   it('recovers interrupted attempts and energy after reopening the database without changing applied evidence', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'terrarium-test-'));
     directories.push(directory);
@@ -612,7 +672,7 @@ describe('persisted world', () => {
     });
     expect(
       await db.selectFrom('schema_migrations').selectAll().execute(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }]);
     expect(await world.memory('old-agent')).toEqual([]);
     const unchanged = new Database(legacy, { readonly: true });
     expect(unchanged.prepare('PRAGMA table_info(agents)').all()).toHaveLength(

@@ -249,6 +249,15 @@ describe('agent turns and scheduling', () => {
     expect(notify).not.toHaveBeenCalled();
     expect((await world.history({ roomId: agent.roomId })).messages).toHaveLength(0);
   });
+  it('keeps legacy turn reasoning strength identical in previews and submitted requests', async () => {
+    const agent = await world.saveAgent({ ...input, reasoningEffort: 'high' }), preview = await previewPrompt(world, agent);
+    expect(preview.payload).toMatchObject({ reasoning: { effort: 'high' } });
+    await performTurn(world, agent, { name: 'fake', complete: async request => {
+      expect(request.reasoningEffort).toBe('high');
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      return { content: '{"action":{"type":"wait"}}' };
+    } }, new AbortController().signal, () => true, () => {}, async () => {});
+  });
 
   it('keeps accepted speech applied after notification failure and correlates retries', async () => {
     await world.saveAgent(input);

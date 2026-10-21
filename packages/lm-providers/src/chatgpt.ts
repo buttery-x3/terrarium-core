@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { boundedJson, type ChatGptAuth } from './chatgpt-auth.js';
 import { ProviderError, type LmCompletionRequest, type LmCompletionResponse, type LmProvider } from './types.js';
 
@@ -231,7 +232,11 @@ export function createChatGptProvider(auth: ChatGptAuth): LmProvider {
   return {
     name: 'chatgpt',
     async complete(request) {
+      request.signal?.throwIfAborted();
       const token = await auth.token();
+      request.signal?.throwIfAborted();
+      if (request.reasoningEffort != null)
+        checkReasoning(await modelCatalogForToken(auth, token), request.model, request.reasoningEffort);
       request.signal?.throwIfAborted();
       const payload = createChatGptPayload(request);
       await request.onRequest?.(payload);
@@ -264,6 +269,7 @@ export function createChatGptProvider(auth: ChatGptAuth): LmProvider {
 export function createChatGptPayload(request: LmCompletionRequest): Record<string, unknown> {
   return {
     model: request.model, stream: true, store: false,
+    ...(request.reasoningEffort != null ? { reasoning: { effort: request.reasoningEffort } } : {}),
     instructions: request.messages.filter(message => message.role === 'system').map(message => message.content).join('\n'),
     input: request.messages.filter(message => message.role !== 'system'),
     ...(request.webSearch ? { tools: [{ type: 'web_search' }], tool_choice: 'required', include: ['web_search_call.action.sources'] } : {}),
@@ -272,8 +278,7 @@ export function createChatGptPayload(request: LmCompletionRequest): Record<strin
   };
 }
 
-export async function listChatGptModels(auth: ChatGptAuth) {
-  const token = await auth.token();
+async function fetchChatGptModelCatalog(token: string) {
   const response = await fetch('https://api.openai.com/v1/models', {
     redirect: 'error',
     headers: { Authorization: `Bearer ${token}` },
@@ -286,9 +291,56 @@ export async function listChatGptModels(auth: ChatGptAuth) {
   const value = await boundedJson(response);
   if (!Array.isArray(value.models))
     throw new Error('ChatGPT returned an invalid model catalog.');
-  return value.models.flatMap((model: any) =>
-    model.visibility === 'list' && typeof model.slug === 'string'
-      ? [model.slug]
-      : [],
-  );
+  return value.models.flatMap((model: any) => {
+    if (!model || model.visibility !== 'list' || typeof model.slug !== 'string' || !model.slug.trim()) return [];
+    const efforts: { effort: string; description: string }[] | null = Array.isArray(model.supported_reasoning_levels)
+      ? model.supported_reasoning_levels.flatMap((level: any) =>
+        level && typeof level.effort === 'string' && level.effort.trim() && level.effort.length <= 80
+          ? [{ effort: level.effort, description: typeof level.description === 'string' ? level.description : '' }] : [])
+      : null;
+    return [{
+      slug: model.slug, displayName: typeof model.display_name === 'string' ? model.display_name : model.slug,
+      defaultReasoningEffort: typeof model.default_reasoning_level === 'string' ? model.default_reasoning_level : null,
+      supportedReasoningEfforts: efforts?.filter((level: { effort: string }, index: number) =>
+        efforts.findIndex((other: { effort: string }) => other.effort === level.effort) === index) ?? null,
+    }];
+  });
+}
+
+type ModelCatalog = Awaited<ReturnType<typeof fetchChatGptModelCatalog>>;
+type ModelCatalogCache = { identity: string; value?: ModelCatalog; expiresAt: number; pending?: Promise<ModelCatalog> };
+const modelCatalogs = new WeakMap<ChatGptAuth, ModelCatalogCache>();
+async function modelCatalogForToken(auth: ChatGptAuth, token: string, refresh = false): Promise<ModelCatalog> {
+  const identity = createHash('sha256').update(token).digest('hex');
+  const cached = modelCatalogs.get(auth);
+  if (cached?.identity === identity && cached.pending) return cached.pending;
+  if (!refresh && cached?.identity === identity && cached.value && cached.expiresAt > Date.now()) return cached.value;
+  const entry: ModelCatalogCache = { identity, expiresAt: 0 };
+  entry.pending = fetchChatGptModelCatalog(token).then(value => {
+    entry.value = value; entry.expiresAt = Date.now() + 300000; entry.pending = undefined;
+    return value;
+  }).catch(error => { if (modelCatalogs.get(auth) === entry) modelCatalogs.delete(auth); throw error; });
+  modelCatalogs.set(auth, entry);
+  return entry.pending;
+}
+
+export async function listChatGptModelCatalog(auth: ChatGptAuth, refresh = false): Promise<ModelCatalog> {
+  return modelCatalogForToken(auth, await auth.token(), refresh);
+}
+
+export async function listChatGptModels(auth: ChatGptAuth) {
+  return (await listChatGptModelCatalog(auth, true)).map(model => model.slug);
+}
+
+export async function validateChatGptReasoning(auth: ChatGptAuth, model: string, effort?: string | null) {
+  if (effort == null) return;
+  checkReasoning(await listChatGptModelCatalog(auth), model, effort);
+}
+
+function checkReasoning(catalog: ModelCatalog, model: string, effort: string) {
+  const selected = catalog.find(item => item.slug === model);
+  if (!selected?.supportedReasoningEfforts)
+    throw new Error(`ChatGPT reasoning options are unavailable for ${model}. Refresh available models or choose Model default.`);
+  if (!selected.supportedReasoningEfforts.some((item: { effort: string }) => item.effort === effort))
+    throw new Error(`ChatGPT model ${model} does not support reasoning strength ${effort}. Choose an advertised strength or Model default.`);
 }

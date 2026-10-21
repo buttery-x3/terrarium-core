@@ -86,7 +86,7 @@ function projectedMessages(context: Awaited<ReturnType<typeof contextProjection>
 export async function previewDecision(world: World, agent: Agent, opportunity: DecisionOpportunity) {
   const context = await contextProjection(world, agent);
   return { context: { ...context, opportunity }, constraints: decisionConstraints, payload: createChatGptPayload({
-    provider: agent.provider, model: agent.model, messages: projectedMessages(context, opportunity),
+    provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: projectedMessages(context, opportunity),
     responseFormat: { name: opportunity.reflection ? 'terrarium_reflection' : 'terrarium_action',
       schema: decisionJsonSchema(opportunity, context.activityRules.emotesEnabled, context.relationshipRules.maxAppraisalsPerReflection, Boolean(context.mediaDisplay),
         canEat(context.energyRules, context.own.energy, Boolean(context.room?.isFoodSource)), context.directory.map(room => room.id)) },
@@ -154,7 +154,7 @@ export async function performDecision(
     if (!stillCurrent()) throw new ActionError('stale', 'This decision is no longer current.');
     category = 'provider';
     const result = await provider.complete({
-      provider: agent.provider, model: agent.model, messages,
+      provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages,
       responseFormat: { name: opportunity.reflection ? 'terrarium_reflection' : 'terrarium_action',
         schema: decisionJsonSchema(opportunity, context.activityRules.emotesEnabled, context.relationshipRules.maxAppraisalsPerReflection, Boolean(context.mediaDisplay),
           canEat(context.energyRules, context.own.energy, Boolean(context.room?.isFoodSource)), context.directory.map(room => room.id)) },

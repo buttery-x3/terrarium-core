@@ -87,12 +87,14 @@ describe('reflection appraisals and relationship summaries', () => {
   });
 
   it('stores an evidence-linked private summary and captures the exact preview request', async () => {
-    const observer = await world.saveAgent(input), target = await world.saveAgent({ ...input, name: 'Companion', instructions: 'SECRET TARGET PROFILE' });
+    const observer = await world.saveAgent({ ...input, reasoningEffort: 'high' }), target = await world.saveAgent({ ...input, name: 'Companion', instructions: 'SECRET TARGET PROFILE' });
     const evidence = await appraise(observer, target);
     await world.saveSettings({ ...defaultSettings, prompts: { ...defaultSettings.prompts, relationshipSummary: 'CUSTOM SUMMARY PROMPT' } });
     const preview = await previewRelationshipSummary(world, observer, target.id);
+    expect(preview!.payload).toMatchObject({ reasoning: { effort: 'high' } });
     const attempt = await world.startAttempt(await world.scheduleTurn(observer, Date.now(), 'relationship-summary'), 1, observer);
     const complete = vi.fn(async request => {
+      expect(request.reasoningEffort).toBe('high');
       expect(request.messages[0].content).toContain('CUSTOM SUMMARY PROMPT');
       expect(JSON.stringify(request.messages)).not.toContain('SECRET TARGET PROFILE');
       await request.onRequest?.(createChatGptPayload(request));

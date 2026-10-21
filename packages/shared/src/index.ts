@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
 export const roomIdSchema = z.string().min(1);
+export const reasoningEffortSchema = z.string().trim().min(1).max(80).nullable();
+export type ChatGptModel = {
+  slug: string; displayName: string; defaultReasoningEffort: string | null;
+  supportedReasoningEfforts: { effort: string; description: string }[] | null;
+};
 const timingFieldsSchema = z.object({
   reflectionIntervalMs: z.number().int().positive().max(2147483647),
   speechMinDelayMs: z.number().int().positive().max(2147483647),
@@ -33,6 +38,7 @@ export const roomInputSchema = z.object({
 export const agentInputSchema = z.object({
   id: z.string().min(1).optional(), name: messageTextSchema, instructions: messageTextSchema,
   roomId: roomIdSchema, provider: z.literal('chatgpt'), model: z.string().trim().min(1),
+  reasoningEffort: reasoningEffortSchema.optional(),
   enabled: z.boolean(), minIntervalMs: z.number().int().positive().max(2147483647),
   maxIntervalMs: z.number().int().positive().max(2147483647),
   contextMessageLimit: z.number().int().min(1).max(50),
@@ -171,6 +177,7 @@ export const settingsSchema = z.object({
   relationships: z.object({ maxAppraisalsPerReflection: z.number().int().min(0).max(5),
     summaryIntervalMs: z.number().int().positive().max(2147483647), summaryBatchSize: z.number().int().min(1).max(50) }).strict(),
   news: z.object({ enabled: z.boolean(), roomId: roomIdSchema, intervalMs: z.number().int().positive().max(2147483647),
+    reasoningEffort: reasoningEffortSchema.optional(),
     model: z.string().trim().min(1).max(160), topics: z.array(z.string().trim().min(1).max(160)).min(1).max(12),
     recentHeadlineLimit: z.number().int().min(1).max(30) }).strict(),
   media: z.object({ enabled: z.boolean(), roomId: roomIdSchema, programmeDurationMs: z.number().int().positive().max(2147483647),
@@ -189,7 +196,7 @@ export const defaultSettings: Settings = {
   scheduling: { reflectionIntervalMs: 60000, speechMinDelayMs: 15000, speechMaxDelayMs: 150000,
     speechCooldownMs: 15000, emoteMinIntervalMs: 120000, emoteMaxIntervalMs: 300000, engagementEnabled: true },
   relationships: { maxAppraisalsPerReflection: 2, summaryIntervalMs: 600000, summaryBatchSize: 20 },
-  news: { enabled: false, roomId: 'room-1', intervalMs: 600000, model: 'gpt-6-luna',
+  news: { enabled: false, roomId: 'room-1', intervalMs: 600000, model: 'gpt-6-luna', reasoningEffort: null,
     topics: ['sport and upcoming events', 'science', 'nature', 'technology', 'entertainment', 'food', 'human interest', 'major world news'], recentHeadlineLimit: 12 },
   media: { enabled: false, roomId: 'media-room', programmeDurationMs: 600000, ballotDurationMs: 120000, proposalCooldownMs: 300000 },
   activity: { roomEventsEnabled: true, emotesEnabled: true },
@@ -222,7 +229,7 @@ export function upgradeRelationshipSettings(value: z.infer<typeof version4Settin
     appraisals: defaultPrompts.appraisals, relationshipSummary: defaultPrompts.relationshipSummary } });
 }
 export function upgradeNewsSettings(value: z.infer<typeof version5SettingsSchema>): Settings {
-  return upgradeMediaSettings({ ...value, news: { ...defaultSettings.news, topics: [...defaultSettings.news.topics] },
+  return upgradeMediaSettings({ ...value, news: { ...defaultSettings.news, reasoningEffort: undefined, topics: [...defaultSettings.news.topics] },
     prompts: { ...value.prompts, newsSelection: defaultPrompts.newsSelection } });
 }
 export function upgradeMediaSettings(value: z.infer<typeof version6SettingsSchema>): Settings {
@@ -264,7 +271,16 @@ export const configurationSchema = z.discriminatedUnion('version', [
   configurationFields.extend({ version: z.literal(6), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings), version6SettingsSchema.transform(upgradeMediaSettings)]) }),
   configurationFields.extend({ version: z.literal(7), settings: z.union([settingsSchema, version7SettingsSchema.transform(upgradeDiagnosticSettings)]) }),
   configurationFields.extend({ version: z.literal(8), settings: settingsSchema }),
+  configurationFields.extend({ version: z.literal(9), settings: settingsSchema }),
 ]).superRefine((value, context) => {
+  if (value.version >= 9) {
+    if (value.settings?.news.reasoningEffort === undefined)
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['settings', 'news', 'reasoningEffort'], message: 'Version 9 requires reasoning effort; null uses the model default.' });
+    value.agents.forEach((agent, index) => {
+      if (agent.reasoningEffort === undefined)
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['agents', index, 'reasoningEffort'], message: 'Version 9 requires reasoning effort; null uses the model default.' });
+    });
+  }
   if (value.version >= 2) {
     value.rooms.forEach((room, index) => {
       if (room.isFoodSource === undefined) context.addIssue({ code: z.ZodIssueCode.custom, path: ['rooms', index, 'isFoodSource'], message: 'Version 2 requires a food-source flag.' });

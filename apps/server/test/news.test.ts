@@ -28,6 +28,17 @@ describe('shared searched news', () => {
     expect(rows.every(row => row.ended_at !== null && row.execution_pending === 0)).toBe(true);
     expect(rows.find(row => row.attempt === 1)?.outcome).toBe('applied');
   });
+  it('uses the separate news reasoning strength in previews and actual requests', async () => {
+    const settings = (await world.settings()).value;
+    await world.saveSettings({ ...settings, news: { ...settings.news, reasoningEffort: 'medium' } });
+    const preview = await previewNews(world);
+    expect(preview.payload).toMatchObject({ reasoning: { effort: 'medium' } });
+    await select({ name: 'fake', complete: async request => {
+      expect(request.reasoningEffort).toBe('medium');
+      expect(createChatGptPayload(request)).toMatchObject({ reasoning: { effort: 'medium' }, model: settings.news.model });
+      return { content: '{"item":null}', search: { sources: [] } };
+    } });
+  });
   it('previews the real search-enabled request using only shared news context', async () => {
     const agent = await world.saveAgent({ name: 'Private resident', instructions: 'SECRET PROFILE', roomId: 'room-1',
       provider: 'chatgpt', model: 'fake', enabled: true, minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 });

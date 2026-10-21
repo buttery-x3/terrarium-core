@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { io, type Socket } from 'socket.io-client';
 import { createApplication } from '../../server/src/app.js';
 import { assembleContext } from '../../server/src/turns.js';
-import type { LmCompletionRequest, LmProvider } from '@terrarium/lm-providers';
+import type { ChatGptAuth, LmCompletionRequest, LmProvider } from '@terrarium/lm-providers';
 import {
   createDb,
   ensureTables,
@@ -14,7 +14,7 @@ let application: Awaited<ReturnType<typeof createApplication>>,
 async function setup(provider: LmProvider = {
   name: 'fake',
   complete: async () => ({ content: '{"action":{"type":"wait"}}' }),
-}) {
+}, auth?: ChatGptAuth) {
   db = createDb(':memory:');
   await ensureTables(db);
   application = await createApplication({
@@ -22,6 +22,7 @@ async function setup(provider: LmProvider = {
     origins: ['http://localhost:4173'],
     quiet: true,
     provider,
+    auth,
   });
   await application.app.listen({ port: 0, host: '127.0.0.1' });
   const address = application.app.server.address();
@@ -82,6 +83,55 @@ describe('web conversation contract', () => {
     await request(config, 'run:control', 'start');
     expect((await request(config, 'settings:save', current))).toMatchObject({ ok: false });
     await request(config, 'run:control', 'stop'); expect(complete).not.toHaveBeenCalled();
+  });
+  it('exposes sanitized model choices and validates saved reasoning without model requests', async () => {
+    const complete = vi.fn(), auth = { token: async () => 'synthetic', status: () => ({ connected: true, pending: false }), close: () => {} } as unknown as ChatGptAuth;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ models: [{
+      slug: 'test', visibility: 'list', display_name: 'Test', default_reasoning_level: 'low',
+      supported_reasoning_levels: [{ effort: 'low', description: 'Quick' }, { effort: 'xhigh', description: 'Deeper' }],
+      base_instructions: 'PRIVATE CATALOG FIELD',
+    }] }));
+    const url = await setup({ name: 'fake', complete }, auth), socket = connect(url); await ready(socket);
+    const catalog = await request(socket, 'auth:model-catalog', {});
+    expect(catalog).toMatchObject({ ok: true, value: [{ slug: 'test', defaultReasoningEffort: 'low', supportedReasoningEfforts: [
+      { effort: 'low' }, { effort: 'xhigh' }] }] });
+    expect(JSON.stringify(catalog)).not.toContain('PRIVATE CATALOG FIELD');
+    expect((await request(socket, 'auth:models', {})).value).toEqual(['test']);
+    const input = { name: 'Reasoning resident', instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt', model: 'test',
+      reasoningEffort: 'xhigh', enabled: false, minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 };
+    const saved = await request(socket, 'agents:save', input);
+    expect(saved).toMatchObject({ ok: true, value: { reasoningEffort: 'xhigh' } });
+    expect((await request(socket, 'prompt:preview', { agentId: saved.value.id })).value.payload.reasoning).toEqual({ effort: 'xhigh' });
+    const rejected = await request(socket, 'agents:save', { ...input, id: saved.value.id, reasoningEffort: 'ultra' });
+    expect(rejected.ok).toBe(false); expect(rejected.error).toContain('does not support');
+    expect((await application.world.agent(saved.value.id))?.reasoningEffort).toBe('xhigh');
+    const configuration = (await request(socket, 'config:export', {})).value;
+    configuration.agents[0].reasoningEffort = 'ultra';
+    expect((await request(socket, 'config:preview', configuration)).ok).toBe(false);
+    const settings = (await application.world.settings()).value;
+    expect((await request(socket, 'settings:save', { ...settings, news: { ...settings.news, model: 'test', reasoningEffort: 'low' } })).ok).toBe(true);
+    expect((await request(socket, 'news:preview', {})).value.payload.reasoning).toEqual({ effort: 'low' });
+    expect((await request(socket, 'agents:save', { ...input, id: saved.value.id, model: 'unknown', reasoningEffort: null })).ok).toBe(true);
+    expect(complete).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.every(([url]) => url === 'https://api.openai.com/v1/models')).toBe(true);
+  });
+  it('rechecks the import guard after an agent save waits for model capabilities', async () => {
+    const auth = { token: async () => 'synthetic', status: () => ({ connected: true, pending: false }), close: () => {} } as unknown as ChatGptAuth;
+    let resolveCatalog!: (response: Response) => void, failImport!: (error: Error) => void;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(resolve => { resolveCatalog = resolve; }));
+    const url = await setup(undefined, auth), config = connect(url); await ready(config);
+    const configuration = await application.world.exportConfiguration(), preview = await application.world.previewConfiguration(configuration);
+    const saving = request(config, 'agents:save', { name: 'Pending', instructions: 'Observe', roomId: 'room-1', provider: 'chatgpt',
+      model: 'test', reasoningEffort: 'low', enabled: false, minIntervalMs: 60000, maxIntervalMs: 150000, contextMessageLimit: 30 });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const importer = vi.spyOn(application.world, 'importConfiguration').mockImplementationOnce(() => new Promise((_, reject) => { failImport = reject; }));
+    const importing = request(config, 'config:import', { configuration, previewToken: preview.token });
+    await vi.waitFor(() => expect(importer).toHaveBeenCalledOnce());
+    resolveCatalog(Response.json({ models: [{ slug: 'test', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }] }));
+    expect((await saving).error).toContain('import is in progress');
+    expect(await application.world.agents()).toHaveLength(0);
+    failImport(new Error('Injected import failure'));
+    expect((await importing).ok).toBe(false);
   });
   it('starts idle media directly and requests genuine replacement votes independently of speech', async () => {
     const votes: string[] = [];
@@ -199,7 +249,7 @@ describe('web conversation contract', () => {
     expect((await request(reconnected, 'history:get', { roomId: 'room-2' })).value.messages.map((item: any) => item.type)).toEqual(['speak', 'arrival', 'emote']);
     expect((await request(reconnected, 'history:get', { roomId: 42 })).ok).toBe(false);
     const exported = (await request(config, 'config:export', {})).value;
-    expect(exported.version).toBe(8);
+    expect(exported.version).toBe(9);
     expect(exported.settings.activity).toEqual({ roomEventsEnabled: true, emotesEnabled: true });
     const imported = await request(config, 'config:preview', exported);
     expect((await request(config, 'config:import', { configuration: exported, previewToken: imported.value.token })).ok).toBe(true);
@@ -468,7 +518,7 @@ describe('web conversation contract', () => {
     expect(exported.ok).toBe(true);
     expect(exported.value).toMatchObject({
       format: 'terrarium-config',
-      version: 8,
+      version: 9,
       agents: [],
     });
     const configuration = {
@@ -484,6 +534,7 @@ describe('web conversation contract', () => {
       agents: [
         {
           id: 'import-agent',
+          reasoningEffort: null,
           name: 'Imported agent',
           instructions: 'Observe.',
           motivations: '', intention: '',
@@ -576,6 +627,7 @@ describe('web conversation contract', () => {
           id: 'a',
           name: 'A',
           instructions: 'Wait.',
+          reasoningEffort: null,
           motivations: '', intention: '',
           roomId: 'missing',
           provider: 'chatgpt',

@@ -8,6 +8,7 @@ export interface Message {
 export interface LmCompletionRequest {
   provider: string;
   model: string;
+  reasoningEffort?: string | null;
   messages: Message[];
   temperature?: number;
   maxTokens?: number;

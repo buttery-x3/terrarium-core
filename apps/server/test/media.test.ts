@@ -77,16 +77,18 @@ describe('media decisions and independent votes', () => {
   });
 
   it('records an actual proposer choice and exact private request diagnostics without revealing other votes', async () => {
-    const agent = await world.saveAgent(input), other = await world.saveAgent({ ...input, name: 'Other', instructions: 'OTHER PRIVATE PROFILE' });
+    const agent = await world.saveAgent({ ...input, reasoningEffort: 'low' }), other = await world.saveAgent({ ...input, name: 'Other', instructions: 'OTHER PRIVATE PROFILE' });
     await world.saveReflection(other.id, other.revision, { reaction: 'OTHER PRIVATE REACTION' }, () => true);
     const ballot = await openBallot(agent);
     expect(ballot.votes.every(vote => vote.status === 'pending' && vote.choice === null)).toBe(true);
     await world.saveMediaVote(other.id, other.revision, ballot.id, 'change', () => true);
     const preview = (await previewMediaVote(world, agent, ballot.id))!, payload = JSON.stringify(preview.payload);
+    expect(preview.payload).toMatchObject({ reasoning: { effort: 'low' } });
     expect(payload).not.toContain('OTHER PRIVATE PROFILE'); expect(payload).not.toContain('OTHER PRIVATE REACTION');
     expect(preview.context.vote).not.toHaveProperty('votes'); expect(preview.context.mediaDisplay).not.toHaveProperty('activeBallot');
     const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now(), 'media-vote'), 1, agent);
     await vote(agent, ballot.id, { name: 'fake', complete: async request => {
+      expect(request.reasoningEffort).toBe('low');
       expect(request.responseFormat?.schema).toEqual(mediaVoteJsonSchema);
       await request.onRequest?.(createChatGptPayload(request));
       return { content: '{"choice":"keep"}', responseId: 'vote-response', requestId: 'vote-request' };

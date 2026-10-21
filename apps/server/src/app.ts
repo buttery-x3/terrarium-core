@@ -20,9 +20,12 @@ import {
   type ConversationMessage,
   type ConversationExport,
   type Result,
+  type Configuration,
 } from '@terrarium/shared';
 import {
   listChatGptModels,
+  listChatGptModelCatalog,
+  validateChatGptReasoning,
   type ChatGptAuth,
   type LmProvider,
 } from '@terrarium/lm-providers';
@@ -86,6 +89,22 @@ export async function createApplication(options: {
   const config = io.of('/config'),
     terrain = io.of('/terrain');
   const world = new World(options.db);
+  const validateReasoning = async (model: string, effort?: string | null) => {
+    if (effort == null) return;
+    if (!options.auth) throw new Error('ChatGPT connection is unavailable. Choose Model default or connect ChatGPT to validate reasoning strength.');
+    await validateChatGptReasoning(options.auth, model, effort);
+  };
+  const validateConfigurationReasoning = async (configuration: Configuration) => {
+    const state = await world.state();
+    for (const agent of configuration.agents) {
+      const previous = state.agents.find(item => item.id === agent.id);
+      await validateReasoning(agent.model, agent.reasoningEffort !== undefined ? agent.reasoningEffort
+        : previous?.model === agent.model ? previous.reasoningEffort : null);
+    }
+    const news = configuration.version >= 2 ? configuration.settings!.news : state.settings.news;
+    await validateReasoning(news.model, news.reasoningEffort !== undefined ? news.reasoningEffort
+      : news.model === state.settings.news.model ? state.settings.news.reasoningEffort : null);
+  };
   await world.interruptUnfinished();
   let clearingHistory = false;
   const checkHistoryWrite = () => {
@@ -242,6 +261,10 @@ export async function createApplication(options: {
     });
     command('agents:save', agentInputSchema, async (input) => {
       checkConfigurationWrite();
+      const previous = input.id ? await world.agent(input.id) : undefined;
+      await validateReasoning(input.model, input.reasoningEffort !== undefined ? input.reasoningEffort
+        : previous?.model === input.model ? previous.reasoningEffort : null);
+      checkConfigurationWrite();
       const agent = await world.saveAgent(input);
       await scheduler.changed();
       await publishWorld();
@@ -261,14 +284,23 @@ export async function createApplication(options: {
       checkConfigurationWrite();
       if (scheduler.snapshot().state !== 'stopped') throw new Error('Configuration settings require a stopped run. Choose Stop first.');
       importingConfiguration = true;
-      try { const saved = await world.saveSettings(input); await publishWorld(); await scheduler.maintainDiagnostics(); return saved; }
+      try {
+        const previous = (await world.settings()).value.news;
+        await validateReasoning(input.news.model, input.news.reasoningEffort !== undefined ? input.news.reasoningEffort
+          : input.news.model === previous.model ? previous.reasoningEffort : null);
+        const saved = await world.saveSettings(input); await publishWorld(); await scheduler.maintainDiagnostics(); return saved;
+      }
       finally { importingConfiguration = false; }
     });
     command('reflection:list', z.object({}).strict(), () => world.reflections());
     command('news:state', z.object({}).strict(), () => world.newsState());
     command('news:history', z.object({ before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
       input => world.newsHistory(input));
-    command('news:preview', z.object({}).strict(), () => previewNews(world));
+    command('news:preview', z.object({}).strict(), async () => {
+      const news = (await world.settings()).value.news;
+      await validateReasoning(news.model, news.reasoningEffort);
+      return previewNews(world);
+    });
     command('media:state', z.object({}).strict(), () => world.mediaState());
     command('media:ballots', z.object({ before: z.number().int().positive().optional(), limit: z.number().int().min(1).max(100).optional() }).strict(),
       input => world.mediaBallots(input));
@@ -276,6 +308,7 @@ export async function createApplication(options: {
     command('media:preview', z.object({ agentId: z.string().min(1), ballotId: z.string().min(1) }).strict(), async input => {
       const agent = await world.agent(input.agentId);
       if (!agent) throw new Error('Agent does not exist.');
+      await validateReasoning(agent.model, agent.reasoningEffort);
       return previewMediaVote(world, agent, input.ballotId);
     });
     command('relationships:list', relationshipFilterSchema, input => world.relationshipPage(input));
@@ -287,6 +320,7 @@ export async function createApplication(options: {
     command('relationships:preview', z.object({ observerId: z.string().min(1), targetAgentId: z.string().min(1) }).strict(), async input => {
       const agent = await world.agent(input.observerId);
       if (!agent) throw new Error('Agent does not exist.');
+      await validateReasoning(agent.model, agent.reasoningEffort);
       return previewRelationshipSummary(world, agent, input.targetAgentId);
     });
     command('relationships:reset', z.object({ confirm: z.literal(true) }).strict(), async () => {
@@ -303,6 +337,7 @@ export async function createApplication(options: {
     command('prompt:preview', z.object({ agentId: z.string().min(1), operation: z.enum(['reflection', 'speech', 'emote']).optional() }).strict(), async input => {
       const agent = await world.agent(input.agentId);
       if (!agent) throw new Error('Agent does not exist.');
+      await validateReasoning(agent.model, agent.reasoningEffort);
       const operation = input.operation ?? 'reflection';
       return previewDecision(world, agent, { reflection: operation === 'reflection', speech: operation === 'speech', emote: operation === 'emote', requestedAt: Date.now(), reason: 'cadence' });
     });
@@ -318,15 +353,17 @@ export async function createApplication(options: {
       try { const deleted = await world.clearDiagnostics(); config.emit('diagnostics:changed'); return deleted; }
       finally { importingConfiguration = false; }
     });
-    command('config:preview', configurationSchema, (input) =>
-      world.previewConfiguration(input),
-    );
+    command('config:preview', configurationSchema, async (input) => {
+      await validateConfigurationReasoning(input);
+      return world.previewConfiguration(input);
+    });
     command('config:import', configurationImportSchema, async (input) => {
       checkConfigurationWrite();
       if (scheduler.snapshot().state !== 'stopped')
         throw new Error('Configuration import requires a stopped run. Choose Stop first.');
       importingConfiguration = true;
       try {
+        await validateConfigurationReasoning(input.configuration);
         const result = await world.importConfiguration(
           input.configuration, input.previewToken,
         );
@@ -355,6 +392,10 @@ export async function createApplication(options: {
     command('auth:models', z.object({}).strict(), async () => {
       if (!options.auth) throw new Error('ChatGPT connection is unavailable.');
       return listChatGptModels(options.auth);
+    });
+    command('auth:model-catalog', z.object({}).strict(), async () => {
+      if (!options.auth) throw new Error('ChatGPT connection is unavailable.');
+      return listChatGptModelCatalog(options.auth, true);
     });
     command('auth:login', z.object({}).strict(), async () => {
       if (!options.auth) throw new Error('ChatGPT connection is unavailable.');

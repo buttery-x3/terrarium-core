@@ -30,7 +30,7 @@ export async function previewMediaVote(world: World, agent: Agent, ballotId: str
   const context = await voteContext(world, agent, ballotId);
   if (!context) return null;
   return { context, constraints: mediaVoteConstraints, payload: createChatGptPayload({
-    provider: agent.provider, model: agent.model, messages: voteMessages(context),
+    provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: voteMessages(context),
     responseFormat: { name: 'terrarium_media_vote', schema: mediaVoteJsonSchema },
   }) };
 }
@@ -51,7 +51,7 @@ export async function performMediaVote(
     if (attemptId) await world.updateDiagnostic(attemptId, { context, settingsVersion: context.settingsVersion,
       agentRevision: context.agentRevision, operation: 'media-vote' }, undefined, 'media-vote');
     category = 'provider';
-    const result = await provider.complete({ provider: agent.provider, model: agent.model, messages: voteMessages(context), signal,
+    const result = await provider.complete({ provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort, messages: voteMessages(context), signal,
       responseFormat: { name: 'terrarium_media_vote', schema: mediaVoteJsonSchema },
       onRequest: async payload => {
         signal.throwIfAborted();

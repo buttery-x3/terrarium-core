@@ -38,6 +38,22 @@ describe('runtime contracts', () => {
       { ...defaultSettings.diagnostics, maxAgeMinutes: 1.5 }, { ...defaultSettings.diagnostics, maxPayloadMiB: 31 }])
       expect(settingsSchema.safeParse({ ...defaultSettings, diagnostics }).success).toBe(false);
   });
+  it('requires explicit nullable reasoning choices in version 9 while accepting older files', () => {
+    const settings = { ...defaultSettings, news: { ...defaultSettings.news, reasoningEffort: 'xhigh' } };
+    const file = { format: 'terrarium-config', version: 9, rooms: [], agents: [], settings };
+    expect(configurationSchema.parse(file).settings?.news.reasoningEffort).toBe('xhigh');
+    expect(configurationSchema.parse({ ...file, settings: defaultSettings }).settings?.news.reasoningEffort).toBeNull();
+    const { reasoningEffort, ...news } = settings.news;
+    expect(configurationSchema.safeParse({ ...file, settings: { ...settings, news } }).success).toBe(false);
+    for (const version of [7, 8])
+      expect(configurationSchema.safeParse({ ...file, version, settings: { ...settings, news } }).success).toBe(true);
+    expect(configurationSchema.safeParse({ ...file, settings: { ...settings, news: { ...news, reasoningEffort: '' } } }).success).toBe(false);
+    const resident = { id: 'resident', name: 'Resident', instructions: 'Observe.', motivations: '', intention: '', roomId: 'room-1',
+      provider: 'chatgpt', model: 'test', enabled: false, minIntervalMs: 1000, maxIntervalMs: 2000, contextMessageLimit: 30 };
+    expect(configurationSchema.safeParse({ ...file, agents: [resident] }).success).toBe(false);
+    expect(configurationSchema.safeParse({ ...file, version: 8, agents: [resident] }).success).toBe(true);
+    expect(configurationSchema.safeParse({ ...file, agents: [{ ...resident, reasoningEffort: null }] }).success).toBe(true);
+  });
   it('validates bounded emotes and typed activity, excluding fabricated arrival actions and extra state mutations', () => {
     expect(actionSchema.parse({ type: 'emote', message: '  A watches.  ' })).toEqual({ type: 'emote', message: 'A watches.' });
     for (const action of [{ type: 'emote', message: 'x'.repeat(241) }, { type: 'emote', message: ' ' },

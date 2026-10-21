@@ -36,6 +36,19 @@ describe('private reflection decisions', () => {
     } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);
     expect((await world.agent(agent.id))?.roomId).toBe('news-room');
   });
+  it.each(['reflection', 'speech', 'emote'] as const)('uses the resident reasoning strength in %s previews and actual requests', async operation => {
+    const agent = await world.saveAgent({ ...input, reasoningEffort: 'xhigh' });
+    const offered = { ...opportunity, reflection: operation === 'reflection', speech: operation === 'speech', emote: operation === 'emote' };
+    const preview = await previewDecision(world, agent, offered);
+    expect(preview.payload).toMatchObject({ reasoning: { effort: 'xhigh' } });
+    const complete = vi.fn(async (request: LmCompletionRequest) => {
+      expect(request.reasoningEffort).toBe('xhigh');
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      return { content: JSON.stringify(operation === 'reflection' ? quiet : { action: { type: 'wait' }, intention: null }) };
+    });
+    await performDecision(world, agent, { name: 'fake', complete }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);
+    expect(complete).toHaveBeenCalledOnce();
+  });
   it('allows genuine inactivity while observations and elapsed energy continue', async () => {
     let now = 1000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);

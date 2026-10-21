@@ -6,6 +6,7 @@
   import RelationshipPanel from "./RelationshipPanel.svelte";
   import NewsPanel from "./NewsPanel.svelte";
   import MediaPanel from "./MediaPanel.svelte";
+  import ReasoningSelect from "./ReasoningSelect.svelte";
   import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, MediaState, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
@@ -27,7 +28,8 @@
   let runState: RunState = { state: "stopped", agents: [], concurrency: 4 };
   let auth: AuthState = { connected: false, pending: false };
   let signInUrl = "";
-  let models: string[] = [];
+  let models: import("@terrarium/shared").ChatGptModel[] = [];
+  let modelRequest = 0;
   let roomId = "";
   let roomName = "";
   let roomDescription = "";
@@ -60,6 +62,7 @@
   let confirmDiagnosticClear = false;
   let agentRoom = "";
   let agentModel = "gpt-6-luna";
+  let agentReasoningEffort: string | null = null;
   let enabled = false;
   let minimumSeconds = 10;
   let maximumSeconds = 30;
@@ -140,6 +143,7 @@
     agentId = agent?.id ?? ""; agentName = agent?.name ?? ""; instructions = agent?.instructions ?? "";
     motivations = agent?.motivations ?? ""; intention = agent?.intention ?? "";
     agentRoom = agent?.roomId ?? selectedRoom; agentModel = agent?.model ?? "gpt-6-luna"; enabled = agent?.enabled ?? false;
+    agentReasoningEffort = agent?.reasoningEffort ?? null;
     minimumSeconds = (agent?.minIntervalMs ?? 10000) / 1000; maximumSeconds = (agent?.maxIntervalMs ?? 30000) / 1000;
     agentTimingSeconds = {};
     for (const { key } of timingFields) if (agent?.timingOverrides?.[key] !== undefined) agentTimingSeconds[key] = agent.timingOverrides[key]! / 1000;
@@ -167,8 +171,14 @@
     notice = `Deleted agent “${agent.name}”. Existing conversation messages were kept.`;
   }
   async function discoverModels() {
-    try { models = await request<string[]>("auth:models", {}); }
-    catch (failure) { error = failure instanceof Error ? failure.message : "Could not load ChatGPT models."; }
+    const sequence = ++modelRequest;
+    try { const catalog = await request<typeof models>("auth:model-catalog", {}); if (sequence === modelRequest && connected && auth.connected) models = catalog; }
+    catch (failure) { if (sequence === modelRequest) { models = []; error = failure instanceof Error ? failure.message : "Could not load ChatGPT models."; } }
+  }
+  function reasoningForChangedModel(model: string, effort: string | null | undefined): string | null {
+    if (effort == null || models.find(item => item.slug === model)?.supportedReasoningEfforts?.some(item => item.effort === effort)) return effort ?? null;
+    notice = `Reasoning strength reset to Model default for ${model}. Save to apply this change.`;
+    return null;
   }
   function clearImport() { importConfiguration = undefined; importPreview = undefined; importFileName = ""; }
   async function exportConfiguration() {
@@ -304,7 +314,7 @@
       histories = {}; older = {}; loaded.clear(); loading.clear();
       if (error === "Cannot connect to the local server. Check that pnpm dev is running.") error = "";
     });
-    socket.on("disconnect", () => { connected = false; reflections = []; mediaState = undefined; mediaStateSequence++; reflectionRequest++; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
+    socket.on("disconnect", () => { connected = false; models = []; modelRequest++; auth = { ...auth, connected: false }; reflections = []; mediaState = undefined; mediaStateSequence++; reflectionRequest++; loading.clear(); importPreview = undefined; clearConfirmation = undefined; deleteAgentConfirmation = undefined; });
     socket.on("connect_error", () => { error = "Cannot connect to the local server. Check that pnpm dev is running."; });
     socket.on("world:state", (state: WorldState) => {
       importPreview = undefined;
@@ -335,8 +345,9 @@
     });
     socket.on("run:state", (state: RunState) => { runState = state; if (state.state !== "stopped") clearConfirmation = undefined; });
     socket.on("auth:state", (state: AuthState) => {
-      const newlyConnected = state.connected && !auth.connected;
+      const newlyConnected = state.connected && !state.pending && (!auth.connected || auth.pending);
       auth = state; if (!state.pending) signInUrl = "";
+      if (!state.connected || state.pending) { modelRequest++; models = []; }
       if (newlyConnected) void discoverModels();
     });
     socket.on("operation:error", (value: string) => { error = value; });
@@ -459,7 +470,7 @@
       const timingOverrides: NonNullable<AgentInput["timingOverrides"]> = {};
       for (const { key } of timingFields) if (agentTimingSeconds[key] !== undefined) timingOverrides[key] = Math.round(agentTimingSeconds[key]! * 1000);
       const input: AgentInput = { ...(agentId ? { id: agentId } : {}), name: agentName, instructions, motivations, intention, roomId: agentRoom,
-        provider: "chatgpt", model: agentModel, enabled, minIntervalMs: Math.round(minimumSeconds * 1000),
+        provider: "chatgpt", model: agentModel, reasoningEffort: agentReasoningEffort, enabled, minIntervalMs: Math.round(minimumSeconds * 1000),
         maxIntervalMs: Math.round(maximumSeconds * 1000), contextMessageLimit: contextMessages, timingOverrides };
       const saved = await request<Agent>("agents:save", input); if (agents.some(agent => agent.id === saved.id)) editAgent(saved); notice = "Agent saved.";
     })}>
@@ -471,9 +482,11 @@
       <label>Current intention (optional) <textarea bind:value={intention} maxlength="1000" rows="2"></textarea></label>
       <p>An operator-configured immediate aim. Generated private reactions and intentions are saved separately and shown in the agent inspector.</p>
       <label>Current room <select bind:value={agentRoom} required>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
-      <label>ChatGPT model <input bind:value={agentModel} list="chatgpt-models" required /></label>
-      <datalist id="chatgpt-models">{#each models as model}<option value={model}></option>{/each}</datalist>
+      <label>ChatGPT model <input bind:value={agentModel} list="chatgpt-models" required on:change={() => { agentReasoningEffort = reasoningForChangedModel(agentModel, agentReasoningEffort); }} /></label>
+      <datalist id="chatgpt-models">{#each models as model}<option value={model.slug}>{model.displayName}</option>{/each}</datalist>
       <button type="button" disabled={!auth.connected || busy} on:click={discoverModels}>Refresh available models</button>
+      <ReasoningSelect model={agentModel} bind:value={agentReasoningEffort} {models} />
+      <p>This resident's strength applies to reflection, speech, emotes, relationship summaries and media votes. News has its own setting.</p>
       <h4>Timing overrides</h4>
       <p>Leave a field blank to inherit its saved shared setting. All values are seconds. These schedules replace the legacy interval between turns.</p>
       {#each timingFields as field}
@@ -515,7 +528,8 @@
       <label><input type="checkbox" bind:checked={settings.news.enabled} /> Enable shared news selection</label>
       <label>News display room <select bind:value={settings.news.roomId}>{#each rooms as room}<option value={room.id}>{room.name}</option>{/each}</select></label>
       <label>News selection interval (seconds) <input type="number" min="0.001" step="0.001" value={settings.news.intervalMs / 1000} required on:input={event => { settings.news.intervalMs = Math.round(event.currentTarget.valueAsNumber * 1000); }} /></label>
-      <label>News selection model <input bind:value={settings.news.model} list="chatgpt-models" required /></label>
+      <label>News selection model <input bind:value={settings.news.model} list="chatgpt-models" required on:change={() => { settings.news.reasoningEffort = reasoningForChangedModel(settings.news.model, settings.news.reasoningEffort); }} /></label>
+      <ReasoningSelect model={settings.news.model} bind:value={settings.news.reasoningEffort} {models} label="News reasoning strength" />
       <label>News topics (one per line, up to 12) <textarea rows="6" value={settings.news.topics.join("\n")} required on:change={event => { settings.news.topics = event.currentTarget.value.split(/\r?\n/).map(topic => topic.trim()).filter(Boolean); }}></textarea></label>
       <label>Recent headlines supplied for variety <input type="number" min="1" max="30" step="1" bind:value={settings.news.recentHeadlineLimit} required /></label>
       <p>One shared request selects a sourced headline for the assigned room. Topics and the editable news prompt guide variety; web search must be supported by the selected model and account. A failure retains the existing display.</p>
@@ -575,7 +589,7 @@
     <label>Preview agent <select bind:value={promptAgent} on:change={() => { promptPreview = undefined; }}>{#each agents as agent}<option value={agent.id}>{agent.name}</option>{/each}</select></label>
     <label>Preview operation <select bind:value={promptOperation} on:change={() => { promptPreview = undefined; }}><option value="reflection">Private reflection</option><option value="speech">Speech opportunity</option><option value="emote">Emote opportunity</option></select></label>
     <button disabled={!connected || busy || !promptAgent} on:click={() => perform(async () => { promptPreview = await request("prompt:preview", { agentId: promptAgent, operation: promptOperation }); })}>Preview saved prompt</button>
-    <p>Preview reads current saved state without requesting a model or applying an operation. The payload shows Terrarium's instructions, input, model and output schema. It does not show provider-internal instructions or reasoning.</p>
+    <p>Preview reads current saved state without requesting a model or applying an operation. The payload shows Terrarium's instructions, input, model, any explicit reasoning strength and output schema. It does not show provider-internal instructions or reasoning.</p>
     {#if promptPreview}
       <p>Model: {promptPreview.payload.model}</p>
       <h3>Instructions in request order</h3>

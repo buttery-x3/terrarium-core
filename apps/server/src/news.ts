@@ -40,6 +40,7 @@ function newsMessages(context: Awaited<ReturnType<typeof newsContext>>): Message
 export async function previewNews(world: World) {
   const context = await newsContext(world);
   return { context, constraints: newsConstraints, payload: createChatGptPayload({ provider: 'chatgpt', model: context.settings.model,
+    reasoningEffort: context.settings.reasoningEffort,
     messages: newsMessages(context), webSearch: true, responseFormat: { name: 'terrarium_news', schema: newsJsonSchema(context.settings.topics) } }) };
 }
 
@@ -48,7 +49,7 @@ export async function performNews(world: World, provider: LmProvider, signal: Ab
   const context = await newsContext(world);
   if (!context.settings.enabled || !stillCurrent()) return;
   const job: Agent = { id: 'system-news', name: 'News selection', roomId: context.settings.roomId, provider: 'chatgpt',
-    model: context.settings.model, enabled: true, revision: context.settingsVersion, instructions: '', motivations: '', intention: '',
+    model: context.settings.model, reasoningEffort: context.settings.reasoningEffort, enabled: true, revision: context.settingsVersion, instructions: '', motivations: '', intention: '',
     energy: 0, minIntervalMs: context.settings.intervalMs, maxIntervalMs: context.settings.intervalMs, contextMessageLimit: 1 };
   const turnId = await world.scheduleTurn(job, dueAt, 'news', requestedAt);
   let attemptId: string | undefined, applied = false, outcome = 'error';
@@ -56,7 +57,7 @@ export async function performNews(world: World, provider: LmProvider, signal: Ab
     attemptId = await world.startAttempt(turnId, 1, job);
     await world.updateDiagnostic(attemptId, { context, settingsVersion: context.settingsVersion, operation: 'news' });
     signal.throwIfAborted();
-    const result = await provider.complete({ provider: 'chatgpt', model: job.model, messages: newsMessages(context), webSearch: true,
+    const result = await provider.complete({ provider: 'chatgpt', model: job.model, reasoningEffort: job.reasoningEffort, messages: newsMessages(context), webSearch: true,
       responseFormat: { name: 'terrarium_news', schema: newsJsonSchema(context.settings.topics) }, signal,
       onRequest: async payload => { signal.throwIfAborted(); await world.updateDiagnostic(attemptId!, { payload }); } });
     signal.throwIfAborted();
