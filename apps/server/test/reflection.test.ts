@@ -3,6 +3,7 @@ import { createDb, ensureTables, World } from '@terrarium/persistence';
 import { defaultSettings, type Agent, type AgentInput, type DecisionOpportunity } from '@terrarium/shared';
 import { createChatGptPayload, type LmCompletionRequest, type LmProvider } from '@terrarium/lm-providers';
 import { decisionJsonSchema, performDecision, previewDecision } from '../src/reflection.js';
+import { Scheduler } from '../src/scheduler.js';
 
 let db: ReturnType<typeof createDb>, world: World;
 const input: AgentInput = {
@@ -32,9 +33,103 @@ describe('private reflection decisions', () => {
       const schema = request.responseFormat!.schema as ReturnType<typeof decisionJsonSchema>;
       expect(schema.properties.action.anyOf.find(option => option.properties.type.enum[0] === 'move')?.properties.roomId)
         .toEqual({ type: 'string', minLength: 1, enum: preview.context.directory.map(room => room.id) });
-      return { content: JSON.stringify({ ...(reflection ? quiet : { intention: null }), action: { type: 'move', roomId: 'news-room' } }) };
+      const move = schema.properties.action.anyOf.find(option => option.properties.type.enum[0] === 'move')!;
+      expect(move.required).toContain('reason');
+      expect(move.properties.reason).toMatchObject({ type: 'string', minLength: 1, maxLength: 240 });
+      return { content: JSON.stringify({ ...(reflection ? quiet : { intention: null }), action: { type: 'move', roomId: 'news-room', reason: 'Read the news display.' } }) };
     } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, offered);
     expect((await world.agent(agent.id))?.roomId).toBe('news-room');
+  });
+
+  it('applies a Forum move once when its optional appraisal mistypes a witnessed source ID', async () => {
+    await db.insertInto('rooms').values({ id: 'forum', name: 'Forum', description: 'Exchange opinions.', is_food_source: 0 }).execute();
+    const agent = await world.saveAgent({ ...input, name: 'Quinn' }), companion = await world.saveAgent({ ...input, name: 'Companion' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'A witnessed contribution.' }, () => true)).message!;
+    await world.saveAgent({ ...input, id: companion.id, name: companion.name, enabled: false });
+    const mistypedId = source.id.slice(0, -3) + source.id.slice(-2);
+    const reason = 'Find a fresh discussion in the Forum.';
+    const response = { ...quiet, action: { type: 'move', roomId: 'forum', reason },
+      appraisals: [{ sourceId: mistypedId, reaction: 'like', reason: 'An interesting contribution.' }] };
+    const complete = vi.fn(async (request: LmCompletionRequest) => {
+      expect(request.messages[1].content).toContain(source.id);
+      await request.onRequest?.(createChatGptPayload(request));
+      return { content: JSON.stringify(response) };
+    });
+    const notify = vi.fn();
+    const scheduler = new Scheduler(world, (resident, signal, current, applied, attempt, offered) =>
+      performDecision(world, resident, { name: 'fake', complete }, signal, current, notify, async () => {}, applied, attempt, offered!),
+    () => {}, { concurrency: 4, timeoutMs: 5000, retries: 2, backoffMs: 1 });
+    try {
+      await scheduler.start(); await scheduler.tick();
+      await vi.waitFor(() => expect(scheduler.snapshot().agents.some(item => item.state === 'running')).toBe(false));
+      expect(complete).toHaveBeenCalledOnce();
+      const latest = (await world.agent(agent.id))!;
+      expect(latest).toMatchObject({ roomId: 'forum', revision: agent.revision + 1 });
+      const attempts = (await world.diagnostics({ agentId: agent.id }, true)).records.filter(record => record.attempt > 0);
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ outcome: 'applied', action: 'move', details: { moveReason: reason, proposal: response,
+        sourceRoomId: agent.roomId, destinationRoomId: 'forum', moved: true, acceptedAppraisals: [],
+        optionalValidationErrors: [{ field: 'appraisals', index: 0, sourceId: mistypedId, error: expect.any(String) }] } });
+      expect((await world.appraisals()).appraisals).toEqual([]);
+      expect(notify.mock.calls.map(([event]) => event.type)).toEqual(['departure', 'arrival']);
+      for (const value of [notify.mock.calls, await world.exportConversations(), (await previewDecision(world, latest, opportunity)).payload])
+        expect(JSON.stringify(value)).not.toContain(reason);
+    } finally { await scheduler.close(); }
+  });
+
+  it.each(['move', 'wait'] as const)('handles a disabled newly proposed engagement independently only for %s', async type => {
+    await world.saveSettings({ ...defaultSettings, scheduling: { ...defaultSettings.scheduling, engagementEnabled: false } });
+    const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'An exchange.' }, () => true)).message!;
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    const response = { ...quiet, engagement: { rootMessageId: source.id, targetAgentId: companion.id },
+      action: type === 'move' ? { type, roomId: 'room-2', reason: 'Choose a quieter setting.' } : { type } };
+    const result = performDecision(world, agent, providerFor(response), new AbortController().signal,
+      () => true, () => {}, async () => {}, () => {}, attempt, opportunity);
+    if (type === 'move') {
+      await expect(result).resolves.toMatchObject({ action: { type: 'move', roomId: 'room-2' }, engagement: null });
+      expect((await world.diagnostic(attempt)).details?.optionalValidationErrors)
+        .toEqual([{ field: 'engagement', sourceId: source.id, error: expect.any(String) }]);
+      expect((await world.agent(agent.id))?.roomId).toBe('room-2');
+    } else {
+      await expect(result).rejects.toMatchObject({ category: 'world-validation' });
+      expect((await world.agent(agent.id))?.roomId).toBe(agent.roomId);
+    }
+    expect((await world.reflection(agent.id)).engagement).toBeNull();
+  });
+
+  it.each(['invalid-destination', 'malformed-appraisal'] as const)('retains a valid move purpose when the decision fails for %s', async failure => {
+    const agent = await world.saveAgent(input), notify = vi.fn(), reason = 'Seek a new conversation.';
+    const response = { ...quiet, action: { type: 'move', roomId: failure === 'invalid-destination' ? 'missing-room' : 'room-2', reason },
+      appraisals: [{ sourceId: 'missing-source', reaction: failure === 'malformed-appraisal' ? 'unsupported' : 'like', reason: 'A reaction.' }] };
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await expect(performDecision(world, agent, providerFor(response), new AbortController().signal,
+      () => true, notify, async () => {}, () => {}, attempt, opportunity))
+      .rejects.toMatchObject({ category: failure === 'malformed-appraisal' ? 'schema' : 'world-validation' });
+    expect((await world.diagnostic(attempt))).toMatchObject({ action: 'move', details: { moveReason: reason, proposal: response } });
+    if (failure === 'invalid-destination') expect((await world.diagnostic(attempt)).details?.error).toContain('Destination room does not exist');
+    expect((await world.diagnostic(attempt)).details).not.toHaveProperty('destinationRoomId');
+    expect(await world.agent(agent.id)).toEqual(agent);
+    expect((await world.appraisals()).appraisals).toEqual([]);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('still cancels a move when its active engagement trigger becomes stale', async () => {
+    const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' });
+    const source = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'A current exchange.' }, () => true)).message!;
+    await world.saveReflection(agent.id, agent.revision, { engagement: { roomId: agent.roomId, rootMessageId: source.id, targetAgentId: companion.id } }, () => true);
+    const reason = 'Find another setting.', notify = vi.fn();
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    await expect(performDecision(world, agent, { name: 'fake', complete: async () => {
+      await world.applyAction(companion.id, companion.revision, { type: 'move', roomId: 'room-2' }, () => true);
+      return { content: JSON.stringify({ action: { type: 'move', roomId: 'room-3', reason } }) };
+    } }, new AbortController().signal, () => true, notify, async () => {}, () => {}, attempt,
+    { ...opportunity, reflection: false, speech: true, reason: 'engagement', engagementTrigger: {
+      rootMessageId: source.id, targetAgentId: companion.id, replyToId: source.id, sourceAgentId: companion.id, requestedAt: 1000,
+    } })).rejects.toMatchObject({ category: 'stale' });
+    expect((await world.diagnostic(attempt))).toMatchObject({ outcome: 'stale', action: 'move', details: { moveReason: reason } });
+    expect((await world.agent(agent.id))?.roomId).toBe(agent.roomId);
+    expect(notify).not.toHaveBeenCalled();
   });
   it.each(['reflection', 'speech', 'emote'] as const)('uses the resident reasoning strength in %s previews and actual requests', async operation => {
     const agent = await world.saveAgent({ ...input, reasoningEffort: 'xhigh' });
@@ -198,14 +293,16 @@ describe('private reflection decisions', () => {
     expect(response).toMatchObject({ type: 'speak', replyToId: source.id, conversationId: source.id });
   });
 
-  it('rejects evidence that arrived after the actual request snapshot', async () => {
+  it.each(['wait', 'move'] as const)('rejects an unwitnessed speech plan even when the immediate action is %s', async type => {
     const agent = await world.saveAgent(input), companion = await world.saveAgent({ ...input, name: 'Companion' });
     await expect(performDecision(world, agent, { name: 'fake', complete: async () => {
       const late = (await world.applyAction(companion.id, companion.revision, { type: 'speak', message: 'Late source.' }, () => true)).message!;
-      return { content: JSON.stringify({ ...quiet, speechPlan: { delayMs: 20000, replyToId: late.id, targetAgentId: companion.id } }) };
+      return { content: JSON.stringify({ ...quiet, speechPlan: { delayMs: 20000, replyToId: late.id, targetAgentId: companion.id },
+        action: type === 'move' ? { type, roomId: 'room-2', reason: 'Find another setting.' } : { type } }) };
     } }, new AbortController().signal, () => true, () => {}, async () => {}, () => {}, undefined, opportunity))
       .rejects.toMatchObject({ category: 'world-validation' });
     expect((await world.reflection(agent.id)).reflectedAt).toBeNull();
+    expect((await world.agent(agent.id))?.roomId).toBe(agent.roomId);
   });
 
   it('records notification failure after the private state and action have committed', async () => {

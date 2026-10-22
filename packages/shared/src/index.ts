@@ -50,7 +50,7 @@ export const deleteAgentSchema = z.object({ id: z.string().min(1) }).strict();
 export const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('speak'), message: messageTextSchema, replyToId: z.string().min(1).nullable().optional() }).strict(),
   z.object({ type: z.literal('emote'), message: emoteTextSchema }).strict(),
-  z.object({ type: z.literal('move'), roomId: roomIdSchema }).strict(),
+  z.object({ type: z.literal('move'), roomId: roomIdSchema, reason: z.string().trim().min(1).max(240).optional() }).strict(),
   z.object({ type: z.literal('wait') }).strict(),
   z.object({ type: z.literal('eat') }).strict(),
   z.object({ type: z.literal('propose-media'), title: z.string().trim().min(1).max(240), description: z.string().trim().min(1).max(1000) }).strict(),
@@ -86,8 +86,9 @@ export const actionResponseJsonSchema = {
           properties: {
             type: { type: 'string', enum: ['move'] },
             roomId: { type: 'string', minLength: 1 },
+            reason: { type: 'string', minLength: 1, maxLength: 240, pattern: '\\S' },
           },
-          required: ['type', 'roomId'],
+          required: ['type', 'roomId', 'reason'],
           additionalProperties: false,
         },
         {
@@ -438,6 +439,8 @@ export type AttemptDetails = {
   requestId?: string; responseId?: string; settingsVersion?: number; agentRevision?: number;
   context?: unknown; energySeen?: number; energyBefore?: number; energyAfter?: number; passiveDecay?: number;
   sourceRoomId?: string; destinationRoomId?: string; moved?: boolean; messageId?: string;
+  moveReason?: string;
+  optionalValidationErrors?: { field: 'appraisals' | 'engagement'; index?: number; sourceId?: string; error: string }[];
   eventIds?: string[];
   operation?: string; opportunities?: DecisionOpportunity; requestedAt?: number; schedule?: unknown; rawRequestedDelay?: number;
   reflection?: ReflectionState;

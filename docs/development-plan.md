@@ -1,5 +1,17 @@
 # Terrarium Core development plan
 
+## Approved FLAME-148 follow-up: declared move reasons and optional validation
+
+The user approved this correction on 22 October 2026 after retained diagnostics showed Quinn's valid Forum move discarded because an optional appraisal mistyped a witnessed source ID. Work is isolated on `codex/flame-148-move-diagnostics` while the current simulation continues on its existing checkout.
+
+New model movement schemas require a brief declared destination purpose of at most 240 characters. Legacy actions without a reason remain accepted. Capture the reason with the original proposal and display it beside proposed source/destination, action outcome and any committed movement. It is a resident declaration, not verified causation or provider-internal reasoning. Do not publish it in arrival/departure messages, observations, private reflection state or future model context.
+
+For well-formed move responses, validate optional appraisal references/provenance and newly proposed engagement independently. Reject invalid optional items with explicit diagnostic errors while applying a valid move and any valid optional items atomically. Never infer or repair a mistyped source ID. Malformed responses, capacity violations, invalid movement, active engagement-trigger guards, stale revisions, cancellation, actual reply provenance, diagnostic failures and database failures retain their existing rejection/rollback behavior. Non-move validation is unchanged. Future speech-plan validation is outside this correction.
+
+Use the existing contracts, request/preview paths, persistence transaction and diagnostic UI without dependencies or migrations. Regression checks cover the observed typo, mixed valid/invalid evidence, invalid new engagement, one applied move without retry, private reason/error isolation and fatal rollback boundaries. Run build, frontend checks, full tests, isolated development startup and a browser diagnostic check before delivery.
+
+Implemented and validated: build, frontend checks, all 358 tests, isolated development startup and browser checks pass. The Quinn regression applies one Forum move without retrying; diagnostics show declared reasons and rejected optional items. The primary checkout and live simulation remain unchanged. See the 22 October move-diagnostics entry in [implementation validation](implementation-validation.md).
+
 ## Approved FLAME-148 room, retention and reasoning follow-up
 
 The user approved this follow-up on 22 October 2026, with parallel sub-agents for independent implementation. Integrate the features in this order, preserving a branch at each stage:

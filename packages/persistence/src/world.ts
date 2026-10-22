@@ -887,16 +887,29 @@ export class World {
     });
   }
 
-  private async writeAppraisals(observer: Agent, proposals: AppraisalProposal[], sourceIds?: readonly string[]) {
+  private async validateAppraisals(observer: Agent, proposals: AppraisalProposal[], sourceIds?: readonly string[],
+    optionalValidationErrors?: NonNullable<AttemptDetails['optionalValidationErrors']>) {
     const capacity = (await this.settings()).value.relationships.maxAppraisalsPerReflection;
     if (proposals.length > capacity) throw new ActionError('world-validation', 'This reflection exceeds its optional appraisal capacity.');
-    const acceptedAppraisals: AppraisalRecord[] = [], duplicateAppraisalIds: string[] = [];
+    const parsed = appraisalProposalSchema.array().parse(proposals);
+    const validated: { proposal: AppraisalProposal; source: Selectable<DB['messages']> }[] = [];
     const witnessedIds = new Set(sourceIds ?? (await this.memory(observer.id)).map(item => item.id));
-    for (const input of proposals) {
-      const proposal = appraisalProposalSchema.parse(input);
+    for (const [index, proposal] of parsed.entries()) {
       const source = await this.db.selectFrom('messages').selectAll().where('id', '=', proposal.sourceId).executeTakeFirst();
-      if (!source || !witnessedIds.has(source.id) || source.agent_id === observer.id || source.agent_id === 'config-ui' || !['speak', 'emote'].includes(source.type))
-        throw new ActionError('world-validation', 'Appraisals require witnessed speech or authored emotes from another resident.');
+      if (!source || !witnessedIds.has(source.id) || source.agent_id === observer.id || source.agent_id === 'config-ui' || !['speak', 'emote'].includes(source.type)) {
+        const error = 'Appraisals require witnessed speech or authored emotes from another resident.';
+        if (!optionalValidationErrors) throw new ActionError('world-validation', error);
+        optionalValidationErrors.push({ field: 'appraisals', index, sourceId: proposal.sourceId, error });
+        continue;
+      }
+      validated.push({ proposal, source });
+    }
+    return validated;
+  }
+
+  private async writeAppraisals(observer: Agent, appraisals: { proposal: AppraisalProposal; source: Selectable<DB['messages']> }[]) {
+    const acceptedAppraisals: AppraisalRecord[] = [], duplicateAppraisalIds: string[] = [];
+    for (const { proposal, source } of appraisals) {
       const duplicate = await this.db.selectFrom('appraisals').select('id').where('observer_id', '=', observer.id).where('source_id', '=', source.id).executeTakeFirst();
       if (duplicate) { duplicateAppraisalIds.push(duplicate.id); continue; }
       const previous = await this.db.selectFrom('relationships').select('score').where('observer_id', '=', observer.id).where('target_agent_id', '=', source.agent_id).executeTakeFirst();
@@ -926,21 +939,36 @@ export class World {
     return { ...messageRecord(source), conversationId: source.conversation_id ?? source.id };
   }
 
-  private async writeReflection(agentId: string, update: ReflectionUpdate, sourceIds?: readonly string[], publicAction?: { type: 'speak' | 'emote'; createdAt: string }) {
+  private async validateReflection(agentId: string, update: ReflectionUpdate, sourceIds?: readonly string[],
+    optionalValidationErrors?: NonNullable<AttemptDetails['optionalValidationErrors']>) {
     for (const [key, limit] of [['reaction', 1000], ['intention', 240]] as const) {
       const value = update[key];
       if (value !== undefined && value !== null && (typeof value !== 'string' || value.length > limit))
         throw new ActionError('world-validation', `Private ${key} exceeds its allowed length.`);
     }
+    if (optionalValidationErrors && update.engagement !== undefined && update.engagement !== null &&
+      (typeof update.engagement !== 'object' || Array.isArray(update.engagement) ||
+        Object.keys(update.engagement).some(key => !['roomId', 'rootMessageId', 'targetAgentId'].includes(key)) ||
+        ['roomId', 'rootMessageId', 'targetAgentId'].some(key => typeof update.engagement![key as keyof NonNullable<ReflectionState['engagement']>] !== 'string' ||
+          !update.engagement![key as keyof NonNullable<ReflectionState['engagement']>].length)))
+      throw new ActionError('world-validation', 'Engagement requires room, root-message and target-agent IDs.');
     if (update.engagement) {
       const actor = await this.agent(agentId), target = await this.agent(update.engagement.targetAgentId);
       const sources = sourceIds ? await this.db.selectFrom('messages').selectAll().where('id', 'in', [...sourceIds]).execute().then(rows => rows.map(messageRecord)) : await this.memory(agentId);
       if (!(await this.settings()).value.scheduling.engagementEnabled || !actor || !target || !target.enabled || actor.id === target.id ||
         actor.roomId !== update.engagement.roomId || target.roomId !== actor.roomId ||
         !sources.some(source => source.type === 'speak' && source.roomId === actor.roomId && source.agentId === target.id &&
-          (source.conversationId ?? source.id) === update.engagement!.rootMessageId))
-        throw new ActionError('world-validation', 'Engagement requires a witnessed local exchange and a present interlocutor.');
+          (source.conversationId ?? source.id) === update.engagement!.rootMessageId)) {
+        const error = 'Engagement requires a witnessed local exchange and a present interlocutor.';
+        if (!optionalValidationErrors) throw new ActionError('world-validation', error);
+        optionalValidationErrors.push({ field: 'engagement', sourceId: update.engagement.rootMessageId, error });
+        return { ...update, engagement: undefined };
+      }
     }
+    return update;
+  }
+
+  private async writeReflection(agentId: string, update: ReflectionUpdate, publicAction?: { type: 'speak' | 'emote'; createdAt: string }) {
     const state = await this.reflection(agentId);
     if (update.reaction !== undefined || update.intention !== undefined) state.reflectedAt = new Date().toISOString();
     if (update.reaction !== undefined) state.reaction = update.reaction;
@@ -966,7 +994,7 @@ export class World {
         const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
         if (record.ended_at) throw new ActionError('stale', 'This attempt has already ended.');
       }
-      const reflection = await world.writeReflection(agentId, update);
+      const reflection = await world.writeReflection(agentId, await world.validateReflection(agentId, update));
       if (attemptId) await world.updateDiagnostic(attemptId, { reflection }, 'applied', 'reflect');
       check();
       return reflection;
@@ -1152,10 +1180,15 @@ export class World {
           throw new ActionError('stale', 'The intended interlocutor is no longer in this room.');
       }
       const reply = action.type === 'speak' && action.replyToId ? await world.validateReply(agentId, action.replyToId, decision?.sourceIds) : undefined;
-      const appraisals = decision?.appraisals?.length ? await world.writeAppraisals(agentRecord(row), decision.appraisals, decision.sourceIds) : { acceptedAppraisals: [], duplicateAppraisalIds: [] };
-      if (decision?.reflection || decision?.engagement !== undefined) await world.writeReflection(agentId, {
+      const optionalValidationErrors: NonNullable<AttemptDetails['optionalValidationErrors']> = [];
+      const optionalRejects = action.type === 'move' ? optionalValidationErrors : undefined;
+      const validatedAppraisals = decision?.appraisals !== undefined ? await world.validateAppraisals(agentRecord(row), decision.appraisals, decision.sourceIds, optionalRejects) : [];
+      const reflectionUpdate = decision?.reflection || decision?.engagement !== undefined ? await world.validateReflection(agentId, {
         ...decision.reflection, ...(decision.engagement !== undefined ? { engagement: decision.engagement } : {}),
-      }, decision.sourceIds);
+      }, decision.sourceIds, optionalRejects) : undefined;
+      const appraisals = await world.writeAppraisals(agentRecord(row), validatedAppraisals);
+      if (reflectionUpdate && (reflectionUpdate.reaction !== undefined || reflectionUpdate.intention !== undefined || reflectionUpdate.engagement !== undefined))
+        await world.writeReflection(agentId, reflectionUpdate);
       let message: ConversationMessage | undefined;
       const events: ConversationMessage[] = [];
       if (action.type === 'propose-media') events.push(...await world.proposeMedia(agentRecord(row), action));
@@ -1204,7 +1237,7 @@ export class World {
         await db.updateTable('agents').set({ energy: energyAfter }).where('id', '=', row.id).execute();
       }
       const moved = action.type === 'move' && action.roomId !== row.room_id;
-      const reflection = message ? await world.writeReflection(agentId, {}, undefined, { type: action.type as 'speak' | 'emote', createdAt: message.createdAt }) : await world.reflection(agentId);
+      const reflection = message ? await world.writeReflection(agentId, {}, { type: action.type as 'speak' | 'emote', createdAt: message.createdAt }) : await world.reflection(agentId);
       if (attemptId) {
         const record = await db.selectFrom('decisions').selectAll().where('id', '=', attemptId).executeTakeFirstOrThrow();
         if (record.ended_at) throw new ActionError('stale', 'This attempt has already ended.');
@@ -1215,11 +1248,13 @@ export class World {
           passiveDecay: Math.max(0, (details.energySeen ?? row.energy) - row.energy),
           reflection,
           ...appraisals,
+          ...(optionalValidationErrors.length ? { optionalValidationErrors } : {}),
+          ...(action.type === 'move' && action.reason ? { moveReason: action.reason } : {}),
           ...(action.type === 'propose-media' ? { media: await world.mediaState() } : {}),
         }, action.type === 'move' && !moved ? 'applied-noop' : 'applied', action.type);
       }
       check();
-      return { message, events, moved, energyBefore: row.energy, energyAfter, reflection, ...appraisals };
+      return { message, events, moved, energyBefore: row.energy, energyAfter, reflection, ...appraisals, optionalValidationErrors };
     });
   }
 

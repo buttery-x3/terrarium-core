@@ -7,7 +7,7 @@
   import NewsPanel from "./NewsPanel.svelte";
   import MediaPanel from "./MediaPanel.svelte";
   import ReasoningSelect from "./ReasoningSelect.svelte";
-  import { configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
+  import { actionSchema, configurationSchema, configurationFileLimitBytes, defaultSettings, defaultPrompts, type Settings, type DiagnosticRecord, type DiagnosticPage, type DiagnosticFilter, type DiagnosticUsage, type Configuration, type ConfigurationPreview } from "@terrarium/shared";
   import type { Agent, AgentInput, AuthState, ClearHistoryInput, ConversationMessage, HistoryCleared, HistoryCursor, HistoryPage, MediaState, ReflectionState, Result, Room, RunState, WorldState } from "@terrarium/shared";
 
   const socket = io("/config", { autoConnect: false, transports: ["websocket"] });
@@ -636,8 +636,20 @@
             <summary>Inspect operation {record.turnId}, attempt {record.attempt}</summary>
             {#if diagnosticDetails[record.id]}
               {@const detail = diagnosticDetails[record.id].details}
+              {@const proposedAction = actionSchema.safeParse((detail?.proposal as { action?: unknown } | undefined)?.action)}
               {#if detail?.energySeen !== undefined}<p>Energy seen by model: {detail.energySeen}. Before action: {detail.energyBefore ?? "not applied"}. After action: {detail.energyAfter ?? "not applied"}.</p>{/if}
+              {#if proposedAction.success && proposedAction.data.type === "move"}
+                <p>Proposed move: {record.roomId} → {proposedAction.data.roomId}. Outcome: {record.outcome}.</p>
+                <p>Declared move reason: {detail?.moveReason ?? proposedAction.data.reason ?? "Not recorded."}</p>
+                <p>This is the resident's declared purpose, not a verified explanation. It is visible only in diagnostics.</p>
+              {/if}
               {#if detail?.sourceRoomId}<p>Applied location: {detail.sourceRoomId} → {detail.destinationRoomId}. {detail.moved ? "Location changed." : "Location unchanged."}</p>{/if}
+              {#if detail?.optionalValidationErrors?.length}
+                <p>Rejected optional items:</p>
+                <ul>{#each detail.optionalValidationErrors as rejection}
+                  <li>{rejection.field === "appraisals" ? `Appraisal ${(rejection.index ?? 0) + 1}` : "New engagement"}{rejection.sourceId ? ` (${rejection.sourceId})` : ""}: {rejection.error}</li>
+                {/each}</ul>
+              {/if}
               {#if detail?.selfReport}<p>Model self-report: {detail.selfReport}</p>{/if}
               {#if detail?.truncated}<p>Response capture is partial or incomplete. Capture limit: 4 MiB of provider stream data.</p>{/if}
               <pre class="configuration-json">{JSON.stringify(diagnosticDetails[record.id], null, 2)}</pre>

@@ -13,6 +13,18 @@ import {
 } from '../src/index.js';
 
 describe('runtime contracts', () => {
+  it('bounds declared movement reasons while preserving legacy actions', () => {
+    expect(actionSchema.parse({ type: 'move', roomId: 'forum', reason: '  Find a lively discussion.  ' }))
+      .toEqual({ type: 'move', roomId: 'forum', reason: 'Find a lively discussion.' });
+    expect(actionSchema.parse({ type: 'move', roomId: 'forum' })).toEqual({ type: 'move', roomId: 'forum' });
+    expect(actionSchema.safeParse({ type: 'move', roomId: 'forum', reason: 'x'.repeat(240) }).success).toBe(true);
+    for (const reason of ['', '  ', null, 1, 'x'.repeat(241)])
+      expect(actionSchema.safeParse({ type: 'move', roomId: 'forum', reason }).success).toBe(false);
+    expect(actionSchema.safeParse({ type: 'wait', reason: 'Keep listening.' }).success).toBe(false);
+    const move = actionJsonSchema(true, true, false, ['forum']).properties.action.anyOf.find(option => option.properties.type.enum[0] === 'move')!;
+    expect(move.required).toContain('reason');
+    expect(move.properties.reason).toEqual({ type: 'string', minLength: 1, maxLength: 240, pattern: '\\S' });
+  });
   it('restricts movement to the supplied room IDs without changing other requests', () => {
     const destinations = (ids?: readonly string[]) => actionJsonSchema(true, false, false, ids).properties.action.anyOf
       .find(option => option.properties.type.enum[0] === 'move')?.properties.roomId;

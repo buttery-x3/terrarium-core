@@ -69,6 +69,37 @@ describe('agent turns and scheduling', () => {
     expect((await world.agent(agent.id))?.roomId).toBe('room-4');
   });
 
+  it.each(['room-2', 'missing-room'])('captures the declared move purpose privately when the destination is %s', async roomId => {
+    const agent = await world.saveAgent(input), preview = await previewPrompt(world, agent), notify = vi.fn();
+    const reason = 'Seek a different setting for the next conversation.';
+    const response = { action: { type: 'move', roomId, reason: ` ${reason} ` }, intention: null };
+    const attempt = await world.startAttempt(await world.scheduleTurn(agent, Date.now()), 1, agent);
+    const complete = vi.fn(async (request: LmCompletionRequest) => {
+      expect(createChatGptPayload(request)).toEqual(preview.payload);
+      const move = (request.responseFormat!.schema as ReturnType<typeof actionJsonSchema>).properties.action.anyOf
+        .find(option => option.properties.type.enum[0] === 'move')!;
+      expect(move.required).toContain('reason');
+      expect(move.properties.reason).toMatchObject({ type: 'string', minLength: 1, maxLength: 240 });
+      await request.onRequest?.(createChatGptPayload(request));
+      return { content: JSON.stringify(response) };
+    });
+    const result = performTurn(world, agent, { name: 'fake', complete }, new AbortController().signal,
+      () => true, notify, async () => {}, () => {}, attempt);
+    if (roomId === 'missing-room') await expect(result).rejects.toMatchObject({ category: 'world-validation' });
+    else await result;
+    expect(complete).toHaveBeenCalledOnce();
+    const record = await world.diagnostic(attempt), latest = (await world.agent(agent.id))!;
+    expect(record).toMatchObject({ action: 'move', outcome: roomId === 'missing-room' ? 'world-validation' : 'applied',
+      details: { moveReason: reason, proposal: response, output: JSON.stringify(response), payload: preview.payload } });
+    if (roomId === 'missing-room') {
+      expect(record.details).not.toHaveProperty('destinationRoomId');
+      expect(latest.roomId).toBe(agent.roomId); expect(notify).not.toHaveBeenCalled();
+    } else expect(notify).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(notify.mock.calls)).not.toContain(reason);
+    expect(JSON.stringify(await world.exportConversations())).not.toContain(reason);
+    expect(JSON.stringify(await assembleContext(world, latest))).not.toContain(reason);
+  });
+
   it('advertises facilities without remote occupants, headlines or playing programmes in either decision context', async () => {
     await world.saveSettings({ ...defaultSettings, news: { ...defaultSettings.news, enabled: true, roomId: 'room-2' },
       media: { ...defaultSettings.media, enabled: true, roomId: 'room-3' } });
@@ -105,7 +136,7 @@ describe('agent turns and scheduling', () => {
     await requested.promise;
     if (kind === 'cancelled') controller.abort(new Error('Stopped'));
     else await world.saveAgent({ ...input, id: a.id, instructions: 'Edited' });
-    pending.resolve({ content: '{"action":{"type":"move","roomId":"room-2"}}' });
+    pending.resolve({ content: '{"action":{"type":"move","roomId":"room-2","reason":"Choose another setting."}}' });
     expect(await turn).toMatchObject({ category: kind });
     expect(notify).not.toHaveBeenCalled();
     expect(await world.memory(a.id)).toEqual([]);
